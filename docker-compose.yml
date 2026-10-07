@@ -92,7 +92,7 @@ services:
       context: ./frontend
     restart: unless-stopped
     ports:
-      - "${HTTP_PORT:-8080}:8080"
+      - "${HTTP_PORT:-8081}:8080"   # host port 8081 -> container port 8080 (nginx)
     depends_on:
       backend:
         condition: service_healthy

@@ -447,7 +447,7 @@ Per-stage timings (rewrite, embed, dense, keyword, fusion, rerank, generate) are
 | `chroma` | `chromadb/chroma` (pinned version) via a thin `chroma/Dockerfile` | Vector database in server mode; the wrapper only adds a non-root user and an owned `/data` |
 | `postgres` | `postgres:16`, run as `user: postgres` | Chunks, registry, users, conversations |
 
-* Only nginx publishes a port (default 8080, `HTTP_PORT` to change the host side); Postgres and ChromaDB stay on the internal network.
+* Only nginx publishes a port (host port 8081 by default, `HTTP_PORT` to change it; nginx listens on 8080 inside the container); Postgres and ChromaDB stay on the internal network.
 * Two networks: `internal` (`internal: true`: postgres, chroma, backend) and `edge` (frontend, backend). The backend is on both because it needs outbound HTTPS to Gemini; Postgres and ChromaDB have no route out, and nginx cannot even resolve their names.
 * Named volumes (`pg_data`, `chroma_data` mounted at `/data`, `uploads`) persist data across `docker compose down`. Non-root ownership of fresh volumes works because each image creates the mount directory owned by the runtime user.
 * Healthchecks (`pg_isready`; Chroma heartbeat over bash `/dev/tcp`, since the image has no curl/wget; backend `/api/health`; nginx `/healthz`) with `depends_on: condition: service_healthy`; the backend runs `alembic upgrade head` on start.

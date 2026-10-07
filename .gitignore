@@ -6,6 +6,10 @@
 # Runtime data when not using named volumes
 data/
 
+# Local sample documents (large PDFs). Anchored on purpose: the small generated
+# eval corpus at eval/sample_docs/ is committed.
+/sample_docs/
+
 # Python
 __pycache__/
 *.py[cod]

@@ -18,7 +18,7 @@ documents do not contain the answer, the app says so instead of guessing.
 ## Architecture
 
 ```
-                         host :8080 (HTTP_PORT)
+                         host :8081 (HTTP_PORT)
                                   │
    ┌──────────────────────────────▼─────────────────────────────┐
    │ edge network                                               │
@@ -52,8 +52,8 @@ cp .env.example .env     # then fill in GOOGLE_API_KEY, JWT_SECRET, POSTGRES_PAS
 docker compose up --build
 ```
 
-Open <http://localhost:8080>. The page shows the live status of the backend, Postgres and
-Chroma. API docs are at <http://localhost:8080/api/docs>.
+Open <http://localhost:8081>. The page shows the live status of the backend, Postgres and
+Chroma. API docs are at <http://localhost:8081/api/docs>.
 
 Generate the two secrets with:
 
@@ -91,8 +91,8 @@ Passwords are 8 to 72 bytes. Tokens last `JWT_EXPIRE_MINUTES` (default 60) and a
 `Authorization: Bearer <token>`. Try it from the interactive docs at `/api/docs` ("Authorize"), or:
 
 ```bash
-curl -s -X POST localhost:8080/api/auth/signup -H 'Content-Type: application/json'      -d '{"email": "you@company.com", "password": "a long passphrase"}'
-curl -s localhost:8080/api/auth/me -H "Authorization: Bearer $TOKEN"
+curl -s -X POST localhost:8081/api/auth/signup -H 'Content-Type: application/json' \n     -d '{"email": "you@company.com", "password": "a long passphrase"}'
+curl -s localhost:8081/api/auth/me -H "Authorization: Bearer $TOKEN"
 ```
 
 There is no user-management screen yet: to promote someone, update the database directly
@@ -133,7 +133,7 @@ All settings are environment variables, read only by `backend/app/config.py`. Bl
 | `JWT_EXPIRE_MINUTES` | `60` | Login token lifetime |
 | `BCRYPT_ROUNDS` | `12` | Password hashing cost (4 to 15); about 250 ms per hash at 12 |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `groundedrag` / **required** / `groundedrag` | Database credentials (compose builds `DATABASE_URL` from them; keep the password URL-safe) |
-| `HTTP_PORT` | `8080` | Host port for the web UI |
+| `HTTP_PORT` | `8081` | Host port for the web UI (nginx listens on 8080 inside the container) |
 | `EMBEDDING_MODEL` | `models/gemini-embedding-001` | Embedding model |
 | `EMBEDDING_DIM` | `768` | Output dimensionality (128 to 3072) |
 | `EMBEDDING_BATCH_SIZE` / `EMBEDDING_MAX_CONCURRENCY` | `32` / `4` | Ingestion throughput versus rate limits |
@@ -222,7 +222,7 @@ Deliberate choices and deviations from the spec documents. Newest phase last.
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `Bind for 0.0.0.0:8080 failed: port is already allocated` | Another process or container uses 8080. Set `HTTP_PORT=8081` (or any free port) in `.env`, then `docker compose up -d`. Find the owner with `docker ps` or `netstat -ano \| findstr :8080`. |
+| `Bind for 0.0.0.0:8081 failed: port is already allocated` | Another process or container uses host port 8081. Set `HTTP_PORT=8082` (or any free port) in `.env`, then `docker compose up -d`. Find the owner with `docker ps` or `netstat -ano \| findstr :8081`. |
 | `required variable POSTGRES_PASSWORD is missing a value` | `.env` is missing or incomplete. Run `cp .env.example .env` and fill in the required values. |
 | Backend restarts with `ValidationError ... jwt_secret` | `JWT_SECRET` is empty or shorter than 32 characters. |
 | Backend cannot log in to Postgres after editing `POSTGRES_PASSWORD` | The password is fixed when the `pg_data` volume is first created. Restore the old value, or reset with `docker compose down -v` (**deletes all data**). |

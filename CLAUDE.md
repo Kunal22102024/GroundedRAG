@@ -347,7 +347,7 @@ nginx serves the SPA (with fallback to `index.html`), proxies `/api` to `backend
 27. Healthchecks plus `depends_on: condition: service_healthy`; the backend runs `alembic upgrade head` on start.
 28. Pin the ChromaDB image and client library versions together (`chroma/Dockerfile` tag == `chromadb-client` in `requirements.txt`). This cannot be checked at runtime (the server's `/api/v2/version` returns a fixed `"1.0.0"`), so `tests/test_pinned_versions.py` enforces it; bump both in one change.
 29. No embedding model is baked into the image; only the optional FlashRank model may be.
-30. Containers run as non-root: backend uid 10001, chroma uid 10001 (via `chroma/Dockerfile`, which pre-creates `/data` so the named volume inherits ownership), nginx via `nginx-unprivileged` (port 8081 inside the container), postgres via `user: postgres`.
+30. Containers run as non-root: backend uid 10001, chroma uid 10001 (via `chroma/Dockerfile`, which pre-creates `/data` so the named volume inherits ownership), nginx via `nginx-unprivileged` (host port 8081, container port 8080), postgres via `user: postgres`.
 
 ---
 
@@ -418,7 +418,7 @@ docker compose exec backend pytest
 docker compose exec backend ruff check . && docker compose exec backend ruff format --check .
 docker compose exec backend python -m eval.run_eval
 
-# host port 8080 already in use? Set HTTP_PORT in .env (e.g. HTTP_PORT=8081)
+# host port 8081 already in use? Set HTTP_PORT in .env (e.g. HTTP_PORT=8082)
 
 # migrations
 docker compose exec backend alembic revision --autogenerate -m "describe change"
