@@ -1,0 +1,115 @@
+# GroundedRAG production-like stack: frontend (nginx), backend, chroma, postgres.
+#
+#   cp .env.example .env     # set GOOGLE_API_KEY, JWT_SECRET, POSTGRES_PASSWORD
+#   docker compose up --build
+#
+# Networking (CLAUDE.md rule 25): only nginx publishes a port. Postgres and
+# Chroma live on an `internal` network with no route to the outside world; the
+# backend joins both that network and `edge` (which has outbound access for the
+# Gemini API). ChromaDB has no per-user authorization and must never be exposed.
+
+name: groundedrag
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    # Run as the unprivileged postgres user from the start (rule 30). The data
+    # directory in the image is already owned by it, so the named volume
+    # inherits correct ownership.
+    user: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-groundedrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-groundedrag}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [internal]
+
+  chroma:
+    build:
+      context: ./chroma
+    restart: unless-stopped
+    environment:
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - chroma_data:/data
+    healthcheck:
+      # The image has no curl/wget, so speak minimal HTTP over bash's /dev/tcp.
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8000 &&
+          printf 'GET /api/v2/heartbeat HTTP/1.0\r\n\r\n' >&3 &&
+          head -n 1 <&3 | grep -q ' 200 '
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks: [internal]
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Infrastructure wiring. These override anything in .env.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-groundedrag}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-groundedrag}
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      UPLOAD_DIR: /data/uploads
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chroma:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    # Single worker by design: the BM25 index lives in process memory (rule 4).
+    networks: [internal, edge]
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks: [edge]
+
+networks:
+  internal:
+    internal: true
+  edge: {}
+
+volumes:
+  pg_data:
+  chroma_data:
+  uploads:

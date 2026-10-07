@@ -1,0 +1,16 @@
+# Runtime dependencies. Add a package only when a feature needs it.
+
+# Web framework
+fastapi==0.142.2
+uvicorn[standard]==0.54.0          # standard extras: uvloop, httptools, watchfiles (dev reload)
+pydantic==2.13.5
+pydantic-settings==2.15.0          # config.py: Settings loaded from the environment
+
+# Database
+sqlalchemy==2.1.3
+alembic==1.20.0
+psycopg[binary]==3.3.6             # PostgreSQL driver (SQLAlchemy URL scheme: postgresql+psycopg)
+
+# Vector store. HTTP-only client; MUST match the chromadb/chroma image tag in
+# chroma/Dockerfile (CLAUDE.md rule 28).
+chromadb-client==1.5.9

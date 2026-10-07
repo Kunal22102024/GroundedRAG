@@ -1,0 +1,12 @@
+# Keep LF line endings everywhere so shell scripts and Dockerfiles work
+# inside Linux containers even when checked out on Windows.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.docx binary
+*.ico binary
+*.woff binary
+*.woff2 binary

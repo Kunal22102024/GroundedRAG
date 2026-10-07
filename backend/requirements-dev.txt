@@ -1,0 +1,7 @@
+# Test and lint tooling. Installed in the image by default so that
+# `docker compose exec backend pytest` works (see Dockerfile INSTALL_DEV).
+-r requirements.txt
+
+pytest==9.1.1
+httpx2==2.13.1                     # required by fastapi.testclient (Starlette deprecated plain httpx)
+ruff==0.16.10

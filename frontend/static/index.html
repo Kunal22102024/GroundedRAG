@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GroundedRAG</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --card: #ffffff; --fg: #14171f; --muted: #5d6676;
+      --line: #e3e6ec; --ok: #12805c; --bad: #b42318; --accent: #3b5bdb;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0e1118; --card: #161b26; --fg: #e8ebf2; --muted: #9aa3b5;
+        --line: #262d3d; --ok: #3ccf91; --bad: #ff7a70; --accent: #8da2ff;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      padding: 1.5rem; background: var(--bg); color: var(--fg);
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    main {
+      width: min(30rem, 100%); background: var(--card); border: 1px solid var(--line);
+      border-radius: 14px; padding: 1.75rem;
+    }
+    h1 { margin: 0 0 .25rem; font-size: 1.5rem; letter-spacing: -.01em; }
+    p { margin: 0 0 1.25rem; color: var(--muted); }
+    ul { list-style: none; margin: 0 0 1.25rem; padding: 0; }
+    li {
+      display: flex; justify-content: space-between; gap: 1rem;
+      padding: .6rem 0; border-top: 1px solid var(--line);
+    }
+    .ok { color: var(--ok); } .bad { color: var(--bad); } .wait { color: var(--muted); }
+    button {
+      font: inherit; padding: .45rem .9rem; border-radius: 8px; cursor: pointer;
+      border: 1px solid var(--line); background: transparent; color: var(--accent);
+    }
+    small { display: block; margin-top: 1rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>GroundedRAG</h1>
+    <p>Stack status. The application UI arrives in a later build phase.</p>
+    <ul id="checks"><li><span>Backend</span><span class="wait">checking…</span></li></ul>
+    <button id="refresh" type="button">Re-check</button>
+    <small id="meta"></small>
+  </main>
+  <script>
+    const list = document.getElementById("checks");
+    const meta = document.getElementById("meta");
+
+    function row(name, ok, detail) {
+      const li = document.createElement("li");
+      const label = document.createElement("span");
+      label.textContent = name;
+      const state = document.createElement("span");
+      state.className = ok ? "ok" : "bad";
+      state.textContent = ok ? "healthy" : (detail || "unavailable");
+      li.append(label, state);
+      return li;
+    }
+
+    async function check() {
+      list.replaceChildren();
+      try {
+        const health = await (await fetch("/api/health")).json();
+        list.append(row("Backend", true));
+        meta.textContent = "Backend version " + health.version;
+        const res = await fetch("/api/ready");
+        const ready = await res.json();
+        for (const [name, c] of Object.entries(ready.checks)) {
+          list.append(row(name[0].toUpperCase() + name.slice(1), c.ok, c.detail));
+        }
+      } catch (err) {
+        list.append(row("Backend", false, "unreachable"));
+        meta.textContent = "";
+      }
+    }
+
+    document.getElementById("refresh").addEventListener("click", check);
+    check();
+  </script>
+</body>
+</html>

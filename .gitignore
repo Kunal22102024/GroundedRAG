@@ -1,0 +1,31 @@
+# Secrets and local config (commit .env.example only)
+.env
+.env.*
+!.env.example
+
+# Runtime data when not using named volumes
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local agent settings
+.claude/settings.local.json
