@@ -14,7 +14,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.api import health
+from app.api import auth, health
 from app.config import get_settings
 from app.constants import API_PREFIX
 from app.db import database
@@ -63,6 +63,7 @@ def create_app() -> FastAPI:
 
     api_router = APIRouter(prefix=API_PREFIX)
     api_router.include_router(health.router)
+    api_router.include_router(auth.router)
     app.include_router(api_router)
     return app
 

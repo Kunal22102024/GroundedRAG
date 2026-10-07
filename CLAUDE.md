@@ -100,11 +100,17 @@ groundedrag/
 │   │       └── models.py         # SQLAlchemy models
 │   │
 │   └── tests/
-│       ├── conftest.py           # forces dummy env (never the real DB), fixtures, mocked LLM/embeddings
+│       ├── conftest.py           # forces dummy env (never the real DB); `db`/`database_url` fixtures create a
+│       │                         # throwaway migrated Postgres database; mocked LLM/embeddings
 │       ├── test_config.py       # settings defaults and validation
 │       ├── test_health.py       # /health and /ready
 │       ├── test_middleware.py   # request ID, JSON logging, access-log privacy
 │       ├── test_pinned_versions.py  # chroma image tag == chromadb-client pin (rule 28)
+│       ├── test_models.py       # defaults, CHECK constraints, cascades (real Postgres)
+│       ├── test_migrations.py   # upgrade/downgrade, models == migration (incl. CHECKs and FK actions)
+│       ├── test_auth_service.py # hashing, JWT attacks, signup race, timing equalization, log privacy
+│       ├── test_auth_api.py     # signup/login/me, role changes applied to live tokens
+│       ├── test_access_control.py  # role -> access-level map (retrieval-time tests join it with filters.py)
 │       ├── test_parsers.py
 │       ├── test_chunking.py
 │       ├── test_filters.py
@@ -156,7 +162,7 @@ groundedrag/
 | `config.py` | `Settings` (Pydantic) read from env | The **only** place that reads environment variables |
 | `constants.py` | `REFUSAL_MESSAGE = "Insufficient information available in the selected documents."`, `ACCESS_LEVELS`, role → allowed-levels map, status enums | Import these; never retype the strings |
 | `schemas.py` | Pydantic models for every request and response | API contracts live here |
-| `deps.py` | `get_db`, `get_current_user`, `require_admin` | Auth is applied through dependencies, never ad hoc |
+| `deps.py` | `get_db`, `get_current_user`, `require_admin` (plus `DbSession`, `CurrentUser`, `AdminUser` aliases) | Auth is applied through dependencies, never ad hoc. `get_current_user` re-reads the user from Postgres on every request, so role changes and deletions apply to tokens already issued. Missing/invalid token is 401 (not HTTPBearer's default 403) |
 | `middleware.py` | Request ID, JSON logging, request timing (pure ASGI, so SSE streams are not buffered) | Never logs document text, questions, secrets, or query strings. `configure_logging` must leave `uvicorn.access` without handlers (uvicorn logs access lines, with query strings, whenever that logger has handlers) |
 
 ### 3.2 `api/` — HTTP layer
@@ -165,7 +171,7 @@ Handlers validate input, call one service function, and return a schema. **No bu
 
 | File | Purpose |
 | --- | --- |
-| `auth.py` | Signup, login, current-user. First registered user becomes `admin` |
+| `auth.py` | Signup, login, current-user. First registered user becomes `admin`. Signup and login both return `{access_token, token_type, expires_in, user}`. Handlers are plain `def` (bcrypt is CPU-bound; FastAPI runs them in a worker thread). 409 on duplicate email; one identical 401 for wrong password and unknown email |
 | `documents.py` | Upload (multi-file), list, detail, delete, serve original file |
 | `chat.py` | `POST /chat` — streams Server-Sent Events |
 | `conversations.py` | List, read, rename, delete conversations |
@@ -177,7 +183,7 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | File | Purpose |
 | --- | --- |
 | `health_service.py` | Readiness probes run concurrently in worker threads with a timeout; failure details are exception class names only (errors can embed hosts or credentials) |
-| `auth_service.py` | Password hashing (bcrypt), JWT issue/verify, user creation, role assignment |
+| `auth_service.py` | bcrypt hashing (work factor `BCRYPT_ROUNDS`), HS256 JWT issue/verify (algorithm pinned, claims `sub`/`iat`/`exp` only), `register_user`, `authenticate`. Signup takes a Postgres advisory lock so concurrent first signups cannot create two admins; unknown-email logins still run a bcrypt check so timing does not reveal which emails exist. Typed errors (`EmailAlreadyRegistered`, `InvalidCredentials`, `InvalidToken`) are translated to HTTP in `api/` and `deps.py` |
 | `document_service.py` | Validate uploads, store files under generated names, create DB rows, enqueue ingestion, delete (vectors → DB rows → file → BM25 refresh) |
 | `ingestion.py` | Background job: parse → chunk → metadata → write chunks to Postgres → embed → upsert to Chroma → refresh BM25 → set status. Cleans up on failure |
 | `chat_service.py` | Full chat turn: rewrite → filter → retrieve → guard → generate → verify citations → persist → stream events |
@@ -207,7 +213,7 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | File | Purpose |
 | --- | --- |
 | `database.py` | SQLAlchemy engine and session factory |
-| `models.py` | `users`, `documents`, `chunks`, `conversations`, `messages`, `feedback` (columns defined in `TDD.md` §4.3) |
+| `models.py` | `users`, `documents`, `chunks`, `conversations`, `messages`, `feedback` (columns defined in `TDD.md` §4.3). Enum-like columns are `VARCHAR` + named `CHECK` (not PG enums); cascades are `ON DELETE` in the database; constraint names come from `NAMING_CONVENTION` in `database.py`. Every change needs a new migration, and `tests/test_migrations.py` fails if models and migrations disagree |
 
 ---
 
@@ -333,7 +339,7 @@ nginx serves the SPA (with fallback to `index.html`), proxies `/api` to `backend
 22. Secrets only through `.env` (ignored by git). Commit `.env.example` only.
 23. Uploaded files are stored under generated names; validate extension, content type, and size; never use user-supplied paths.
 24. Deleting a document must remove vectors, rows, and file; its content must never appear in later answers.
-25. Passwords: bcrypt. Tokens: short-lived JWT. Only nginx publishes a port; Postgres and Chroma stay internal. Compose enforces this with an `internal: true` network (Postgres, Chroma, backend) and an `edge` network (nginx, backend; gives the backend outbound access to Gemini). Postgres and Chroma have no route to the internet and nginx cannot resolve them.
+25. Passwords: bcrypt, at most 72 bytes (rejected at signup, never silently truncated). Tokens: short-lived HS256 JWT carrying only the user id. Only nginx publishes a port; Postgres and Chroma stay internal. Compose enforces this with an `internal: true` network (Postgres, Chroma, backend) and an `edge` network (nginx, backend; gives the backend outbound access to Gemini). Postgres and Chroma have no route to the internet and nginx cannot resolve them.
 
 ### 7.6 Docker
 
@@ -341,7 +347,7 @@ nginx serves the SPA (with fallback to `index.html`), proxies `/api` to `backend
 27. Healthchecks plus `depends_on: condition: service_healthy`; the backend runs `alembic upgrade head` on start.
 28. Pin the ChromaDB image and client library versions together (`chroma/Dockerfile` tag == `chromadb-client` in `requirements.txt`). This cannot be checked at runtime (the server's `/api/v2/version` returns a fixed `"1.0.0"`), so `tests/test_pinned_versions.py` enforces it; bump both in one change.
 29. No embedding model is baked into the image; only the optional FlashRank model may be.
-30. Containers run as non-root: backend uid 10001, chroma uid 10001 (via `chroma/Dockerfile`, which pre-creates `/data` so the named volume inherits ownership), nginx via `nginx-unprivileged` (port 8080 inside the container), postgres via `user: postgres`.
+30. Containers run as non-root: backend uid 10001, chroma uid 10001 (via `chroma/Dockerfile`, which pre-creates `/data` so the named volume inherits ownership), nginx via `nginx-unprivileged` (port 8081 inside the container), postgres via `user: postgres`.
 
 ---
 
@@ -358,6 +364,7 @@ nginx serves the SPA (with fallback to `index.html`), proxies `/api` to `backend
 
 ## 9. Testing & Evaluation Rules
 
+* **Database tests** run against a throwaway database (`groundedrag_test_<random>`) that the fixtures create on the stack's Postgres, migrate with the real Alembic migrations, and drop afterwards; they skip when no server is reachable and refuse to truncate any other database. New concurrency-sensitive code needs a test that **fails when the protection is removed** (see the signup-lock test, which widens the race window on purpose); mutate a copy of the code to check.
 * **Unit tests:** parsers, chunking (page numbers preserved, no mid-sentence cuts, overlap, token ceiling), filter building, RRF, guard (including lexical override), citation verification, access-level filtering.
 * **Integration test:** upload a small sample document → wait for `indexed` → query → assert a valid citation. Mock the LLM and embeddings in tests (no network calls, no API key needed).
 * **Evaluation (`eval/run_eval.py`):** hit-rate@5 and MRR for dense-only, keyword-only, hybrid, hybrid + rerank; refusal accuracy on unanswerable questions; per-stage latency p50/p95. Include exact-token questions and about 10 unanswerable ones.
@@ -401,7 +408,7 @@ nginx serves the SPA (with fallback to `index.html`), proxies `/api` to `backend
 ```bash
 # first run
 cp .env.example .env              # set GOOGLE_API_KEY, JWT_SECRET, DB password
-docker compose up --build         # app at http://localhost:8080
+docker compose up --build         # app at http://localhost:8081
 
 # development with hot reload
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up
@@ -422,7 +429,7 @@ docker compose exec backend alembic upgrade head
 
 ## 12. Definition of Done (acceptance checks)
 
-1. `docker compose up --build` from a clean checkout starts everything; `http://localhost:8080` loads.
+1. `docker compose up --build` from a clean checkout starts everything; `http://localhost:8081` loads.
 2. Register, log in, upload a multi-page PDF and a DOCX; statuses go queued → processing → indexed.
 3. Ask a question: streamed answer with working citation chips; clicking one opens the drawer with the exact chunk and the original PDF at the cited page.
 4. An exact-token query (error code or ID present in a document) is found even when phrased awkwardly, and is not wrongly refused.

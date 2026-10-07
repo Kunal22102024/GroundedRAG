@@ -6,6 +6,13 @@ from enum import StrEnum
 
 API_PREFIX = "/api"
 
+JWT_ALGORITHM = "HS256"
+
+# bcrypt only uses the first 72 bytes of a password and bcrypt 5 raises on more,
+# so longer passwords are rejected at the API boundary instead of truncated.
+PASSWORD_MIN_CHARS = 8
+PASSWORD_MAX_BYTES = 72
+
 # Returned verbatim, without calling the LLM, when the documents cannot answer
 # (CLAUDE.md rules 8 and 11).
 REFUSAL_MESSAGE = "Insufficient information available in the selected documents."
@@ -42,3 +49,17 @@ class DocumentStatus(StrEnum):
     PROCESSING = "processing"
     INDEXED = "indexed"
     FAILED = "failed"
+
+
+class MessageRole(StrEnum):
+    """Who authored a chat message."""
+
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+class FeedbackRating(StrEnum):
+    """Thumbs up/down on an assistant message."""
+
+    UP = "up"
+    DOWN = "down"

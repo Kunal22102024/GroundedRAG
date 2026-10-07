@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     # --- Authentication and logging -----------------------------------------
     jwt_secret: SecretStr
     jwt_expire_minutes: int = Field(default=60, ge=1)
+    # bcrypt work factor. 12 costs roughly 250 ms per hash; tests lower it.
+    bcrypt_rounds: int = Field(default=12, ge=4, le=15)
     log_level: str = "INFO"
 
     @field_validator("jwt_secret")
