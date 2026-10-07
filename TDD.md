@@ -2,7 +2,7 @@
 
 **System Name:** GroundedRAG — Hybrid Retrieval & Metadata Pipeline
 
-**Version:** 1.3.2
+**Version:** 1.3.3
 
 **Target Architecture:** Containerized services (Docker Compose): frontend (nginx), backend (FastAPI), vector database (ChromaDB), relational database (PostgreSQL). Embeddings and generation are provided by Google Gemini through LangChain.
 
@@ -93,7 +93,18 @@ Traditional fixed-character chunking (e.g., 500 characters with 50-character ove
 * Target about 800 characters per chunk with about 100 characters of overlap.
 * Never cross a page boundary without recording the page range (`page_number` for the first page, `page_end` for the last).
 * **Token ceiling:** `gemini-embedding-001` accepts at most 2,048 tokens per input and silently truncates the excess. The chunker enforces a hard maximum well below this (about 800 characters is roughly 200 tokens), so no chunk is ever silently cut.
-* Detect scanned PDFs (pages with no extractable text) and fail the document with a clear "scanned PDF, OCR not supported" message.
+* Detect scanned PDFs (pages with no extractable text) and fail the document with a clear "scanned PDF, OCR not supported" message. A PDF whose text-bearing pages are under 20% of its pages is treated as scanned; blank PDFs get the same message.
+
+**Implemented behavior (phase 1 parsers and chunker)**
+
+* **Segments.** Every parser returns ordered `(page, section, text)` segments (a paragraph, list item, table row or code block) plus the file's own properties (title, creation date, and for Markdown front matter a department and type). Formats without pages (DOCX, MD, HTML, TXT) use page 1.
+* **PDF pages are physical pages**, so `#page=N` opens the cited page. Verified against an independent PDF engine: 0 wrong pages in 150 sampled snippets, and 0 of 36 on a document whose page numbers are known by construction.
+* **PDF sections** come from the document outline when it has enough entries (outline titles are matched to the page lines carrying them, including titles that wrap over up to three lines or lose spaces); otherwise from font size (at least 1.12x the body size) and bold short lines. Consecutive heading lines of the same style merge into one title.
+* **Two-column pages are read column by column.** A vertical gutter (at least 10 pt wide, crossed by at most 10% of lines) with prose on both sides splits merged lines into left and right pieces; the left column is read first and full-width lines (headings spanning both columns) separate blocks. Pages whose "columns" hold short cells (tables) are not split. Without this, side-by-side text is stitched into lines mixing two unrelated sentences. Measured against an independent engine, agreement rose from 37% to 74% on a design-heavy 37-page handbook and is 92% on a 327-page manual with 150 two-column pages.
+* **Page chrome is removed:** running headers, footers and web-page banners that repeat on at least 40% of pages (top/bottom lines, or any line of 12 or more characters), and bare page labels ("Page 3", "3 of 12", "- 4 -") at page edges. A safety net skips removal if it would delete more than 30% of the text, so documents of near-identical pages (forms) are never emptied.
+* **Hyphenated line breaks are repaired** ("administra-" + "tive"), and ligatures, soft hyphens and zero-width characters are normalized.
+* **Known limitation:** PDFs with a text layer that overprints other text (for example a watermark laid over body text) can interleave characters from the two layers; a stricter line tolerance did not help. Such a document still indexes and its page numbers are correct, but chunk text near the overprint is noisy.
+* **Chunking.** Chunks are packed by sentence (abbreviations, list markers and initials are not sentence ends), never cross a section, and may span pages (recording `page_number` to `page_end`). Overlap is made of whole trailing sentences only, only when they sit on the same page and section as what follows, and is capped at 1.5x `CHUNK_OVERLAP_CHARS`, so a chunk's page range always describes exactly the text it contains. A chunk is at most `CHUNK_TARGET_CHARS` plus that cap, validated at startup against `CHUNK_HARD_MAX_CHARS` (1500 characters), far below the 2,048-token limit even for one-token-per-character scripts. A sentence longer than the target is split at word boundaries, and a single token longer than the target is hard-cut. Tiny chunks are merged into a same-section neighbour, and chunks with fewer than 3 letters or digits are dropped.
 
 **Phase 2 (upgrade): semantic boundary detection**
 
@@ -135,6 +146,10 @@ ChromaDB accepts only **flat** metadata values (string, integer, float, boolean)
 
 Metadata resolution order: explicit values supplied at upload, then folder/filename conventions, then file properties, then upload date. LLM-based extraction is an optional later enhancement.
 
+* Resolution happens **during indexing** (PRD 4.1); until then `documents.creation_date` is `NULL` and department and type hold only what the uploader or the folder said.
+* Folder or file-name department: a known department (HR, Engineering, Legal, Operations, IT) as a folder or as the first word of the name; a two-letter name such as "IT" must be capitalized so the word "it" does not match. Type: keywords such as policy/standard, manual/handbook/guide, spec/rfc, contract/agreement in the name or title.
+* Dates in a file name: `2026-01-15` or `20260115` (exact), `April2025` or `feb_2026` (month, reported as the 1st), a bare year (January 1st). A month- or year-only name is **refined to the exact day by a file date that agrees with it** (a PDF created on 2025-04-07 named `..._April2025.pdf` becomes 2025-04-07); a disagreeing file date (a later re-save) never overrides the name. Dates before 1990 or more than a year ahead are ignored.
+
 ### 3.3 Embedding Generation (Gemini)
 
 ```python
@@ -161,6 +176,10 @@ Rules for the embedding wrapper (`core/embeddings.py`):
 * **Normalize** every vector to unit length in the backend. Google requires normalization for any dimension other than the 3072 default.
 * The same model and dimension are used for ingestion and querying. The Chroma collection records `embedding_model` and `embedding_dim` in its metadata and its name (e.g., `chunks__gemini-embedding-001__768`); the backend verifies this at startup and refuses to start on a mismatch.
 * Embedding calls are batched (configurable batch size and concurrency) and wrapped in retries with exponential backoff and jitter for rate-limit (429) and transient (5xx) errors.
+* **Error handling.** LangChain wraps the SDK error, so the wrapper walks the exception chain to classify it: rate limit (429), daily quota (never retried), rejected key (HTTP 400 "API key not valid", 401, 403: never retried), bad input, transient (5xx, timeouts, connection errors) or fatal. A server-supplied "retry in N s" is honoured, and a rate limit starts a cooldown shared by all threads so one 429 does not trigger a burst of more. A wait longer than 120 s is reported instead of blocking a worker. Messages are user-safe: they never contain text or the key.
+* **Free-tier keys are heavily limited.** Measured with the project's key: `embed_content_free_tier_requests`, limit 100 per minute per model, where every text counts as one request and a batch of 120 is refused at once. Indexing therefore runs at about 100 chunks per minute (a 300-page manual is roughly 15 minutes of waiting) and a daily quota may stop it. A billing-enabled key removes the limit.
+* Raw vectors are not unit length at reduced dimensions (measured norm about 0.58 at 768), so normalization in the backend is required, not optional. Inputs over 2,000 characters are rejected instead of truncated.
+* Measured latency from the development environment: 0.8 to 2.7 s per single-query call and 0.7 to 4 s per batch, well above the 300 ms query-embedding target in section 12 (network distance, not the wrapper); repeated questions are served from the LRU cache.
 * Identical chunk texts within one upload are embedded once.
 * Query embeddings are cached in a small in-memory LRU so repeated questions do not pay the API round trip.
 
@@ -176,7 +195,11 @@ queued ──► processing ──► indexed
 * Steps: parse → chunk → resolve metadata → write chunks to PostgreSQL → embed in batches → upsert to ChromaDB → refresh BM25 → mark `indexed` with `chunk_count`.
 * On startup, any document stuck in `processing` is marked `failed` (or re-queued), so jobs interrupted by a restart never hang forever.
 * A failure at any step marks the document `failed` and removes partial chunks from Chroma and Postgres, so no half-indexed document is ever searchable.
-* Re-embedding after a model or dimension change is a maintenance command that reads chunks from PostgreSQL into a new collection.
+* Chunk rows are written and committed **before** anything reaches Chroma, so Postgres always knows what Chroma should hold. Failure cleanup removes the document from Postgres, Chroma and BM25, and the user sees a safe message (the scanned-PDF message, the rate-limit message, "the search index is unavailable", or a generic one with details only in the logs).
+* One document is indexed at a time by default (`INGESTION_WORKERS`) in an in-process pool. A per-document lock is shared with deletion, so a document being indexed answers 409 to a delete and a delete in progress makes ingestion skip the document.
+* Logs carry the document id, page and chunk counts and per-stage timings (`parse_ms`, `chunk_ms`, `db_ms`, `embed_ms`, `index_ms`, `total_ms`), never names or text.
+* **Startup consistency.** The backend verifies the Chroma collection (name, recorded model and dimension, cosine distance) and **refuses to start** on a mismatch. It also refuses to start when PostgreSQL holds indexed chunks but the collection is empty, which is what a changed `EMBEDDING_MODEL`/`EMBEDDING_DIM` or a lost Chroma volume looks like (the collection name encodes model and dimension, so the new collection starts empty); serving questions from an empty index would silently return nothing. A non-empty difference only logs a warning.
+* Re-embedding after a model or dimension change is a maintenance command, `python -m app.maintenance reembed`, that reads indexed chunks from PostgreSQL into the configured collection. It is resumable (chunks already present are skipped), so a rate-limited or quota-stopped run continues where it stopped; run it with the entrypoint overridden because the backend will not start until it has finished.
 
 ---
 
@@ -190,6 +213,7 @@ queued ──► processing ──► indexed
 * **Metadata filtering:** `where` clauses with `$eq`, `$in`, `$gte`, `$lte`, combined with `$and`. Chroma has no separately declared payload indexes; filter performance is validated against the targets in §11.
 * **Batching:** upserts stay below the server's maximum batch size.
 * **Deletion:** `delete(where={"document_id": ...})` removes all of a document's vectors.
+* **Index health: verify, never trust.** ChromaDB 1.5.9 can store a vector that its HNSW index never returns (`get` still returns it with its embedding, but no query does, not even one filtered by `document_id`). It was observed once in live use: after deleting 12 documents and uploading the same files again, 15 of 155 vectors (all of the smallest documents) were stored but unreachable. Recall@3 against exact search was 8/18, a query for all 155 vectors returned 140, and a freshly built collection from the same vectors scored 18/18. The trigger was **not** reproduced in controlled experiments (random and real embeddings, delete-everything-then-refill, identical duplicates, waits past compaction, crossing `batch_size`), so it is treated as a storage-engine fault that can recur at any time, and silent recall loss would defeat the product. The backend therefore verifies the index: every new chunk is queried with its own embedding before the document is marked `indexed` (the vector must come back as the nearest hit, or an identical twin at distance about 0 must, so re-uploads are not misread); a miss is repaired by deleting and re-inserting just that vector, with a rebuild of the whole collection from the vectors Chroma still stores as the fallback (no embedding calls, no API cost); startup verifies the whole collection up to 20,000 vectors and repairs it; and `python -m app.maintenance verify-index` does the same on demand. Verified on the broken live collection: all 15 were found and a targeted re-insert restored a full 155 of 155.
 * **Client:** the backend uses the HTTP client against the `chroma` container.
 
 ### 4.2 Keyword Index (BM25, in the backend)
@@ -198,6 +222,8 @@ queued ──► processing ──► indexed
 * A custom tokenizer keeps identifiers intact and also splits them: `ERR_404_NET` is indexed as the whole token plus `err`, `404`, `net`. Queries are tokenized identically.
 * **Filter parity:** the same metadata and access-level filter used for ChromaDB is applied to the BM25 channel (allowed chunk IDs resolved from PostgreSQL, scores masked to that set), so both channels search an identical subset.
 * **Lifecycle:** loaded at startup from PostgreSQL, updated on ingest and delete, rebuildable on demand. The backend runs a **single worker process** in Phase 1.
+* **Implementation:** `bm25s` (Lucene variant). It cannot add documents incrementally, so each update rebuilds from the stored token lists (interned strings, so memory is a pointer per token). The index state is an immutable snapshot replaced atomically; searches read it without locking, so a long ingestion never blocks a question. Each chunk keeps the same metadata Chroma filters on, and `search` takes a predicate over it, giving both channels an identical subset.
+* **Tokenizer:** letters and digits in any script, with identifiers kept whole and also split (`ERR_404_NET` becomes `err_404_net`, `err`, `404`, `net`), case-folded, single letters dropped.
 * **Alternative:** PostgreSQL full-text search (`tsvector` + `ts_rank_cd`) is multi-worker safe and needs no in-memory index, at the cost of non-BM25 ranking and less control over identifier tokenization.
 
 ### 4.3 Relational Database (PostgreSQL) — Data Model
@@ -342,10 +368,10 @@ All routes are under `/api` and require a JWT bearer token except signup, login,
 | Method & Path | Purpose |
 | --- | --- |
 | `POST /auth/signup`, `POST /auth/login`, `GET /auth/me` | Authentication; the first registered user becomes `admin`. Signup and login return `{access_token, token_type: "bearer", expires_in, user}`; signup is `201`, a duplicate email is `409`, and wrong password and unknown email both return the same `401` |
-| `POST /documents` | Multipart upload of one or more files with optional department, document_type, access_level |
-| `GET /documents`, `GET /documents/{id}` | List and inspect documents with status and chunk counts |
-| `GET /documents/{id}/file` | Serve the original file for source preview |
-| `DELETE /documents/{id}` | Delete file, DB rows, and all vectors |
+| `POST /documents` | Multipart upload of one or more files with optional department, document_type, creation_date (YYYY-MM-DD), access_level. Returns 202 with `documents` (status `queued`) and `rejected` (file and reason): files are accepted or refused one by one; 400 if none is accepted, 403 for `Restricted` by a non-admin, 422 for invalid fields |
+| `GET /documents`, `GET /documents/{id}` | List (filters: department, type, status, access level, file-name search; paging) and inspect documents with status, error message and chunk counts, plus library totals. A document above the caller's access level is a 404, never a 403 |
+| `GET /documents/{id}/file` | Serve the original. Only PDFs are inline (`application/pdf`); everything else is an attachment with `Content-Security-Policy: sandbox`, so an uploaded HTML page can never run script on the app's origin. `nosniff` and `no-store` on all |
+| `DELETE /documents/{id}` | Delete file, DB rows, and all vectors. Admin or uploader (403 otherwise); 409 while the document is being indexed; 503 if a step failed, leaving the document parked as `failed` and unsearchable so the delete can simply be repeated |
 | `POST /chat` | Server-Sent Events stream (below) |
 | `GET /conversations`, `GET /conversations/{id}`, `PATCH /conversations/{id}`, `DELETE /conversations/{id}` | Conversation history management |
 | `POST /messages/{id}/feedback` | Thumbs up/down |
@@ -365,6 +391,9 @@ All routes are under `/api` and require a JWT bearer token except signup, login,
   * **Out of scope for now:** login rate limiting or lockout, password reset, email verification, and a user-management API (promoting or removing users); roles beyond the first admin must be changed in the database.
 * **Roles and access levels:** `admin` may read `Public`, `Internal`, and `Restricted`; `user` may read `Public` and `Internal`. Enforced as a metadata filter on every query, in both retrieval channels.
 * **Uploads:** any authenticated user may upload; only `admin` may assign `Restricted`. Deletion by `admin` or the document owner.
+  * **Validation:** extension (pdf, docx, md, markdown, html, htm, txt), declared content type (image, audio and video types refused; otherwise advisory), magic bytes (`%PDF-` near the start, a DOCX that is a zip with `word/document.xml` and a bounded unpacked size, text without NUL bytes) and size (`MAX_UPLOAD_MB`, counted while copying).
+  * **Storage:** the original is stored as `<uuid4 hex><validated extension>`; the uploaded name is only ever displayed (folders stripped, control characters removed, 255 characters), never used as a path. The served media type comes from our validated extension, not the client.
+  * **Delete order:** the document is first parked as `failed` (instantly excluded from retrieval), then removed from BM25, Chroma and Postgres (chunks cascade), then the file is deleted. A leftover file is wasted space, not a leak, since nothing points at it.
 * **File safety:** extension and content-type validation, size limit, generated storage names, no path traversal.
 * **Prompt injection:** document text is untrusted. The prompt marks context as data, and the model has no tools, so injected instructions cannot trigger actions; citation verification catches fabricated sources.
 * **Network exposure:** only nginx publishes a port. ChromaDB has no per-user authorization and must never be exposed; all authorization happens in the backend.
@@ -375,7 +404,7 @@ All routes are under `/api` and require a JWT bearer token except signup, login,
 
 Both document chunks (for embedding) and retrieved context plus questions (for generation) are sent to Google's Gemini API. For enterprise documents:
 
-* Use a **billing-enabled (paid) project** key. Google's terms state that paid-service prompts and responses are not used to improve its products, whereas free-tier data may be; confirm current terms before uploading confidential material.
+* Use a **billing-enabled (paid) project** key. The key used during development is a free-tier key (the API reports `embed_content_free_tier_requests`), so documents sent through it are subject to the free-tier data terms and to a 100-requests-per-minute limit. Google's terms state that paid-service prompts and responses are not used to improve its products, whereas free-tier data may be; confirm current terms before uploading confidential material.
 * Never log document text, questions, or API keys.
 * Restricted documents are still sent to Google when indexed; if that is unacceptable for a document class, exclude it or use a locally hosted embedding and LLM backend (the wrappers are provider-agnostic for this reason).
 
@@ -482,18 +511,23 @@ Per-stage timings (rewrite, embed, dense, keyword, fusion, rerank, generate) are
 | --- | --- |
 | **`gemini-2.5-flash` lifecycle.** As of October 2026 it is a legacy model; Google's deprecations page recommends `gemini-3.5-flash` as its replacement, and its dates are described as the earliest possible, with exact dates communicated later. An October 16, 2026 shutdown date was listed in July and later removed. | Model ID is configuration only; keep the LLM behind one wrapper; plan a migration test with the eval set; check the deprecations page before release. |
 | Embedding-model or dimension change forces re-indexing | Collection name encodes model and dimension; startup check; documented re-embed command that reads from PostgreSQL. |
-| Threshold calibrated for another model gives wrong refusals | Treat 0.45 as provisional; calibrate on the eval set (§6.3). |
+| Threshold calibrated for another model gives wrong refusals | Treat 0.45 as provisional; calibrate on the eval set (§6.3). Measured in phase 3 with `gemini-embedding-001` at 768 dimensions on a 62-chunk corpus: the best chunk for a relevant question scored 0.76 to 0.82 cosine and the best chunk for an unrelated question 0.56 at most, so 0.45 would never refuse; a cutoff near 0.65 separates those samples, but the corpus is far too small to trust. |
 | Rate limits and cost during bulk ingestion | Batching, bounded concurrency, backoff, deduplication, resumable failure handling. |
 | Data leaves the deployment | Paid-tier key, confirm terms, provider-agnostic wrappers (§9). |
 | In-memory BM25 limits scaling | Single worker now; PostgreSQL full-text search is the scale-out path. |
 | ChromaDB single-node, no built-in authorization | Internal network only; backend enforces all access control. |
 | Chroma server and client versions can drift unnoticed (the server does not report its build version) | Image tag and client pin live side by side and a unit test fails if they differ; bump both in one change. |
 | Scanned PDFs unsupported | Detected and rejected with a clear message; OCR is a later phase. |
+| ChromaDB can silently stop returning stored vectors (observed: 15 of 155 after delete and re-upload; trigger unknown) | Every write is verified by querying each new vector with its own embedding; automatic repair by re-insert or rebuild; startup verification; `verify-index` command (section 4.1). Re-test on every Chroma upgrade. |
+| Free-tier embedding quota (about 100 requests per minute, possibly a daily cap) makes large documents slow or impossible | Backoff honours the server's retry hint; the job fails cleanly with a clear message on a daily quota; `reembed` and re-upload can resume; use a billing-enabled key for real workloads. |
+| PDFs with overprinted or unusual text layers (watermarks over body text) yield interleaved characters | Page numbers stay correct and the document still indexes; documented limitation, no OCR or layout model in phase 1. |
+| Complex multi-column layouts with callouts and sidebars may still read out of order | Column detection covers the common two-column case and leaves tables alone; measured 74% to 92% agreement with an independent engine on real manuals; improve with the evaluation set. |
 
 ---
 
 ## Changelog
 
+* **1.3.3:** Phase 3 (parsers, chunking, metadata, embeddings, vector store, BM25, ingestion, documents API). Documented implemented parser behavior (physical PDF pages, outline or font-based sections, column-by-column reading of two-column pages, page-chrome removal with a safety net, known overprint limitation) and chunker rules (sentence packing, same-page overlap, size ceiling validated at startup); metadata resolution during indexing with month/year refinement (migration 0002 makes `creation_date` nullable until then); the embeddings wrapper's error classification, shared rate-limit cooldown and measured free-tier limits (100 requests per minute) and latency; ingestion ordering (Postgres before Chroma), failure cleanup, per-document lock and startup consistency checks including refusal to start on an empty Chroma and the `reembed` maintenance command; `bm25s` details; the documents API contract, upload validation, safe file serving and the park-then-delete order; verification and repair of the Chroma index after a live recall failure (stored vectors that no query returned); new risks.
 * **1.3.2:** Phase 2 (database and authentication). Documented the schema conventions (UUID keys, `VARCHAR` + `CHECK` instead of ENUM types, database-level cascades, lower-case unique email, `page_number >= 1`, one feedback row per user per message, `SET NULL` for document owners) and the test that keeps models and migration identical. Documented the authentication design: bcrypt with a byte limit and configurable work factor, pinned-algorithm JWTs that carry only the user id, role re-read from the database per request, advisory-locked signup so only one first admin can exist, enumeration-resistant login, and the explicit list of what is out of scope. Added `BCRYPT_ROUNDS` to the configuration.
 * **1.3.1:** Phase 1 (deployment skeleton) refinements, no behavior change to retrieval or generation. Deployment: two Docker networks (`internal` with no egress for Postgres/Chroma, `edge` for nginx and the backend), a thin `chroma/Dockerfile` so ChromaDB runs non-root with an owned `/data`, `nginx-unprivileged` on container port 8080 with `HTTP_PORT` for the host side, Postgres run as `user: postgres`, healthcheck mechanics per service (the Chroma image has no curl/wget). Chroma: documented the exact cosine collection configuration and the `embedding_function=None` requirement, both verified on 1.5.9; documented that server/client version equality cannot be verified at runtime (fixed `"1.0.0"` from `/api/v2/version`) and is enforced by a test instead. Readiness: `/ready` covers Postgres and Chroma now; the embedding-model probe arrives with `core/embeddings.py` and will be cached. Logging: uvicorn's own access log is kept off because it records query strings.
 * **1.3.0:** Switched embeddings to Google `gemini-embedding-001` and generation to `gemini-2.5-flash` via LangChain. Added: reduced 768-dim output with normalization, explicit `RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY` task types, 2,048-token input ceiling, model/dimension-aware collection naming with startup check, embedding retries/batching/caching, thinking budget 0 and finish-reason handling, a lexical override in the guard so exact-token queries are not wrongly refused, adjusted latency targets (API embeddings), data privacy section, security and access-control section, PostgreSQL data model, API contract summary, ingestion state machine, configuration reference, observability, and a risks table including Gemini model lifecycle. Removed FastEmbed/BGE and build-time embedding model baking.

@@ -15,6 +15,8 @@ from typing import Self
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.constants import CHUNK_HARD_MAX_CHARS
+
 _LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
 _MIN_JWT_SECRET_CHARS = 32
 
@@ -32,6 +34,8 @@ class Settings(BaseSettings):
     embedding_dim: int = Field(default=768, ge=128, le=3072)
     embedding_batch_size: int = Field(default=32, ge=1, le=100)
     embedding_max_concurrency: int = Field(default=4, ge=1, le=32)
+    # Retries per batch for rate limits (429) and transient (5xx/network) errors.
+    embedding_max_retries: int = Field(default=6, ge=0, le=20)
 
     llm_model: str = "gemini-2.5-flash"
     rewrite_model: str | None = None
@@ -50,6 +54,8 @@ class Settings(BaseSettings):
     chunk_target_chars: int = Field(default=800, ge=200)
     chunk_overlap_chars: int = Field(default=100, ge=0)
     max_upload_mb: int = Field(default=50, ge=1)
+    # Documents indexed at the same time. 1 keeps embedding API usage predictable.
+    ingestion_workers: int = Field(default=1, ge=1, le=8)
 
     # --- Infrastructure -----------------------------------------------------
     database_url: str
@@ -84,6 +90,13 @@ class Settings(BaseSettings):
     def _overlap_smaller_than_target(self) -> Self:
         if self.chunk_overlap_chars >= self.chunk_target_chars:
             raise ValueError("CHUNK_OVERLAP_CHARS must be smaller than CHUNK_TARGET_CHARS")
+        # A chunk can be the target plus up to 1.5x the overlap (CLAUDE.md rule 16: stay far
+        # below the embedding model's 2,048-token input limit instead of relying on truncation).
+        longest = self.chunk_target_chars + int(self.chunk_overlap_chars * 1.5)
+        if longest > CHUNK_HARD_MAX_CHARS:
+            raise ValueError(
+                f"CHUNK_TARGET_CHARS plus 1.5 x CHUNK_OVERLAP_CHARS must not exceed {CHUNK_HARD_MAX_CHARS}"
+            )
         return self
 
     @property

@@ -54,13 +54,14 @@ groundedrag/
 │   ├── requirements-dev.txt      # pytest, httpx2, ruff (installed in the image by default)
 │   ├── pyproject.toml            # pytest + ruff configuration
 │   ├── alembic.ini
-│   ├── alembic/                  # env.py, script.py.mako, versions/ (migrations)
+│   ├── alembic/                  # env.py, script.py.mako, versions/ (0001 schema, 0002 nullable creation_date)
 │   ├── app/
 │   │   ├── main.py               # app factory, startup/shutdown, router mounting
 │   │   ├── config.py             # Settings loaded from env (single source of config)
 │   │   ├── constants.py          # REFUSAL_MESSAGE, access-level map, enums
 │   │   ├── schemas.py            # Pydantic request/response models
 │   │   ├── deps.py               # FastAPI dependencies: db session, current user, require_admin
+│   │   ├── maintenance.py        # `python -m app.maintenance reembed`: rebuild vectors from Postgres (resumable)
 │   │   ├── middleware.py         # request-ID, structured logging, timing
 │   │   │
 │   │   ├── api/                  # HTTP layer only: parse request, call service, shape response
@@ -72,7 +73,8 @@ groundedrag/
 │   │   │   └── health.py
 │   │   │
 │   │   ├── services/             # business workflows; orchestrate core + db
-│   │   │   ├── health_service.py # readiness probes (Postgres, Chroma) so api/ never touches them
+│   │   │   ├── health_service.py # readiness probes (Postgres, Chroma, embeddings) so api/ never touches them
+│   │   │   ├── index_service.py  # startup: verify collection, recover jobs, refuse inconsistent index, load BM25
 │   │   │   ├── auth_service.py
 │   │   │   ├── document_service.py
 │   │   │   ├── ingestion.py
@@ -111,13 +113,21 @@ groundedrag/
 │       ├── test_auth_service.py # hashing, JWT attacks, signup race, timing equalization, log privacy
 │       ├── test_auth_api.py     # signup/login/me, role changes applied to live tokens
 │       ├── test_access_control.py  # role -> access-level map (retrieval-time tests join it with filters.py)
-│       ├── test_parsers.py
-│       ├── test_chunking.py
+│       ├── pdf_factory.py       # builds PDFs (pages, outlines, columns, scans) for tests; no binary fixtures
+│       ├── test_parsers.py      # pages, headings, columns, chrome removal, every format, failure messages
+│       ├── test_chunking.py     # sentence integrity, overlap rules, page ranges, size ceilings
+│       ├── test_metadata.py     # precedence: upload > file name > file properties > upload date
+│       ├── test_embeddings.py   # task types, normalization, batching, retries, error classification
+│       ├── test_vectorstore.py  # real Chroma: cosine, flat metadata, mismatch refusal, filters
+│       ├── test_bm25.py         # identifier-aware tokenizer, filtering, concurrent updates
+│       ├── test_ingestion.py    # end to end with a fake embedder; failure cleanup; ordering; worker pool
+│       ├── test_index_service.py  # startup consistency and refusal to start
+│       ├── test_maintenance.py  # reembed
+│       ├── test_documents_api.py  # upload validation, visibility, file serving, delete
 │       ├── test_filters.py
 │       ├── test_fusion.py
 │       ├── test_guard.py
 │       ├── test_citations.py
-│       ├── test_access_control.py
 │       └── test_integration.py
 │
 ├── frontend/
@@ -176,29 +186,30 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | `chat.py` | `POST /chat` — streams Server-Sent Events |
 | `conversations.py` | List, read, rename, delete conversations |
 | `feedback.py` | Thumbs up/down on an assistant message |
-| `health.py` | `/health` (liveness, touches nothing) and `/ready` (Postgres, Chroma; the embedding-model probe is added with `core/embeddings.py`). Delegates to `health_service` |
+| `health.py` | `/health` (liveness, touches nothing) and `/ready` (Postgres, Chroma, and a cached embedding probe). Delegates to `health_service` |
 
 ### 3.3 `services/` — workflows
 
 | File | Purpose |
 | --- | --- |
-| `health_service.py` | Readiness probes run concurrently in worker threads with a timeout; failure details are exception class names only (errors can embed hosts or credentials) |
+| `health_service.py` | Readiness probes run concurrently in worker threads with a timeout; failure details are exception class names only. The embedding probe is a real API call, so a good result is cached 5 minutes and a failure 30 seconds (a free-tier key allows ~100 requests/minute) |
+| `index_service.py` | `run_startup`: open the Chroma collection (refuse a model/dimension/distance mismatch), fail interrupted `processing` documents and requeue `queued` ones, **refuse to start when Postgres has indexed chunks but Chroma is empty** (changed `EMBEDDING_DIM`, lost volume: serving an empty index would silently return nothing), rebuild BM25 from Postgres, start workers |
 | `auth_service.py` | bcrypt hashing (work factor `BCRYPT_ROUNDS`), HS256 JWT issue/verify (algorithm pinned, claims `sub`/`iat`/`exp` only), `register_user`, `authenticate`. Signup takes a Postgres advisory lock so concurrent first signups cannot create two admins; unknown-email logins still run a bcrypt check so timing does not reveal which emails exist. Typed errors (`EmailAlreadyRegistered`, `InvalidCredentials`, `InvalidToken`) are translated to HTTP in `api/` and `deps.py` |
-| `document_service.py` | Validate uploads, store files under generated names, create DB rows, enqueue ingestion, delete (vectors → DB rows → file → BM25 refresh) |
-| `ingestion.py` | Background job: parse → chunk → metadata → write chunks to Postgres → embed → upsert to Chroma → refresh BM25 → set status. Cleans up on failure |
+| `document_service.py` | Validate uploads (extension, declared type, magic bytes, size; per-file accept/reject), store under `<uuid><ext>`, create `queued` rows, enqueue ingestion. Role-aware listing (a document above your level is a 404, never a 403). Delete: park as `failed` first (immediately unsearchable), then BM25 → Chroma → rows → file; a busy document answers 409; a failed step leaves it retryable |
+| `ingestion.py` | Background job (one worker by default): parse → chunk → resolve metadata → **chunk rows to Postgres first** → embed → upsert to Chroma → BM25 → `indexed`. Any failure removes partial data from all three stores and sets a user-safe message. Per-document lock shared with delete. Logs ids, counts and timings only |
 | `chat_service.py` | Full chat turn: rewrite → filter → retrieve → guard → generate → verify citations → persist → stream events |
 
 ### 3.4 `core/` — RAG building blocks (no web framework imports)
 
 | File | Purpose | Key rules |
 | --- | --- | --- |
-| `parsers.py` | PDF (page-aware, pdfplumber), DOCX, MD, HTML, TXT → list of `(page, section, text)` | Detects scanned PDFs (no extractable text) and raises a clear error |
-| `chunking.py` | `Chunker` interface + structure-aware implementation (~800 chars, ~100 overlap) | Keeps page range; never exceeds the embedding token ceiling; semantic chunker is a future implementation of the same interface |
-| `metadata.py` | Resolve department, type, creation date, access level | Order: explicit upload values → folder/filename → file properties → upload date; produces `creation_date_int` |
+| `parsers.py` | PDF (page-aware, pdfplumber), DOCX, MD, HTML, TXT → list of `(page, section, text)` | PDF: physical page numbers; sections from the outline (titles may wrap over lines) or font size/boldness; two-column pages read column by column (tables are not split); running headers/footers/banners and bare page labels removed, never more than 30% of the text; hyphenation repaired. Scanned/blank PDFs raise `ScannedPdfError` ("scanned PDF, OCR not supported"). Error messages are user-safe and never contain text |
+| `chunking.py` | `Chunker` interface + structure-aware implementation (~800 chars, ~100 overlap) | Packs by sentence; never crosses a section; overlap is whole trailing sentences, same page and section only; a chunk is at most target + 1.5×overlap (enforced against `CHUNK_HARD_MAX_CHARS` = 1500, far under the 2,048-token embedding limit); records `page_number`..`page_end`; semantic chunker is a future implementation of the same interface |
+| `metadata.py` | Resolve department, type, creation date, access level | Order: explicit upload values → folder/filename → file properties → upload date; produces `creation_date_int`. A month- or year-only file name ("April2025") is refined to the exact day by a *consistent* file date. Implausible dates (before 1990, far future) are ignored |
 | `llm.py` | Builds the `ChatGoogleGenerativeAI` instance from settings | The **only** place that constructs the LLM client |
-| `embeddings.py` | Wraps `GoogleGenerativeAIEmbeddings`: document vs query task types, batching, retries/backoff, L2 normalization, query LRU cache | The **only** place that calls the embedding API |
-| `vectorstore.py` | Chroma client: create/get collection (cosine), upsert, dense query, delete by `document_id` | The **only** place that imports `chromadb`; passes embeddings explicitly. Create collections with `configuration={"hnsw": {"space": "cosine"}}` and `embedding_function=None` (the client's default is Chroma's built-in embedder; verified against 1.5.9) |
-| `bm25.py` | In-memory BM25 index, identifier-aware tokenizer, add/remove/rebuild, filtered top-N | Rebuilt from Postgres at startup; filter parity with Chroma |
+| `embeddings.py` | Wraps `GoogleGenerativeAIEmbeddings`: document vs query task types, batching, retries/backoff, L2 normalization, query LRU cache | The **only** place that calls the embedding API. Walks the exception chain (LangChain wraps the SDK error) to classify 429/quota/auth/input/transient; honours the server's "retry in N s" hint with a cooldown shared by all threads; never retries a bad key or a daily quota. Rejects inputs over 2,000 characters instead of letting the API truncate them |
+| `vectorstore.py` | Chroma client: create/get collection (cosine), upsert, dense query, delete by `document_id` | The **only** place that imports `chromadb`; passes embeddings explicitly. Create collections with `configuration={"hnsw": {"space": "cosine"}}` and `embedding_function=None` (the client's default is Chroma's built-in embedder; verified against 1.5.9). **Never trust a Chroma write**: Chroma can store a vector its index never returns (seen live: 15 of 155 after delete and re-upload). `ensure_reachable(ids)` queries each new vector with its own embedding and repairs misses (re-insert, then `rebuild_collection`); `find_unreachable`/`repair_unreachable` back startup verification and `python -m app.maintenance verify-index`. Call `ensure_reachable` after any code path that writes vectors |
+| `bm25.py` | In-memory BM25 index (`bm25s`), identifier-aware tokenizer, add/remove/rebuild, filtered top-N | Rebuilt from Postgres at startup; filter parity with Chroma via a predicate over the same metadata fields; immutable snapshots swapped atomically so searches never block on ingestion |
 | `filters.py` | `build_filter(user, request_filters)` returning one neutral filter object plus Chroma `where` and SQL translations | **The only place filters are built**; always injects the access-level constraint |
 | `fusion.py` | `rrf(rankings, k)` | Pure function; RRF scores are for ordering only |
 | `retrieval.py` | Orchestrates embed query → dense + BM25 (parallel) → fusion → optional rerank; returns candidates with dense similarity and timings | |
@@ -365,6 +376,8 @@ nginx serves the SPA (with fallback to `index.html`), proxies `/api` to `backend
 ## 9. Testing & Evaluation Rules
 
 * **Database tests** run against a throwaway database (`groundedrag_test_<random>`) that the fixtures create on the stack's Postgres, migrate with the real Alembic migrations, and drop afterwards; they skip when no server is reachable and refuse to truncate any other database. New concurrency-sensitive code needs a test that **fails when the protection is removed** (see the signup-lock test, which widens the race window on purpose); mutate a copy of the code to check.
+* **Index-health tests simulate the symptom** (a wrapped `query` that never returns chosen vectors) because real Chroma cannot be made to lose vectors on demand; detection, re-insertion and rebuilding run for real. Scripts that drop or rebuild collections must force a scratch `CHROMA_COLLECTION` name first: run against `.env` they would hit the real collection.
+* **Real services in tests:** vector store, ingestion, startup and API tests run against the stack's real Chroma (a unique `test_<id>` collection per run) and a throwaway Postgres database, with a deterministic bag-of-words fake embedder (`FakeEmbeddings` in `conftest.py`). Startup is neutralized by an autouse fixture; call `REAL_RUN_STARTUP` to test it.
 * **Unit tests:** parsers, chunking (page numbers preserved, no mid-sentence cuts, overlap, token ceiling), filter building, RRF, guard (including lexical override), citation verification, access-level filtering.
 * **Integration test:** upload a small sample document → wait for `indexed` → query → assert a valid citation. Mock the LLM and embeddings in tests (no network calls, no API key needed).
 * **Evaluation (`eval/run_eval.py`):** hit-rate@5 and MRR for dense-only, keyword-only, hybrid, hybrid + rerank; refusal accuracy on unanswerable questions; per-stage latency p50/p95. Include exact-token questions and about 10 unanswerable ones.

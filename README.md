@@ -5,9 +5,10 @@ text files, ask questions in a chat interface, and get streamed answers grounded
 those documents, each claim carrying a clickable citation (document, page, section). When the
 documents do not contain the answer, the app says so instead of guessing.
 
-> **Build status:** Phases 1 and 2 of 6 are complete (deployment skeleton; database schema and
-> authentication). Everything below that describes later phases (upload, chat, citations) is the
-> design target in [PRD.md](PRD.md) and [TDD.md](TDD.md), not yet implemented.
+> **Build status:** Phases 1 to 3 of 6 are complete (deployment skeleton; database and
+> authentication; document ingestion and the documents API). Chat with citations, the web UI and
+> the evaluation tooling are the design target in [PRD.md](PRD.md) and [TDD.md](TDD.md), not yet
+> implemented.
 
 | Document | Defines |
 | --- | --- |
@@ -99,6 +100,77 @@ There is no user-management screen yet: to promote someone, update the database 
 (`docker compose exec postgres psql -U groundedrag -c "UPDATE users SET role='admin' WHERE email='...'"`).
 The change applies immediately, even to tokens issued before it.
 
+## Documents
+
+Supported formats: PDF, DOCX, Markdown (`.md`, `.markdown`), HTML (`.html`, `.htm`) and plain text,
+up to `MAX_UPLOAD_MB` each. Upload one or many files in a single request (needs a signed-in user and
+a `GOOGLE_API_KEY`, because indexing calls Gemini):
+
+```bash
+curl -s -X POST localhost:8081/api/documents -H "Authorization: Bearer $TOKEN" \
+     -F "files=@policy.pdf" -F "files=@handbook.docx" -F "department=HR" -F "document_type=Policy"
+curl -s "localhost:8081/api/documents?status=failed" -H "Authorization: Bearer $TOKEN"
+curl -s -OJ localhost:8081/api/documents/<id>/file -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE localhost:8081/api/documents/<id> -H "Authorization: Bearer $TOKEN"
+```
+
+The upload returns `202` at once; files then move `queued → processing → indexed` (or `failed` with an
+`error_message`) in the background, so poll `GET /api/documents`. Files are accepted or refused one by
+one: refused files come back in `rejected` with a reason and never block the others.
+
+**What is checked on upload:** extension, declared content type, the file's actual bytes (a `.pdf`
+must really be a PDF, a `.docx` really a zip with `word/document.xml`, text must not be binary) and
+size. Originals are stored under generated names, never under the name you uploaded.
+
+**Metadata** is worked out while indexing. Anything you pass wins; otherwise the folder or file name
+(`IT/Policy_2026-01-15.pdf`), then the file's own properties, then the upload date:
+
+| Field | From the file name or folder | From the file |
+| --- | --- | --- |
+| `department` | a known department as a folder or first word (HR, Engineering, Legal, Operations, IT) | Markdown front matter |
+| `document_type` | words such as policy/standard, manual/handbook, spec/rfc, contract/agreement | title, front matter |
+| `creation_date` | `2026-01-15`, `20260115`, `April2025`, `2026` (a month or year is refined to the exact day by a consistent PDF date) | PDF creation date, DOCX/HTML/Markdown date |
+| `access_level` | defaults to `Internal`; `Restricted` only for admins | |
+
+**What happens to problem files:** a scanned or blank PDF fails with *"This looks like a scanned PDF,
+OCR not supported"*; an empty, corrupt or password-protected file fails with a plain explanation. A
+failed document leaves nothing in the search index and stays listed so you can see why and delete it.
+
+**Only PDFs are shown inline** when you open an original; every other type downloads. Opening an
+uploaded HTML page on the app's own origin would let it run script next to your session token.
+
+**A deleted document is gone everywhere**: search index, vector store, database and file. If a step
+fails, the document is parked as `failed` (already unsearchable) and you simply delete it again.
+
+### Free-tier Gemini keys
+
+A free-tier key allows about **100 embedding requests per minute** (every chunk counts), and may have
+a daily cap. Indexing backs off and resumes automatically, but it runs at roughly 100 chunks a minute:
+a 300-page manual is on the order of 15 minutes. A billing-enabled key removes the limit (and is the
+right choice for confidential documents, TDD section 9). `GET /api/ready` reports whether the key works.
+
+### Checking the search index
+
+Chroma can occasionally hold a vector that its index never returns, so a document looks indexed but
+searches miss it. The backend checks every new chunk before marking a document indexed and re-checks
+everything at startup, repairing what it finds without calling Gemini. To check on demand:
+
+```bash
+docker compose exec backend python -m app.maintenance verify-index
+```
+
+### Recovering the search index
+
+The backend **refuses to start** if the vector store does not match the database, instead of quietly
+answering from an empty index. That happens after changing `EMBEDDING_MODEL`/`EMBEDDING_DIM` (the
+collection name encodes both) or losing the Chroma volume. The log says so; fix it by rebuilding the
+vectors from the database (resumable, so a rate limit or quota stop just means running it again):
+
+```bash
+docker compose run --rm --no-deps --entrypoint python backend -m app.maintenance reembed
+docker compose up -d backend
+```
+
 ## Development
 
 ```bash
@@ -137,6 +209,7 @@ All settings are environment variables, read only by `backend/app/config.py`. Bl
 | `EMBEDDING_MODEL` | `models/gemini-embedding-001` | Embedding model |
 | `EMBEDDING_DIM` | `768` | Output dimensionality (128 to 3072) |
 | `EMBEDDING_BATCH_SIZE` / `EMBEDDING_MAX_CONCURRENCY` | `32` / `4` | Ingestion throughput versus rate limits |
+| `EMBEDDING_MAX_RETRIES` | `6` | Retries per batch on rate limits and transient errors (backoff honours the server's retry hint) |
 | `LLM_MODEL` | `gemini-2.5-flash` | Answer generation |
 | `REWRITE_MODEL` | empty (= `LLM_MODEL`) | Follow-up question rewriting |
 | `LLM_TEMPERATURE` / `LLM_MAX_TOKENS` / `LLM_THINKING_BUDGET` | `0.0` / `1024` / `0` | Generation settings |
@@ -146,6 +219,7 @@ All settings are environment variables, read only by `backend/app/config.py`. Bl
 | `RERANK_ENABLED` | `false` | Cross-encoder reranking |
 | `CHUNK_TARGET_CHARS` / `CHUNK_OVERLAP_CHARS` | `800` / `100` | Chunking |
 | `MAX_UPLOAD_MB` | `50` | Per-file upload limit |
+| `INGESTION_WORKERS` | `1` | Documents indexed at the same time |
 | `CHROMA_COLLECTION` | `chunks` | Collection prefix; model and dimension are appended (`chunks__gemini-embedding-001__768`) |
 | `LOG_LEVEL` | `INFO` | Log verbosity |
 | `DATABASE_URL`, `CHROMA_HOST`, `CHROMA_PORT`, `UPLOAD_DIR` | set by compose | Only set these yourself when running the backend outside Docker |
@@ -218,6 +292,47 @@ Deliberate choices and deviations from the spec documents. Newest phase last.
 * **Test database per session, not per test.** Tables are truncated between tests; a test refuses to
   run if the connected database name does not start with `groundedrag_test_`.
 
+**Phase 3**
+
+* **Metadata is resolved during indexing**, as the PRD says, so `documents.creation_date` is `NULL` until
+  then (migration `0002`) instead of holding a made-up placeholder.
+* **Page numbers are physical PDF pages**, so `#page=N` opens the cited page. Formats without pages
+  report page 1; the UI will hide the page for them.
+* **Two-column PDFs are read column by column** (TDD 3.1). Without it, side-by-side text is stitched
+  into lines that mix two sentences. Tables are deliberately not split.
+* **Page chrome is stripped** (repeated headers, footers, banners, bare page labels), with a safety
+  net that skips the removal if it would delete more than 30% of a document's text.
+* **Chunk overlap is whole sentences on the same page**, so a chunk's page range always describes
+  exactly its text. A hard size ceiling (1500 characters) keeps every chunk far under the embedding
+  model's 2,048-token limit, validated at startup.
+* **`bm25s` rather than `rank_bm25`** for the keyword index (maintained, faster, filter mask support).
+  It cannot add documents incrementally, so each update rebuilds from stored tokens; searches use an
+  immutable snapshot and never wait for an ingestion.
+* **The backend refuses to start on an inconsistent index** (Postgres has indexed chunks, Chroma is
+  empty), because serving from an empty index would silently return nothing. `reembed` repairs it.
+* **Indexing runs one document at a time** in an in-process pool, so a free-tier key's rate limit is
+  shared sensibly. A restart fails documents that were mid-indexing (re-queueing could loop forever on
+  a document that crashes the process) and resubmits ones that never started.
+* **Delete parks the document as `failed` first**, then removes it from BM25, Chroma, Postgres and disk.
+  This differs slightly from the order in CLAUDE.md, and gives a stronger guarantee: it is excluded
+  from retrieval immediately, whichever later step fails.
+* **Documents above your access level answer 404**, never 403, so their existence is not revealed.
+* **The embedding readiness probe is cached** (5 minutes when healthy, 30 seconds when failing)
+  because every probe spends one request out of a free-tier 100 per minute.
+* **The vector index is verified, not trusted.** ChromaDB 1.5.9 was seen to store vectors that no search
+  returns (15 of 155 after deleting and re-uploading the same files). The trigger could not be
+  reproduced, so every write is checked by querying each new vector with its own embedding, with automatic
+  repair (re-insert, or rebuild from the stored vectors; no API cost), startup verification, and a
+  `verify-index` command. Re-test this on every Chroma upgrade (TDD 4.1).
+* **The provisional `RELEVANCE_THRESHOLD=0.45` is too low for this model.** Measured on a small corpus (62
+  chunks): the best chunk for a relevant question scores 0.76 to 0.82 cosine, and the best chunk for an
+  unrelated question 0.56 at most, so 0.45 would never refuse. A cutoff near 0.65 separates these
+  samples, but the corpus is tiny: calibrate with the evaluation set (CLAUDE.md rule 17) before relying on it.
+* **Known limitation:** PDFs whose text layer overprints other text (a watermark laid over the body)
+  can interleave characters. The document still indexes and its page numbers are right.
+* **Not implemented, by scope:** OCR, re-ingesting a failed document in place (delete and upload
+  again), and per-user storage quotas.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
@@ -229,6 +344,13 @@ Deliberate choices and deviations from the spec documents. Newest phase last.
 | My account is not an admin | Someone else signed up first. Promote yourself with the `UPDATE users SET role='admin' ...` command in "Accounts and roles". |
 | `401` right after logging in | Check the header is exactly `Authorization: Bearer <token>`, the token has not expired (`expires_in` seconds), and `JWT_SECRET` has not changed since it was issued (changing it invalidates every token). |
 | Database tests are all skipped | No Postgres was reachable. Run `docker compose exec backend pytest` with the stack up. |
+| A document is `failed` with "rate limited" or "quota" | A free-tier Gemini key allows about 100 embedding requests per minute (and may have a daily cap). Wait and upload again, or use a billing-enabled key. The error message and the logs say which limit was hit. |
+| A document is `failed` with "rejected the API key" | `GOOGLE_API_KEY` is wrong or revoked. `GET /api/ready` shows `embeddings` as not ok. |
+| Backend exits at startup: "PostgreSQL holds N indexed chunks but the Chroma collection ... is empty" | The embedding settings changed or the Chroma volume was lost. Run the `reembed` command in "Recovering the search index", or restore the old settings. |
+| Backend exits at startup: "does not match the configured embedding setup" | A collection with the current name exists but was built with a different model, dimension or distance. Restore the settings, or remove that collection and run `reembed`. |
+| A document is `indexed` but searches never find it | The vector index lost it. Run `docker compose exec backend python -m app.maintenance verify-index` (see "Checking the search index"). A log line `vectors stored but unreachable by search; repairing` at startup means this was found and fixed. |
+| Deleting a document answers 409 | It is being indexed right now. Delete it again when it finishes. |
+| Deleting answers 503 | A step failed. The document is now `failed` (unsearchable); delete it again to finish. |
 | `/api/ready` returns 503 | The body names the failing dependency under `checks`. Look at `docker compose ps` and `docker compose logs <service>`. |
 | `exec /app/docker-entrypoint.sh: no such file or directory` | The script was checked out with Windows (CRLF) line endings. `.gitattributes` forces LF; re-checkout the file (or run `git add --renormalize .`). |
 | Chroma container is unhealthy | It has no curl; the healthcheck uses bash `/dev/tcp`. Check `docker compose logs chroma` for the real error (usually a permissions problem on `chroma_data`). |

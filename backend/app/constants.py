@@ -35,11 +35,24 @@ class AccessLevel(StrEnum):
 
 ACCESS_LEVELS: tuple[str, ...] = tuple(level.value for level in AccessLevel)
 
+# Suggested values for the library filters. Free text is still accepted at upload
+# (matched case-insensitively to these when possible); IT appears in the TDD examples.
+DEPARTMENTS: tuple[str, ...] = ("HR", "Engineering", "Legal", "Operations", "IT")
+DOCUMENT_TYPES: tuple[str, ...] = ("Policy", "Manual", "Technical Spec", "Contract")
+
 # Role -> access levels that role may read (PRD 4.4, TDD section 8).
 ROLE_ACCESS_LEVELS: dict[Role, tuple[AccessLevel, ...]] = {
     Role.ADMIN: (AccessLevel.PUBLIC, AccessLevel.INTERNAL, AccessLevel.RESTRICTED),
     Role.USER: (AccessLevel.PUBLIC, AccessLevel.INTERNAL),
 }
+
+
+def allowed_access_levels(role: str) -> tuple[AccessLevel, ...]:
+    """Access levels a role may read. Unknown roles get nothing (fail closed)."""
+    try:
+        return ROLE_ACCESS_LEVELS[Role(role)]
+    except ValueError:
+        return ()
 
 
 class DocumentStatus(StrEnum):
@@ -63,3 +76,36 @@ class FeedbackRating(StrEnum):
 
     UP = "up"
     DOWN = "down"
+
+
+# --- Uploads and ingestion -----------------------------------------------------
+
+# Extension -> canonical media type (used when serving the original; never taken
+# from the client).
+ALLOWED_EXTENSIONS: dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".txt": "text/plain",
+}
+
+# gemini-embedding-001 accepts 2,048 tokens per input and silently truncates the rest
+# (CLAUDE.md rule 16). One token is at least one character in the worst case (CJK), so
+# these character ceilings keep every input under the limit without a tokenizer.
+CHUNK_HARD_MAX_CHARS = 1500
+EMBEDDING_INPUT_MAX_CHARS = 2000
+
+# Chunks shorter than this are merged into a neighbour when possible.
+MIN_CHUNK_CHARS = 20
+
+# A PDF with fewer than this share of text-bearing pages is treated as scanned.
+SCANNED_PDF_MAX_TEXT_PAGE_RATIO = 0.2
+# A page counts as text-bearing with at least this many non-space characters.
+MIN_PAGE_TEXT_CHARS = 20
+
+SCANNED_PDF_MESSAGE = (
+    "This looks like a scanned PDF, OCR not supported (no extractable text found)."
+)

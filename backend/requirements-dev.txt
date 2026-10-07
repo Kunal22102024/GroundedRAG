@@ -5,3 +5,4 @@
 pytest==9.1.1
 httpx2==2.13.1                     # required by fastapi.testclient (Starlette deprecated plain httpx)
 ruff==0.16.10
+fpdf2==2.8.9                       # builds PDF fixtures (pages, outlines, image-only pages) for parser tests

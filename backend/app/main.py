@@ -6,6 +6,7 @@ Run with a single uvicorn worker only: the BM25 index lives in process memory
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -14,11 +15,12 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.api import auth, health
+from app.api import auth, documents, health
 from app.config import get_settings
 from app.constants import API_PREFIX
 from app.db import database
 from app.middleware import RequestContextMiddleware, configure_logging
+from app.services import index_service, ingestion
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "backend starting",
         extra={"version": __version__, "collection": settings.collection_name},
     )
+    # Verifies the embedding setup and repairs derived indexes. A mismatch raises, so the
+    # backend refuses to start rather than serve from the wrong or an empty index.
+    await asyncio.to_thread(index_service.run_startup)
     yield
+    ingestion.shutdown_workers()
     database.dispose_engine()
     logger.info("backend stopped")
 
@@ -64,6 +70,7 @@ def create_app() -> FastAPI:
     api_router = APIRouter(prefix=API_PREFIX)
     api_router.include_router(health.router)
     api_router.include_router(auth.router)
+    api_router.include_router(documents.router)
     app.include_router(api_router)
     return app
 

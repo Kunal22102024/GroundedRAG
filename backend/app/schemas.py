@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.constants import PASSWORD_MAX_BYTES, PASSWORD_MIN_CHARS, Role
+from app.constants import (
+    PASSWORD_MAX_BYTES,
+    PASSWORD_MIN_CHARS,
+    AccessLevel,
+    DocumentStatus,
+    Role,
+)
 
 # Deliberately permissive: enterprise domains such as company.local must work, and
 # the real proof of an address is delivery, not syntax.
@@ -94,3 +100,59 @@ class AuthResponse(BaseModel):
     token_type: Literal["bearer"] = "bearer"
     expires_in: int  # seconds
     user: UserOut
+
+
+# --- Documents ----------------------------------------------------------------------
+
+
+class DocumentOut(BaseModel):
+    """A document and its indexing state."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    mime_type: str
+    size_bytes: int
+    status: DocumentStatus
+    error_message: str | None
+    chunk_count: int
+    department: str
+    document_type: str
+    # Null until indexing resolves it (upload value > file name > file properties > upload date).
+    creation_date: date | None
+    access_level: AccessLevel
+    owner_id: uuid.UUID | None
+    created_at: datetime
+
+
+class LibrarySummaryOut(BaseModel):
+    """Totals across every document the user may see, ignoring list filters."""
+
+    total_files: int
+    total_chunks: int
+    by_status: dict[str, int]
+
+
+class DocumentListResponse(BaseModel):
+    """One page of documents."""
+
+    items: list[DocumentOut]
+    total: int
+    limit: int
+    offset: int
+    summary: LibrarySummaryOut
+
+
+class RejectedFileOut(BaseModel):
+    """A file in an upload that was refused."""
+
+    filename: str
+    reason: str
+
+
+class UploadResponse(BaseModel):
+    """Result of an upload: accepted files are queued for indexing."""
+
+    documents: list[DocumentOut]
+    rejected: list[RejectedFileOut]

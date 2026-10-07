@@ -97,7 +97,8 @@ class Document(Base):
     chunk_count: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
     department: Mapped[str] = mapped_column(sa.String(100), default="", server_default="")
     document_type: Mapped[str] = mapped_column(sa.String(100), default="", server_default="")
-    creation_date: Mapped[date] = mapped_column(sa.Date)
+    # NULL until indexing resolves it (explicit upload value > filename > file properties > upload date).
+    creation_date: Mapped[date | None] = mapped_column(sa.Date)
     access_level: Mapped[str] = mapped_column(
         sa.String(16),
         default=AccessLevel.INTERNAL.value,

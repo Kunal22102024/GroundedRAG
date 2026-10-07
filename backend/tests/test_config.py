@@ -38,6 +38,7 @@ def test_defaults_match_tdd_configuration_reference(clean_env: pytest.MonkeyPatc
     assert settings.rerank_enabled is False
     assert (settings.chunk_target_chars, settings.chunk_overlap_chars) == (800, 100)
     assert settings.max_upload_mb == 50
+    assert (settings.embedding_max_retries, settings.ingestion_workers) == (6, 1)
     assert settings.log_level == "INFO"
 
 
@@ -82,6 +83,22 @@ def test_overlap_must_be_smaller_than_target(clean_env: pytest.MonkeyPatch) -> N
     clean_env.setenv("CHUNK_OVERLAP_CHARS", "300")
     with pytest.raises(ValidationError, match="CHUNK_OVERLAP_CHARS"):
         make()
+
+
+@pytest.mark.parametrize(
+    ("target", "overlap", "ok"),
+    [("1200", "200", True), ("1400", "200", False), ("1500", "0", True), ("1600", "0", False)],
+)
+def test_chunk_size_plus_overlap_must_stay_under_the_embedding_safe_ceiling(
+    clean_env: pytest.MonkeyPatch, target: str, overlap: str, ok: bool
+) -> None:
+    clean_env.setenv("CHUNK_TARGET_CHARS", target)
+    clean_env.setenv("CHUNK_OVERLAP_CHARS", overlap)
+    if ok:
+        make()
+    else:
+        with pytest.raises(ValidationError, match="must not exceed 1500"):
+            make()
 
 
 @pytest.mark.parametrize("dim", ["64", "4096"])

@@ -35,9 +35,17 @@ os.environ["JWT_SECRET"] = "test-secret-test-secret-test-secret-0123456789"
 os.environ["GOOGLE_API_KEY"] = ""
 os.environ["LOG_LEVEL"] = "INFO"
 os.environ["BCRYPT_ROUNDS"] = "4"  # minimum cost; real hashing speed is not under test
+os.environ["EMBEDDING_MAX_RETRIES"] = "3"
+# A collection name no real deployment uses, unique per run, so tests never touch real vectors.
+os.environ["CHROMA_COLLECTION"] = f"test_{uuid.uuid4().hex[:8]}"
 
 TEST_DB_PREFIX = "groundedrag_test_"
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
+
+# The real startup function, captured before the autouse fixture below replaces it.
+from app.services import index_service as _index_service  # noqa: E402
+
+REAL_RUN_STARTUP = _index_service.run_startup
 
 
 class LogCollector(logging.Handler):
@@ -148,3 +156,138 @@ def db(database_url: str) -> Iterator[Session]:
         connection.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
     with get_sessionmaker()() as session:
         yield session
+
+
+# --- Startup, derived indexes, embeddings, uploads -----------------------------------------
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_startup() -> Iterator[None]:
+    """App lifespan startup talks to Postgres and Chroma; tests call REAL_RUN_STARTUP instead.
+
+    Session scoped on purpose: a module-scoped ``TestClient`` fixture starts the app before any
+    function-scoped fixture runs, and would otherwise execute the real startup against whatever
+    rows an earlier test left behind.
+    """
+    patch = pytest.MonkeyPatch()
+    patch.setattr(_index_service, "run_startup", lambda: None)
+    yield
+    patch.undo()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_derived_state() -> Iterator[None]:
+    """Every test starts with an empty BM25 index and no cached embedding or readiness state."""
+    from app.core import bm25, embeddings
+    from app.services import health_service
+
+    bm25.reset_index()
+    embeddings.clear_caches()
+    health_service.reset_embedding_cache()
+    yield
+    bm25.reset_index()
+
+
+@pytest.fixture
+def vectors() -> Iterator[object]:
+    """The vector store module, with a clean, verified test collection (skips without Chroma)."""
+    import contextlib
+
+    from app.core import vectorstore
+
+    try:
+        vectorstore.heartbeat()
+    except vectorstore.VectorStoreError:
+        pytest.skip("ChromaDB is not reachable (run the tests inside the compose stack)")
+    vectorstore.reset_collection_cache()
+    with contextlib.suppress(vectorstore.VectorStoreError):
+        vectorstore.drop_collection()
+    vectorstore.get_collection()
+    yield vectorstore
+    with contextlib.suppress(vectorstore.VectorStoreError):
+        vectorstore.drop_collection()
+
+
+def hashing_vector(text: str, dim: int) -> list[float]:
+    """A deterministic bag-of-words embedding: texts sharing words have high cosine similarity."""
+    import math
+    import zlib
+
+    from app.core import bm25
+
+    vector = [0.0] * dim
+    for token in bm25.tokenize(text):
+        vector[zlib.crc32(token.encode()) % dim] += 1.0
+    norm = math.sqrt(sum(x * x for x in vector))
+    if norm == 0:
+        vector[0], norm = 1.0, 1.0
+    return [x / norm for x in vector]
+
+
+class FakeEmbeddings:
+    """Stands in for the Gemini wrapper: no network, no key, unit-length vectors."""
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+        self.document_batches: list[list[str]] = []
+        self.queries: list[str] = []
+        self.error: Exception | None = None
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if self.error is not None:
+            raise self.error
+        self.document_batches.append(list(texts))
+        return [hashing_vector(t, self.dim) for t in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        if self.error is not None:
+            raise self.error
+        self.queries.append(text)
+        return hashing_vector(text, self.dim)
+
+
+@pytest.fixture
+def fake_embeddings(monkeypatch: pytest.MonkeyPatch) -> FakeEmbeddings:
+    """Replace the embedding functions the services call."""
+    from app.config import get_settings
+    from app.core import embeddings
+
+    fake = FakeEmbeddings(get_settings().embedding_dim)
+    monkeypatch.setattr(embeddings, "embed_documents", fake.embed_documents)
+    monkeypatch.setattr(embeddings, "embed_query", fake.embed_query)
+    return fake
+
+
+@pytest.fixture
+def upload_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A private upload directory for the test."""
+    from app.config import get_settings
+
+    directory = tmp_path / "uploads"
+    monkeypatch.setattr(get_settings(), "upload_dir", directory)
+    return directory
+
+
+@pytest.fixture
+def deferred_ingestion(monkeypatch: pytest.MonkeyPatch) -> list[uuid.UUID]:
+    """Record submitted documents without running them (they stay ``queued``)."""
+    from app.services import ingestion
+
+    submitted: list[uuid.UUID] = []
+    monkeypatch.setattr(ingestion, "submit", submitted.append)
+    return submitted
+
+
+@pytest.fixture
+def inline_ingestion(monkeypatch: pytest.MonkeyPatch) -> list[uuid.UUID]:
+    """Run each submitted document's ingestion immediately, in the calling thread."""
+    from app.services import ingestion
+
+    submitted: list[uuid.UUID] = []
+
+    def run(document_id: uuid.UUID) -> None:
+        submitted.append(document_id)
+        ingestion.ingest_document(document_id)
+
+    monkeypatch.setattr(ingestion, "submit", run)
+    return submitted
