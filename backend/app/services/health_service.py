@@ -14,8 +14,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from app.core import embeddings, vectorstore
+from app.core import bm25, embeddings, vectorstore
 from app.db import database
+from app.services import index_service
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,10 @@ CHECK_TIMEOUT_SECONDS = 4.0
 EMBEDDING_TIMEOUT_SECONDS = 20.0
 EMBEDDING_OK_TTL_SECONDS = 300.0
 EMBEDDING_FAILURE_TTL_SECONDS = 30.0
+# Index health looks at counts and a sample of stored vectors; cached so polling stays cheap.
+INDEX_OK_TTL_SECONDS = 60.0
+INDEX_FAILURE_TTL_SECONDS = 15.0
+INDEX_SAMPLE_SIZE = 64
 
 
 @dataclass(frozen=True)
@@ -88,6 +93,55 @@ def check_embeddings() -> CheckResult:
     return result
 
 
+_index_lock = threading.Lock()
+_index_cache: tuple[float, CheckResult] | None = None
+
+
+def reset_index_cache() -> None:
+    """Forget the cached index health result (tests)."""
+    global _index_cache
+    with _index_lock:
+        _index_cache = None
+
+
+def check_index() -> CheckResult:
+    """Verify the derived indexes match PostgreSQL and the stored vectors can be found (cached).
+
+    Chat retrieval refuses to answer from a broken index (it errors instead of saying "not
+    found"); this makes the same problem visible to operators before anyone asks a question.
+    """
+    global _index_cache
+    with _index_lock:
+        if _index_cache is not None and time.monotonic() < _index_cache[0]:
+            return _index_cache[1]
+    try:
+        with database.get_sessionmaker()() as db:
+            indexed = index_service.indexed_chunk_count(db)
+        vectors = vectorstore.count()
+        keyword = len(bm25.get_index())
+        problems = []
+        if vectors < indexed:
+            problems.append(f"{indexed - vectors} of {indexed} chunks have no vector")
+        if keyword != indexed:
+            problems.append(f"keyword index holds {keyword} of {indexed} chunks")
+        sample = vectorstore.sample_ids(INDEX_SAMPLE_SIZE) if vectors else []
+        broken = vectorstore.find_unreachable(sample) if sample else []
+        if broken:
+            problems.append(
+                f"{len(broken)} of {len(sample)} sampled vectors cannot be found by search"
+            )
+        result = CheckResult(
+            ok=not problems, detail="; ".join(problems) or f"{indexed} chunks, {vectors} vectors"
+        )
+    except Exception as exc:
+        logger.warning("index readiness check failed", extra={"error": type(exc).__name__})
+        result = CheckResult(ok=False, detail=type(exc).__name__)
+    ttl = INDEX_OK_TTL_SECONDS if result.ok else INDEX_FAILURE_TTL_SECONDS
+    with _index_lock:
+        _index_cache = (time.monotonic() + ttl, result)
+    return result
+
+
 async def _run_with_timeout(
     check: Callable[[], CheckResult], timeout: float | None = None
 ) -> CheckResult:
@@ -102,10 +156,11 @@ async def _run_with_timeout(
 
 async def run_readiness() -> dict[str, CheckResult]:
     """Run every readiness check concurrently and return results by dependency name."""
-    names = ("postgres", "chroma", "embeddings")
+    names = ("postgres", "chroma", "embeddings", "index")
     results = await asyncio.gather(
         _run_with_timeout(check_postgres),
         _run_with_timeout(check_chroma),
         _run_with_timeout(check_embeddings, EMBEDDING_TIMEOUT_SECONDS),
+        _run_with_timeout(check_index),
     )
     return dict(zip(names, results, strict=True))

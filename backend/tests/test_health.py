@@ -29,10 +29,12 @@ def patch_checks(
     postgres: CheckResult = OK,
     chroma: CheckResult = OK,
     embeddings_check: CheckResult = OK,
+    index: CheckResult = OK,
 ) -> None:
     monkeypatch.setattr(health_service, "check_postgres", lambda: postgres)
     monkeypatch.setattr(health_service, "check_chroma", lambda: chroma)
     monkeypatch.setattr(health_service, "check_embeddings", lambda: embeddings_check)
+    monkeypatch.setattr(health_service, "check_index", lambda: index)
 
 
 def test_health_is_alive_without_touching_dependencies(client: TestClient) -> None:
@@ -53,6 +55,7 @@ def test_ready_reports_ok_when_all_dependencies_up(
             "postgres": {"ok": True, "detail": None},
             "chroma": {"ok": True, "detail": None},
             "embeddings": {"ok": True, "detail": None},
+            "index": {"ok": True, "detail": None},
         },
     }
 

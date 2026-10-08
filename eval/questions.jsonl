@@ -1,0 +1,15 @@
+{"question": "How many vacation days do full-time staff get each year?", "expected_document": "HR_Leave_Policy_2025-03-01.docx", "expected_page": 1, "answerable": true, "kind": "normal"}
+{"question": "What is the minimum recommended length for a work password?", "expected_document": "SANS_Password_Construction_Standard_April2025.pdf", "expected_page": 1, "answerable": true, "kind": "normal"}
+{"question": "When are we allowed to restart the gateway in an emergency?", "expected_document": "Gateway_Runbook.md", "expected_page": 1, "answerable": true, "kind": "normal"}
+{"question": "How long do the nightly backups stay on disk before they are deleted?", "expected_document": "Operations_Notes.txt", "expected_page": 1, "answerable": true, "kind": "normal"}
+{"question": "Who is responsible for writing the acceptable use policy?", "expected_document": "369.pdf", "expected_page": 3, "answerable": true, "kind": "normal"}
+{"question": "Which protocol must be used to protect email traffic between mail servers?", "expected_document": "sans_Email_Management_Policy_feb2026.pdf", "expected_page": 2, "answerable": true, "kind": "normal"}
+{"question": "What were the Alpine region's quarterly sales?", "expected_document": "Quarterly_Report_2026-01-15.pdf", "expected_page": 7, "answerable": true, "kind": "normal"}
+{"question": "What does ERR_404_NET mean and what should I check first?", "expected_document": "Gateway_Runbook.md", "expected_page": 1, "answerable": true, "kind": "exact_token"}
+{"question": "What does safeguard EM-09 require?", "expected_document": "sans_Email_Management_Policy_feb2026.pdf", "expected_page": 2, "answerable": true, "kind": "exact_token"}
+{"question": "What runs at 01:30?", "expected_document": "Operations_Notes.txt", "expected_page": 1, "answerable": true, "kind": "exact_token"}
+{"question": "What is the maximum number of characters a password can have?", "expected_document": null, "expected_page": null, "answerable": false, "kind": "near_miss"}
+{"question": "How many days of sick leave do employees get each year?", "expected_document": null, "expected_page": null, "answerable": false, "kind": "near_miss"}
+{"question": "How long are old emails kept before they are deleted?", "expected_document": null, "expected_page": null, "answerable": false, "kind": "near_miss"}
+{"question": "Who won the 2018 football world cup?", "expected_document": null, "expected_page": null, "answerable": false, "kind": "off_topic"}
+{"question": "How do I bake sourdough bread at home?", "expected_document": null, "expected_page": null, "answerable": false, "kind": "off_topic"}

@@ -22,20 +22,19 @@ from __future__ import annotations
 
 import logging
 import random
-import re
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Literal, TypeVar
+from typing import Any, TypeVar
 
 import numpy as np
 
 from app.config import get_settings
 from app.constants import EMBEDDING_INPUT_MAX_CHARS
+from app.core.gemini_errors import classify as _classify
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +48,11 @@ _BACKOFF_BASE_SECONDS = 2.0
 _BACKOFF_MAX_SECONDS = 60.0
 # A server-suggested wait longer than this is reported to the caller instead of blocking a worker.
 _MAX_SINGLE_WAIT_SECONDS = 120.0
+
+_RATE_LIMITED_MESSAGE = (
+    "The embedding service is rate limited (free-tier keys allow about 100 requests per "
+    "minute). Try again later or use a billing-enabled key."
+)
 
 # Indirection so tests can run without really sleeping.
 _sleep: Callable[[float], None] = time.sleep
@@ -80,72 +84,6 @@ class EmbeddingInputError(EmbeddingError):
     """The text cannot be embedded (empty or too long)."""
 
 
-Kind = Literal["rate_limit", "quota", "auth", "input", "transient", "fatal"]
-
-
-@dataclass(frozen=True)
-class _Classified:
-    kind: Kind
-    retry_after: float | None = None
-    code: int | None = None
-
-
-# --- Error classification ---------------------------------------------------------
-
-_RETRY_IN = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
-_RETRY_DELAY = re.compile(r"retryDelay['\"]?\s*:\s*['\"]([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
-_TRANSIENT_STATUSES = ("UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL", "ABORTED")
-
-
-def _chain(exc: BaseException) -> list[BaseException]:
-    """The exception and its causes (LangChain wraps the google-genai error)."""
-    seen: list[BaseException] = []
-    current: BaseException | None = exc
-    while current is not None and current not in seen and len(seen) < 6:
-        seen.append(current)
-        current = current.__cause__ or current.__context__
-    return seen
-
-
-def _classify(exc: BaseException) -> _Classified:
-    chain = _chain(exc)
-    text = " ".join(str(e) for e in chain)
-    code = next(
-        (
-            int(c)
-            for e in chain
-            for c in (getattr(e, "code", None), getattr(e, "status_code", None))
-            if isinstance(c, int)
-        ),
-        None,
-    )
-
-    if code == 429 or "RESOURCE_EXHAUSTED" in text:
-        if re.search(r"PerDay|per_day|daily", text, re.IGNORECASE):
-            return _Classified("quota", code=code)
-        hint = _RETRY_IN.search(text) or _RETRY_DELAY.search(text)
-        return _Classified("rate_limit", float(hint.group(1)) if hint else None, code)
-    if (
-        code in (401, 403)
-        or "API key not valid" in text
-        or "API_KEY_INVALID" in text
-        or "PERMISSION_DENIED" in text
-        or "UNAUTHENTICATED" in text
-    ):
-        return _Classified("auth", code=code)
-    if code == 400 or "INVALID_ARGUMENT" in text:
-        return _Classified("input", code=code)
-    if (code is not None and code >= 500) or any(s in text for s in _TRANSIENT_STATUSES):
-        return _Classified("transient", code=code)
-    for e in chain:
-        module = type(e).__module__
-        if isinstance(e, (TimeoutError, ConnectionError, OSError)) or module.startswith(
-            ("httpx", "httpcore", "httpx2")
-        ):
-            return _Classified("transient", code=code)
-    return _Classified("fatal", code=code)
-
-
 # --- Client, rate-limit cooldown and cache ---------------------------------------------
 
 
@@ -165,10 +103,13 @@ _cooldown_lock = threading.Lock()
 _cooldown_until = 0.0
 
 
-def _wait_for_cooldown() -> None:
+def _wait_for_cooldown(max_wait: float | None = None) -> None:
+    """Sleep out the shared cooldown; with ``max_wait``, refuse to wait longer than that."""
     with _cooldown_lock:
         remaining = _cooldown_until - _monotonic()
     if remaining > 0:
+        if max_wait is not None and remaining > max_wait:
+            raise EmbeddingRateLimitError(_RATE_LIMITED_MESSAGE)
         _sleep(remaining)
 
 
@@ -195,15 +136,19 @@ def clear_caches() -> None:
 # --- Calls with retries ------------------------------------------------------------------
 
 
-def _with_retries(call: Callable[[], T], max_retries: int | None = None) -> T:
+def _with_retries(
+    call: Callable[[], T], max_retries: int | None = None, max_wait: float | None = None
+) -> T:
     """Run ``call``, retrying rate limits and transient failures with backoff.
 
-    Non-retryable problems (bad key, bad input, exhausted quota) raise immediately.
+    Non-retryable problems (bad key, bad input, exhausted quota) raise immediately. ``max_wait``
+    caps a single wait (chat questions use a short one so a user is never left hanging).
     """
     retries = get_settings().embedding_max_retries if max_retries is None else max_retries
+    longest_wait = _MAX_SINGLE_WAIT_SECONDS if max_wait is None else max_wait
     attempt = 0
     while True:
-        _wait_for_cooldown()
+        _wait_for_cooldown(max_wait)
         try:
             return call()
         except EmbeddingError:
@@ -229,13 +174,10 @@ def _with_retries(call: Callable[[], T], max_retries: int | None = None) -> T:
             else:
                 delay = min(_BACKOFF_MAX_SECONDS, _BACKOFF_BASE_SECONDS * 2 ** (attempt - 1))
             delay *= _jitter(1.0, 1.25)
-            too_long = delay > _MAX_SINGLE_WAIT_SECONDS
+            too_long = delay > longest_wait
             if attempt > retries or too_long:
                 if info.kind == "rate_limit":
-                    raise EmbeddingRateLimitError(
-                        "The embedding service is rate limited (free-tier keys allow about 100 "
-                        "requests per minute). Try again later or use a billing-enabled key."
-                    ) from exc
+                    raise EmbeddingRateLimitError(_RATE_LIMITED_MESSAGE) from exc
                 raise EmbeddingError(
                     "The embedding service is unavailable. Try again later."
                 ) from exc
@@ -325,8 +267,13 @@ def embed_documents(texts: Sequence[str]) -> list[list[float]]:
     return [list(by_text[text]) for text in texts]
 
 
-def embed_query(text: str) -> list[float]:
-    """Embed a question with ``RETRIEVAL_QUERY``; repeated questions are served from an LRU cache."""
+def embed_query(text: str, *, interactive: bool = False) -> list[float]:
+    """Embed a question with ``RETRIEVAL_QUERY``; repeated questions are served from an LRU cache.
+
+    ``interactive`` is for a user waiting on the answer: few retries and a short maximum wait
+    (``INTERACTIVE_MAX_RETRIES``, ``INTERACTIVE_MAX_WAIT_SECONDS``) instead of the patient
+    settings used by background ingestion.
+    """
     _check_text(text)
     with _cache_lock:
         cached = _query_cache.get(text)
@@ -339,7 +286,9 @@ def embed_query(text: str) -> list[float]:
     raw = _with_retries(
         lambda: client.embed_query(
             text, task_type=QUERY_TASK, output_dimensionality=settings.embedding_dim
-        )
+        ),
+        max_retries=settings.interactive_max_retries if interactive else None,
+        max_wait=settings.interactive_max_wait_seconds if interactive else None,
     )
     vector = _normalize([raw], settings.embedding_dim)[0]
     with _cache_lock:

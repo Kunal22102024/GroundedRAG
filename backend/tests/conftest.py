@@ -184,6 +184,7 @@ def _isolated_derived_state() -> Iterator[None]:
     bm25.reset_index()
     embeddings.clear_caches()
     health_service.reset_embedding_cache()
+    health_service.reset_index_cache()
     yield
     bm25.reset_index()
 
@@ -239,7 +240,7 @@ class FakeEmbeddings:
         self.document_batches.append(list(texts))
         return [hashing_vector(t, self.dim) for t in texts]
 
-    def embed_query(self, text: str) -> list[float]:
+    def embed_query(self, text: str, *, interactive: bool = False) -> list[float]:
         if self.error is not None:
             raise self.error
         self.queries.append(text)
@@ -291,3 +292,81 @@ def inline_ingestion(monkeypatch: pytest.MonkeyPatch) -> list[uuid.UUID]:
 
     monkeypatch.setattr(ingestion, "submit", run)
     return submitted
+
+
+# --- Chat model ------------------------------------------------------------------------------
+
+
+class FakeChatModel:
+    """Stands in for ``ChatGoogleGenerativeAI``: scripted replies, no network, counts its calls.
+
+    Queue replies with ``reply``/``fail``/``block``. Every ``astream`` call is recorded in
+    ``calls`` (the messages sent), so a test can prove the LLM was or was not called. With an
+    empty script the model answers with the refusal sentence.
+    """
+
+    def __init__(self) -> None:
+        self.script: list[object] = []
+        self.calls: list[list[object]] = []
+        self.slept: list[float] = []
+
+    def reply(self, *pieces: str, finish: str = "STOP") -> FakeChatModel:
+        self.script.append({"pieces": list(pieces), "finish": finish})
+        return self
+
+    def fail(self, exc: Exception) -> FakeChatModel:
+        self.script.append(exc)
+        return self
+
+    def block(self) -> FakeChatModel:
+        self.script.append({"block": True})
+        return self
+
+    @property
+    def answer_calls(self) -> int:
+        """Calls that were not follow-up rewrites."""
+        return sum(1 for call in self.calls if "LAST USER QUESTION" not in str(call[-1].content))
+
+    async def astream(self, messages: list[object]):  # noqa: ANN201 - async generator
+        from langchain_core.messages import AIMessageChunk
+
+        from app.constants import REFUSAL_MESSAGE
+
+        self.calls.append(list(messages))
+        step = (
+            self.script.pop(0) if self.script else {"pieces": [REFUSAL_MESSAGE], "finish": "STOP"}
+        )
+        if isinstance(step, Exception):
+            raise step
+        if isinstance(step, dict) and step.get("block"):
+            yield AIMessageChunk(
+                content="", response_metadata={"prompt_feedback": {"block_reason": "SAFETY"}}
+            )
+            return
+        pieces = step["pieces"]  # type: ignore[index]
+        if not pieces:
+            yield AIMessageChunk(content="", response_metadata={"finish_reason": step["finish"]})  # type: ignore[index]
+        for index, piece in enumerate(pieces):
+            last = index == len(pieces) - 1
+            yield AIMessageChunk(
+                content=piece,
+                response_metadata={"finish_reason": step["finish"]} if last else {},  # type: ignore[index]
+                usage_metadata={"input_tokens": 120, "output_tokens": 12, "total_tokens": 132}
+                if last
+                else None,
+            )
+
+
+@pytest.fixture
+def fake_llm(monkeypatch: pytest.MonkeyPatch) -> FakeChatModel:
+    """Replace the chat model (answering and rewriting) and make rate-limit waits instant."""
+    from app.core import llm
+
+    fake = FakeChatModel()
+    monkeypatch.setattr(llm, "get_chat_model", lambda kind="answer": fake)
+
+    async def no_sleep(seconds: float) -> None:
+        fake.slept.append(seconds)
+
+    monkeypatch.setattr(llm, "_sleep", no_sleep)
+    return fake

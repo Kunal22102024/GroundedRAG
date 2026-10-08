@@ -78,6 +78,16 @@ class FeedbackRating(StrEnum):
     DOWN = "down"
 
 
+# --- Chat -----------------------------------------------------------------------------
+
+# A question is embedded as one query, so it shares the embedding input ceiling below.
+QUESTION_MAX_CHARS = 2000
+# Follow-up rewriting sees the last few messages only; earlier turns add cost, not meaning.
+REWRITE_HISTORY_MESSAGES = 6
+REWRITE_HISTORY_ANSWER_CHARS = 400
+REWRITE_MAX_TOKENS = 256
+CONVERSATION_TITLE_MAX_CHARS = 80
+
 # --- Uploads and ingestion -----------------------------------------------------
 
 # Extension -> canonical media type (used when serving the original; never taken

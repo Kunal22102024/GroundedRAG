@@ -29,12 +29,12 @@ def test_defaults_match_tdd_configuration_reference(clean_env: pytest.MonkeyPatc
     assert settings.embedding_model == "models/gemini-embedding-001"
     assert settings.embedding_dim == 768
     assert (settings.embedding_batch_size, settings.embedding_max_concurrency) == (32, 4)
-    assert settings.llm_model == "gemini-2.5-flash"
+    assert settings.llm_model == "gemini-3.8-flash"
     assert (settings.llm_temperature, settings.llm_max_tokens) == (0.0, 1024)
     assert settings.llm_thinking_budget == 0
     assert (settings.retrieval_candidates, settings.retrieval_top_k) == (30, 5)
     assert settings.rrf_k == 60
-    assert settings.relevance_threshold == 0.45
+    assert settings.relevance_threshold == 0.60
     assert settings.rerank_enabled is False
     assert (settings.chunk_target_chars, settings.chunk_overlap_chars) == (800, 100)
     assert settings.max_upload_mb == 50

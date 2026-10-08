@@ -7,11 +7,12 @@ import uuid
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.constants import (
     PASSWORD_MAX_BYTES,
     PASSWORD_MIN_CHARS,
+    QUESTION_MAX_CHARS,
     AccessLevel,
     DocumentStatus,
     Role,
@@ -156,3 +157,41 @@ class UploadResponse(BaseModel):
 
     documents: list[DocumentOut]
     rejected: list[RejectedFileOut]
+
+
+# --- Chat -----------------------------------------------------------------------------
+
+
+class ChatFilters(BaseModel):
+    """Optional narrowing filters (PRD 4.2). The caller's access levels are always applied on top."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    department: str | None = Field(default=None, max_length=100)
+    document_type: str | None = Field(default=None, max_length=100)
+    date_from: date | None = None
+    date_to: date | None = None
+    document_ids: list[uuid.UUID] | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def _dates_ordered(self) -> ChatFilters:
+        if self.date_from and self.date_to and self.date_from > self.date_to:
+            raise ValueError("date_from must not be after date_to")
+        return self
+
+
+class ChatRequest(BaseModel):
+    """One question, optionally continuing a conversation and narrowed by filters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=QUESTION_MAX_CHARS)
+    conversation_id: uuid.UUID | None = None
+    filters: ChatFilters | None = None
+
+    @field_validator("question")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value

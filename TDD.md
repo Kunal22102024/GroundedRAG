@@ -2,7 +2,7 @@
 
 **System Name:** GroundedRAG — Hybrid Retrieval & Metadata Pipeline
 
-**Version:** 1.3.3
+**Version:** 1.3.4
 
 **Target Architecture:** Containerized services (Docker Compose): frontend (nginx), backend (FastAPI), vector database (ChromaDB), relational database (PostgreSQL). Embeddings and generation are provided by Google Gemini through LangChain.
 
@@ -54,7 +54,7 @@
             │    GENERATION & GROUNDING ENGINE   │
             │   - Relevance Guard (cosine/lexical)│
             │   - Strict Context Prompting       │
-            │   - Gemini gemini-2.5-flash (stream)│
+            │   - Gemini gemini-3.8-flash (stream)│
             │   - Citation Mapping + Verification│
             └─────────────────┬──────────────────┘
                               │
@@ -72,7 +72,7 @@
 | Embeddings | Google `gemini-embedding-001` via LangChain (`GoogleGenerativeAIEmbeddings`) | Strong retrieval quality; no local model. Embeddings are a **remote API call**: network latency, rate limits, cost, and data leaves the deployment (see §9). |
 | Embedding size | **768 dimensions** by default (configurable; model default is 3072) | The model supports reduced output sizes with little quality loss; 768 cuts storage and search cost about 4x versus 3072. Vectors are L2-normalized in the backend. |
 | Embedding task types | `RETRIEVAL_DOCUMENT` for chunks, `RETRIEVAL_QUERY` for queries | The model is asymmetric; using the right task type improves retrieval. Always set explicitly. |
-| Generation | Google `gemini-2.5-flash` via LangChain (`ChatGoogleGenerativeAI`), model ID configurable | See the model lifecycle risk in §15. Never hardcode the model ID. |
+| Generation | Google `gemini-3.8-flash` via LangChain (`ChatGoogleGenerativeAI`), model ID configurable | See the model lifecycle risk in §15. Never hardcode the model ID. |
 | Vector DB | ChromaDB (server mode, cosine distance) | Dense search + metadata filtering. Chroma's native sparse/hybrid Search API is Chroma Cloud only, so keyword search and fusion run in the backend. |
 | Keyword search | BM25 in the backend over Postgres chunks | Guarantees exact-token matching (error codes, IDs). |
 | Source of truth | PostgreSQL | Chroma and the BM25 index are derived and rebuildable. |
@@ -161,7 +161,7 @@ embeddings_model = GoogleGenerativeAIEmbeddings(
 )
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",              # settings.LLM_MODEL
+    model="gemini-3.8-flash",              # settings.LLM_MODEL
     temperature=0.0,                       # factual answers for RAG
     max_tokens=1024,                       # settings.LLM_MAX_TOKENS
     thinking_budget=0,                     # settings.LLM_THINKING_BUDGET (see §6.2)
@@ -309,11 +309,18 @@ The dense cosine similarity of each candidate is carried through fusion so the g
 
 ### 5.4 Exact-Token Safeguard (Optional)
 
-If the query contains identifier-like tokens (error codes, IDs, version strings), the dense query can additionally pass `where_document={"$contains": "<token>"}` as a substring check, so exact matches are surfaced even if the BM25 tokenizer misses them.
+If the query contains identifier-like tokens (error codes, IDs, version strings), the dense query can additionally pass `where_document={"$contains": "<token>"}` as a substring check, so exact matches are surfaced even if the BM25 tokenizer misses them. **Not implemented:** the BM25 tokenizer keeps identifiers whole and the lexical override (§6.3) covers the rest; on the draft evaluation set BM25 ranked the expected chunk first for all three exact-token questions.
 
 ### 5.5 Reranking (Optional)
 
-A cross-encoder (FlashRank on CPU, or Cohere Rerank) rescoring the fused top candidates. Controlled by a configuration flag and evaluated against hybrid-only retrieval. When enabled, its score replaces the cosine score in the guard.
+A cross-encoder (FlashRank on CPU, or Cohere Rerank) rescoring the fused top candidates. Controlled by a configuration flag and evaluated against hybrid-only retrieval. When enabled, its score replaces the cosine score in the guard. **Not implemented yet:** `RERANK_ENABLED` stays `false`. On the 10 answerable draft questions BM25 ranked the expected chunk first every time and dense search 9 times out of 10, so the extra dependency (ONNX runtime plus a model download) was deferred until an evaluation shows a need.
+
+### 5.6 Implementation notes (phase 4)
+
+* **One filter, three translations.** `core/filters.py::build_filter(user, request)` returns a frozen `SearchFilter`; its `to_chroma()`, `allows()` (the BM25 predicate) and `sql_conditions()` are all derived from the same fields, and the access levels from the role are part of every one of them. An unknown role has no readable level and matches nothing (fail closed). An empty `document_ids` list means "no restriction", which is what a UI with nothing selected sends. A department or type is matched case-insensitively to its canonical spelling.
+* **Retrieval** (`core/retrieval.py`): embed the question with `RETRIEVAL_QUERY`, run dense (top 30) and keyword (top 30) search in parallel under the same filter, fuse by RRF, then load the fused ids from PostgreSQL. Only chunks whose document is `indexed` and which pass the filter once more in SQL survive, so a half-deleted document or a stale vector can never surface. The top 5 become the candidates. Timings: `embed_ms`, `dense_ms`, `keyword_ms`, `fusion_ms`, `hydrate_ms`.
+* **A broken index is an error, never a silent "not found".** If PostgreSQL knows of chunks the filter allows but the dense channel returns nothing (or the keyword index is empty), retrieval raises `IndexUnavailableError` and the stream ends with an `error` event (`index_unavailable`). `/ready` has an `index` check: counts agree across PostgreSQL, Chroma and BM25, and a random sample of up to 64 stored vectors can be found by search (cached 60 s).
+* **Conversation history** for rewriting is the last 6 messages of the conversation; assistant messages are truncated to 400 characters and lose their `[n]` markers. The answer prompt receives the rewritten standalone question only.
 
 ---
 
@@ -346,7 +353,9 @@ In the implementation, sources may be numbered (`[1]`, `[2]`) in the context and
 ### 6.2 Gemini Generation Settings
 
 * `temperature=0.0` for factual, repeatable answers. (Newer Gemini generations may recommend default temperature settings; re-check the model documentation and re-run the evaluation set when migrating.)
-* **Thinking:** `gemini-2.5-flash` is a reasoning model. Thinking tokens add latency and cost, and they count toward the output token limit, so with `max_tokens=1024` an unbounded thinking phase can truncate or empty the visible answer. For this extractive task, set the thinking budget to **0** (`LLM_THINKING_BUDGET`). This also protects the 1.2 s first-token target.
+* **Thinking:** Gemini Flash models are reasoning models. Thinking tokens add latency and cost, and they count toward the output token limit, so with `max_tokens=1024` an unbounded thinking phase can truncate or empty the visible answer. For this extractive task, set the thinking budget to **0** (`LLM_THINKING_BUDGET`). This also protects the 1.2 s first-token target. Verified against `langchain-google-genai` 4.4.0 on `gemini-3.8-flash`: the budget reaches the API (`ThinkingConfig(thinking_budget=0)`) and every real answer reported `reasoning_tokens = 0`.
+* **Model availability.** `gemini-2.5-flash` answers `404 NOT_FOUND: no longer available to new users` for a new API key, although `models.list()` still shows it, and Google's message points to `gemini-3.8-flash`, which is now the default. Newer generations list a fixed sampling default; `gemini-3.5-flash-lite` rejected the same request with `400 INVALID_ARGUMENT`, so a model change needs one real call to confirm. The wrapper turns the library's own retries off (`max_retries=1`), because they ignore the server's retry hint.
+* **Rate limits in chat.** A 429 before any output is retried at most `INTERACTIVE_MAX_RETRIES` (2) times, waiting the server's hint plus one second, never longer than `INTERACTIVE_MAX_WAIT_SECONDS` (30). While waiting, the stream sends `status` events (`rate_limited`, with `retry_in`). If the limit persists, or the hint is longer, the stream ends with an `error` event (`rate_limited`: "Rate limit reached, please try again in a minute."). A daily quota ends immediately (`quota_exhausted`). Query embedding follows the same policy. Free-tier keys have both per-minute and per-day limits.
 * **Finish reasons are handled explicitly:** `MAX_TOKENS` returns the partial answer with a flag; safety blocks or empty candidates produce an `error` event with a clear message rather than a blank answer.
 * Token usage is recorded per request for cost visibility.
 
@@ -356,8 +365,18 @@ Before and after generation, automated checks run:
 
 * **Retrieval confidence check:** let `s` be the best **dense cosine similarity** (`1 - ChromaDB distance`, 0–1 scale) among the candidates, or the top **reranker score** when reranking is enabled. If `s` is below the configurable threshold (`RELEVANCE_THRESHOLD`), generation is skipped and the system returns: *"Insufficient information available in the selected documents."* The score is exposed in the response for debugging.
 * **Lexical override:** exact-token queries (an error code, an ID) can have low dense similarity even when the right chunk exists. If the query contains an identifier-like token and the top BM25 chunk contains that exact token (case-insensitive), the guard passes regardless of `s`.
-* **Threshold calibration:** the value of 0.45 is a **provisional starting point**. Similarity distributions differ between embedding models, so after switching to Gemini embeddings the threshold must be re-derived: run the evaluation set (including deliberately unanswerable questions), plot scores for answerable versus unanswerable questions, and set the cutoff between them.
+* **Threshold calibration: `RELEVANCE_THRESHOLD = 0.60`.** Similarity distributions differ between embedding models, so the cutoff was derived from `eval/questions.jsonl` (15 questions, 62-chunk corpus, `gemini-embedding-001` at 768 dimensions), best dense cosine per question:
+
+  | Kind | n | min | mean | max |
+  | --- | --- | --- | --- | --- |
+  | normal (answerable) | 7 | 0.674 | 0.753 | 0.796 |
+  | exact token (answerable) | 3 | 0.668 | 0.726 | 0.799 |
+  | near miss (unanswerable) | 3 | 0.626 | 0.671 | 0.702 |
+  | off topic (unanswerable) | 2 | 0.545 | 0.546 | 0.546 |
+
+  Off-topic questions are cleanly separated (at most 0.562 across all samples, including two earlier ones) from everything else (at least 0.626). **There is no clean gap between answerable and near-miss questions**: 0.668 to 0.799 overlaps 0.626 to 0.702, and a cutoff above 0.702 would refuse real answers (two of ten answerable questions score below it, one of them rescued by the lexical override). So 0.60 sits in the gap that exists, about halfway between the highest off-topic score and the lowest near-miss/answerable score: nothing answerable is refused, off-topic questions never reach the LLM, and near-misses (topic present, fact absent) reach the model, whose prompt tells it to answer with the refusal sentence. Verified live: "maximum number of characters a password can have" scored 0.702, went to the LLM, and came back as the exact refusal sentence with no citation. The trade-off is one LLM call for each near miss. Very short queries can also score high (`SALARY_X9` for a user who cannot see that document scored 0.659 against an unrelated chunk), so the model's own refusal remains the second line of defence. Re-run the evaluation and recalibrate after changing `EMBEDDING_MODEL` or `EMBEDDING_DIM` (CLAUDE.md rule 17).
 * **Citation verification:** every citation marker in the output must map to a chunk actually present in the retrieved context. If any are invalid, retry once; if still invalid, strip the invalid markers and flag the response.
+* **Citation verification, as implemented.** Sources are numbered `[1]`..`[5]` in the prompt. A streaming `CitationFilter` checks every `[n]` while the answer arrives: a number outside `1..K` is removed before the user sees it, `[1, 2]` is normalized to `[1][2]`, other brackets are left alone, and a marker cut off by the token limit is dropped. If the answer ends with an invalid marker or with no valid citation at all (and is not the refusal sentence), it is regenerated **once** with a stricter reminder: the stream sends `status` `{"stage": "retrying", "reset": true}` and the client discards the partial text. A second failure keeps the markers stripped and sets the message's `flagged`. The model answering with the refusal sentence itself is recognised and returned as a refusal without citations.
 
 ---
 
@@ -377,7 +396,13 @@ All routes are under `/api` and require a JWT bearer token except signup, login,
 | `POST /messages/{id}/feedback` | Thumbs up/down |
 | `GET /health`, `GET /ready` | Liveness (touches no dependency; used by the container healthcheck); readiness (Postgres, Chroma and, once `core/embeddings.py` exists, the embedding model via a cached probe so polling does not spend API quota). `/ready` returns 503 when any check fails and exposes only exception class names |
 
-**`POST /chat` events:** `status` (stage updates), `token` (answer text), `citations` (mapped source chunks), `done` (guard score, per-stage timings, token usage, flags), `error`.
+**`POST /chat`** takes `{question (1..2000 chars), conversation_id?, filters?: {department?, document_type?, date_from?, date_to?, document_ids?}}` and streams Server-Sent Events (`Cache-Control: no-cache`, `X-Accel-Buffering: no`). A conversation that is not the caller's is a 404 before the stream starts; everything that goes wrong afterwards is an `error` event, never a dropped connection.
+
+* `status`: `{stage}` is `searching`, `rewriting`, `generating`, `rate_limited` (with `retry_in` seconds) or `retrying` (with `reset: true`: discard the text received so far).
+* `token`: `{text}`: answer text that is safe to show; invalid citation markers were already removed.
+* `citations`: `{citations: [{n, chunk_id, document_id, document_name, page_number, page_end, section_title, text}]}`: only the sources the answer cites, `n` matching the `[n]` markers; empty for a refusal.
+* `done`: `{conversation_id, message_id, answer (authoritative final text), refused, guard: {passed, reason, score, threshold}, timings, usage, flags}`. `guard.reason` is `relevant`, `lexical_override`, `below_threshold` or `no_candidates`. `timings` (ms): `rewrite_ms` (follow-ups only), `embed_ms`, `dense_ms`, `keyword_ms`, `fusion_ms`, `hydrate_ms`, `ttft_ms`, `generate_ms`, `total_ms` (the last three absent when the LLM was not called). `usage`: `input_tokens`, `output_tokens`, `total_tokens`, `reasoning_tokens`. `flags`: `partial` (cut off by `MAX_TOKENS`), `citations_removed`, `uncited`, `retried`, `rewritten`.
+* `error`: `{code, message, retry_after?}` with `code` one of `rate_limited`, `quota_exhausted`, `auth`, `not_configured`, `blocked` (safety), `empty`, `unavailable`, `index_unavailable`, `failed`, `internal`. Nothing is stored for a failed turn.
 
 ---
 
@@ -418,12 +443,14 @@ Both document chunks (for embedding) and retrieved context plus questions (for g
 | `EMBEDDING_MODEL` | `models/gemini-embedding-001` | Embedding model |
 | `EMBEDDING_DIM` | `768` | Output dimensionality (768, 1536, or 3072) |
 | `EMBEDDING_BATCH_SIZE` / `EMBEDDING_MAX_CONCURRENCY` | `32` / `4` | Ingestion throughput vs rate limits |
-| `LLM_MODEL` | `gemini-2.5-flash` | Answer generation (see §15 on lifecycle) |
+| `LLM_MODEL` | `gemini-3.8-flash` | Answer generation (see §6.2 and §15 on availability) |
 | `REWRITE_MODEL` | same as `LLM_MODEL` | Follow-up rewriting |
 | `LLM_TEMPERATURE` / `LLM_MAX_TOKENS` / `LLM_THINKING_BUDGET` | `0.0` / `1024` / `0` | Generation settings |
+| `LLM_TIMEOUT_SECONDS` | `60` | A model call is abandoned after this long |
+| `INTERACTIVE_MAX_RETRIES` / `INTERACTIVE_MAX_WAIT_SECONDS` | `2` / `30` | Rate-limit retries for a user waiting on an answer (LLM and query embedding) |
 | `RETRIEVAL_CANDIDATES` / `RETRIEVAL_TOP_K` | `30` / `5` | Per-channel candidates; chunks sent to the LLM |
 | `RRF_K` | `60` | RRF smoothing constant |
-| `RELEVANCE_THRESHOLD` | `0.45` (provisional) | Guard cutoff; calibrate with the eval set |
+| `RELEVANCE_THRESHOLD` | `0.60` (calibrated, §6.3) | Guard cutoff on the best dense cosine similarity |
 | `RERANK_ENABLED` | `false` | Cross-encoder reranking |
 | `CHUNK_TARGET_CHARS` / `CHUNK_OVERLAP_CHARS` | `800` / `100` | Chunking |
 | `MAX_UPLOAD_MB` | `50` | Upload size limit |
@@ -442,7 +469,7 @@ Both document chunks (for embedding) and retrieved context plus questions (for g
 | Frontend | React, TypeScript, Vite, Tailwind CSS, TanStack Query | Streamlit (prototype) |
 | Parsing & Chunking | pdfplumber, python-docx, BeautifulSoup | LlamaIndex Readers |
 | Embeddings | Google `gemini-embedding-001` via `langchain-google-genai` | Local FastEmbed / BGE, OpenAI embeddings |
-| LLM | Google `gemini-2.5-flash` via `langchain-google-genai` | Newer Gemini Flash models, other providers |
+| LLM | Google `gemini-3.8-flash` via `langchain-google-genai` | Other Gemini Flash / Flash-Lite models, other providers |
 | Vector DB | ChromaDB (server mode, cosine distance) | Qdrant, pgvector |
 | Keyword Search | BM25 in the backend (`bm25s` / `rank_bm25`) | PostgreSQL full-text search, Elasticsearch |
 | Fusion | RRF implemented in the backend | Chroma Cloud Search API (native hybrid) |
@@ -457,13 +484,13 @@ Both document chunks (for embedding) and retrieved context plus questions (for g
 | Stage | Target |
 | --- | --- |
 | Document processing (parse, chunk, embed via API, index) | $\le 6$ seconds per 10-page document (about 30 s per 50 pages, matching the PRD) |
-| Query embedding (Gemini API) | $\le 300\text{ ms}$ (p95); cached repeats near zero |
+| Query embedding (Gemini API) | $\le 300\text{ ms}$ (p95); cached repeats near zero. **Measured: 0.5 to 0.9 s typical, up to about 2 s on the first call after a restart; accepted for this project, not optimized** |
 | Filtered dense search + BM25 search | $\le 150\text{ ms}$ (p95) |
 | RRF fusion | $\le 50\text{ ms}$; reranking, when enabled, has its own budget of $\le 200\text{ ms}$ |
-| LLM first token (TTFT) | $\le 1.2\text{ seconds}$ (requires thinking disabled) |
-| Total end-to-end latency | $\le 3.5\text{ seconds}$ (p95); follow-up questions add one rewrite call |
+| LLM first token (TTFT) | $\le 1.2\text{ seconds}$ (requires thinking disabled). **Measured with `gemini-3.8-flash`: 1.6 to 6.8 s** |
+| Total end-to-end latency | $\le 3.5\text{ seconds}$ (p95); follow-up questions add one rewrite call. **Measured: 2.9 to 7.4 s with `gemini-3.8-flash`; a refusal below the threshold takes 0.6 s because the LLM is not called** |
 
-Per-stage timings (rewrite, embed, dense, keyword, fusion, rerank, generate) are returned with each response so targets can be verified. Ingestion speed is bounded by the embedding API rate limits and is measured, not assumed.
+Per-stage timings (rewrite, embed, dense, keyword, fusion, hydrate, ttft, generate, total) are returned with each response so targets can be verified. Dense plus keyword search plus loading from PostgreSQL measured 25 to 45 ms in total. On the same prompt `gemini-3.1-flash-lite` reached the first token in 1.9 s against 3.0 s for `gemini-3.8-flash` with an identical answer, so a lighter model is the lever for latency (set `LLM_MODEL`). Ingestion speed is bounded by the embedding API rate limits and is measured, not assumed.
 
 ---
 
@@ -509,9 +536,9 @@ Per-stage timings (rewrite, embed, dense, keyword, fusion, rerank, generate) are
 
 | Risk | Mitigation |
 | --- | --- |
-| **`gemini-2.5-flash` lifecycle.** As of October 2026 it is a legacy model; Google's deprecations page recommends `gemini-3.5-flash` as its replacement, and its dates are described as the earliest possible, with exact dates communicated later. An October 16, 2026 shutdown date was listed in July and later removed. | Model ID is configuration only; keep the LLM behind one wrapper; plan a migration test with the eval set; check the deprecations page before release. |
+| **Gemini model lifecycle (seen live).** `gemini-2.5-flash` returns `404 NOT_FOUND: no longer available to new users` for a new API key even though `models.list()` still lists it; Google's message recommends `gemini-3.8-flash`, now the default. As of October 2026 `gemini-2.5-flash` is a legacy model; Google's deprecations page recommends `gemini-3.5-flash` as its replacement, and its dates are described as the earliest possible, with exact dates communicated later. An October 16, 2026 shutdown date was listed in July and later removed. | Model ID is configuration only; keep the LLM behind one wrapper; plan a migration test with the eval set; check the deprecations page before release. |
 | Embedding-model or dimension change forces re-indexing | Collection name encodes model and dimension; startup check; documented re-embed command that reads from PostgreSQL. |
-| Threshold calibrated for another model gives wrong refusals | Treat 0.45 as provisional; calibrate on the eval set (§6.3). Measured in phase 3 with `gemini-embedding-001` at 768 dimensions on a 62-chunk corpus: the best chunk for a relevant question scored 0.76 to 0.82 cosine and the best chunk for an unrelated question 0.56 at most, so 0.45 would never refuse; a cutoff near 0.65 separates those samples, but the corpus is far too small to trust. |
+| Threshold calibrated for another model gives wrong refusals | Calibrated to 0.60 on the draft eval set in phase 4 (§6.3); re-calibrate when the embedding model changes. Phase 3 measurement with `gemini-embedding-001` at 768 dimensions on a 62-chunk corpus: the best chunk for a relevant question scored 0.76 to 0.82 cosine and the best chunk for an unrelated question 0.56 at most, so 0.45 would never refuse; a cutoff near 0.65 separates those samples, but the corpus is far too small to trust. |
 | Rate limits and cost during bulk ingestion | Batching, bounded concurrency, backoff, deduplication, resumable failure handling. |
 | Data leaves the deployment | Paid-tier key, confirm terms, provider-agnostic wrappers (§9). |
 | In-memory BM25 limits scaling | Single worker now; PostgreSQL full-text search is the scale-out path. |
@@ -527,6 +554,7 @@ Per-stage timings (rewrite, embed, dense, keyword, fusion, rerank, generate) are
 
 ## Changelog
 
+* **1.3.4:** Phase 4 (filters, retrieval, guard, rewriting, generation, streaming chat, citation verification). Documented the retrieval implementation (one `SearchFilter` translated for Chroma, BM25 and SQL; hydration from PostgreSQL; an unhealthy index is an error, never an empty result; an `index` check in `/ready`), the SSE protocol with every payload, streaming citation verification with a single retry, the rate-limit policy for a waiting user, the calibrated `RELEVANCE_THRESHOLD = 0.60` with the evaluation data and the honest finding that near-miss questions overlap answerable ones, the measured latencies, and the default model change to `gemini-3.8-flash` after `gemini-2.5-flash` turned out to be closed to new API keys. Optional exact-token `where_document` search and reranking were not implemented.
 * **1.3.3:** Phase 3 (parsers, chunking, metadata, embeddings, vector store, BM25, ingestion, documents API). Documented implemented parser behavior (physical PDF pages, outline or font-based sections, column-by-column reading of two-column pages, page-chrome removal with a safety net, known overprint limitation) and chunker rules (sentence packing, same-page overlap, size ceiling validated at startup); metadata resolution during indexing with month/year refinement (migration 0002 makes `creation_date` nullable until then); the embeddings wrapper's error classification, shared rate-limit cooldown and measured free-tier limits (100 requests per minute) and latency; ingestion ordering (Postgres before Chroma), failure cleanup, per-document lock and startup consistency checks including refusal to start on an empty Chroma and the `reembed` maintenance command; `bm25s` details; the documents API contract, upload validation, safe file serving and the park-then-delete order; verification and repair of the Chroma index after a live recall failure (stored vectors that no query returned); new risks.
 * **1.3.2:** Phase 2 (database and authentication). Documented the schema conventions (UUID keys, `VARCHAR` + `CHECK` instead of ENUM types, database-level cascades, lower-case unique email, `page_number >= 1`, one feedback row per user per message, `SET NULL` for document owners) and the test that keeps models and migration identical. Documented the authentication design: bcrypt with a byte limit and configurable work factor, pinned-algorithm JWTs that carry only the user id, role re-read from the database per request, advisory-locked signup so only one first admin can exist, enumeration-resistant login, and the explicit list of what is out of scope. Added `BCRYPT_ROUNDS` to the configuration.
 * **1.3.1:** Phase 1 (deployment skeleton) refinements, no behavior change to retrieval or generation. Deployment: two Docker networks (`internal` with no egress for Postgres/Chroma, `edge` for nginx and the backend), a thin `chroma/Dockerfile` so ChromaDB runs non-root with an owned `/data`, `nginx-unprivileged` on container port 8080 with `HTTP_PORT` for the host side, Postgres run as `user: postgres`, healthcheck mechanics per service (the Chroma image has no curl/wget). Chroma: documented the exact cosine collection configuration and the `embedding_function=None` requirement, both verified on 1.5.9; documented that server/client version equality cannot be verified at runtime (fixed `"1.0.0"` from `/api/v2/version`) and is enforced by a test instead. Readiness: `/ready` covers Postgres and Chroma now; the embedding-model probe arrives with `core/embeddings.py` and will be cached. Logging: uvicorn's own access log is kept off because it records query strings.

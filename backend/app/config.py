@@ -37,17 +37,23 @@ class Settings(BaseSettings):
     # Retries per batch for rate limits (429) and transient (5xx/network) errors.
     embedding_max_retries: int = Field(default=6, ge=0, le=20)
 
-    llm_model: str = "gemini-2.5-flash"
+    llm_model: str = "gemini-3.8-flash"
     rewrite_model: str | None = None
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     llm_max_tokens: int = Field(default=1024, ge=64)
     llm_thinking_budget: int = Field(default=0, ge=0)
+    llm_timeout_seconds: float = Field(default=60.0, gt=0)
+    # A user is waiting on a chat answer: rate limits and transient errors are retried only this
+    # often, waiting at most this long once (the server's own retry hint is honoured up to that).
+    interactive_max_retries: int = Field(default=2, ge=0, le=6)
+    interactive_max_wait_seconds: float = Field(default=30.0, ge=0)
 
     # --- Retrieval and grounding -------------------------------------------
     retrieval_candidates: int = Field(default=30, ge=1)
     retrieval_top_k: int = Field(default=5, ge=1)
     rrf_k: int = Field(default=60, ge=1)
-    relevance_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
+    # Calibrated with eval/questions.jsonl on gemini-embedding-001 @ 768 dims (TDD 6.3).
+    relevance_threshold: float = Field(default=0.60, ge=0.0, le=1.0)
     rerank_enabled: bool = False
 
     # --- Ingestion ----------------------------------------------------------

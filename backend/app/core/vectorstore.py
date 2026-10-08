@@ -19,6 +19,7 @@ version. It is enforced statically by ``tests/test_pinned_versions.py`` instead.
 from __future__ import annotations
 
 import contextlib
+import random
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -420,6 +421,15 @@ def all_ids(page_size: int = 5000) -> set[str]:
         if len(page["ids"]) < page_size:
             return ids
         offset += page_size
+
+
+def sample_ids(limit: int = 64) -> list[str]:
+    """Up to ``limit`` stored chunk ids from a random position (a cheap health-check sample)."""
+    total = count()
+    collection = get_collection()
+    offset = random.randrange(total - limit + 1) if total > limit else 0
+    page = _call("get", lambda: collection.get(limit=limit, offset=offset, include=[]))
+    return list(page["ids"])
 
 
 def ids_for_document(document_id: str) -> list[str]:
