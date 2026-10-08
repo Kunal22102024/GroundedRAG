@@ -24,7 +24,7 @@ If code and a document disagree, **do not silently pick one**: follow `TDD.md` f
 * **Databases:** PostgreSQL 16 (source of truth), ChromaDB server mode (dense vectors, cosine distance)
 * **Keyword search:** BM25 in the backend (`bm25s` or `rank_bm25`), fused with dense results by RRF in the backend
 * **Embeddings:** Google `gemini-embedding-001` via `langchain-google-genai` (768 dims, L2-normalized)
-* **LLM:** Google `gemini-2.5-flash` via `langchain-google-genai` (model ID comes from config)
+* **LLM:** Google `gemini-3.8-flash` via `langchain-google-genai` (model ID comes from config)
 * **Frontend:** React + TypeScript + Vite + Tailwind CSS + TanStack Query
 * **Infra:** Docker Compose (frontend/nginx, backend, chroma, postgres)
 
@@ -78,7 +78,8 @@ groundedrag/
 │   │   │   ├── auth_service.py
 │   │   │   ├── document_service.py
 │   │   │   ├── ingestion.py
-│   │   │   └── chat_service.py
+│   │   │   ├── chat_service.py
+│   │   │   └── conversation_service.py  # conversation history, rename, delete, message feedback
 │   │   │
 │   │   ├── core/                 # pure RAG building blocks; no FastAPI imports
 │   │   │   ├── parsers.py
@@ -95,7 +96,8 @@ groundedrag/
 │   │   │   ├── query_rewrite.py
 │   │   │   ├── prompts.py
 │   │   │   ├── generation.py
-│   │   │   └── guard.py
+│   │   │   ├── guard.py
+│   │   │   └── gemini_errors.py  # shared Gemini error classification (rate limit, key, transient)
 │   │   │
 │   │   └── db/
 │   │       ├── database.py       # engine, session factory
@@ -136,19 +138,15 @@ groundedrag/
 │   ├── static/index.html         # Phase 1 stack-status page; removed when the React app lands (Phase 5)
 │   ├── package.json, vite.config.ts, tailwind.config.ts, tsconfig.json
 │   └── src/
-│       ├── main.tsx              # entry
-│       ├── App.tsx               # router + providers
-│       ├── api/                  # fetch wrappers: client.ts, auth.ts, documents.ts, chat.ts, sse.ts
-│       ├── hooks/                # useAuth, useDocuments, useConversations, useChatStream
-│       ├── pages/                # LoginPage, SignupPage, LibraryPage, ChatPage, NotFoundPage
+│       ├── main.tsx              # entry: query client, router, auth provider
+│       ├── App.tsx               # routes, protected layout (header, navigation), 404 page
+│       ├── api/client.ts         # fetch wrapper (token, 401 -> logout) and the /chat SSE reader
+│       ├── hooks/useAuth.tsx     # auth context: login, signup, logout
+│       ├── pages/                # LoginPage (login and signup), LibraryPage, ChatPage
 │       ├── components/
-│       │   ├── layout/           # AppShell, Sidebar, ProtectedRoute, ThemeToggle
-│       │   ├── library/          # UploadDropzone, DocumentTable, StatusBadge, DocumentFilters
-│       │   ├── chat/             # ConversationList, MessageList, MessageBubble, ChatInput,
-│       │   │                     # FilterBar, CitationChip, FeedbackButtons, RefusalNotice
-│       │   ├── source/           # SourceDrawer, ChunkHighlight, DocumentViewer
-│       │   └── ui/               # small shared primitives (Button, Modal, Badge, Skeleton, Toast)
-│       ├── lib/                  # types.ts, markdown.tsx, format.ts
+│       │   ├── chat/             # Answer (text with citation chips), FilterBar
+│       │   └── source/           # SourceDrawer (cited passage + original PDF at the page)
+│       ├── lib/                  # types.ts, files.ts (download, sizes, page labels)
 │       └── styles/index.css
 │
 ├── eval/
@@ -213,7 +211,7 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | `filters.py` | `build_filter(user, request_filters)` returning one neutral filter object plus Chroma `where` and SQL translations | **The only place filters are built**; always injects the access-level constraint |
 | `fusion.py` | `rrf(rankings, k)` | Pure function; RRF scores are for ordering only |
 | `retrieval.py` | Orchestrates embed query → dense + BM25 (parallel) → fusion → optional rerank; returns candidates with dense similarity and timings | |
-| `rerank.py` | Optional FlashRank cross-encoder | Behind `RERANK_ENABLED` |
+| `rerank.py` | Optional FlashRank cross-encoder (**not implemented yet**) | Behind `RERANK_ENABLED`, which must stay `false` |
 | `query_rewrite.py` | Turns a follow-up into a standalone question using prior turns | Skipped on the first turn; thinking disabled, small token limit |
 | `prompts.py` | System prompt and context-block formatting | Treats context as untrusted data; numbered sources `[1]`, `[2]` |
 | `generation.py` | Calls the LLM (streaming), assembles the answer, maps citations to chunks, verifies them, retries once | Handles `MAX_TOKENS`, safety blocks, empty candidates |
@@ -296,6 +294,8 @@ nginx serves the SPA (with fallback to `index.html`), proxies `/api` to `backend
 ---
 
 ## 6. Frontend File Purposes
+
+The table lists the intended components; the implementation consolidated them into the files shown in the repository tree (section 2).
 
 | Area | Files | Purpose |
 | --- | --- | --- |
@@ -459,5 +459,7 @@ docker compose exec backend alembic upgrade head
 * Scanned PDFs (no extractable text) are rejected; OCR is not supported.
 * Single backend worker (in-memory BM25 index).
 * Document text and questions are sent to Google's Gemini API; use a paid-tier key and review current terms before uploading confidential documents.
-* `gemini-2.5-flash` is a legacy model with an uncertain shutdown date; keep the model ID in configuration and re-run the eval before migrating.
+* `gemini-2.5-flash` is closed to new API keys (404 "no longer available to new users"), so the default is `gemini-3.8-flash`; keep the model ID in configuration and re-run the eval before migrating.
+* Free-tier Gemini keys have per-minute and per-day limits (embeddings and chat). Chat retries a rate limit briefly, then shows a friendly error.
+* Reranking (`core/rerank.py`) is not implemented; `RERANK_ENABLED` must stay `false`.
 * ChromaDB has no per-user authorization; it must stay on the internal Docker network.

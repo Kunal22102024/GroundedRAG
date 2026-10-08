@@ -15,6 +15,7 @@ from app.constants import (
     QUESTION_MAX_CHARS,
     AccessLevel,
     DocumentStatus,
+    FeedbackRating,
     Role,
 )
 
@@ -195,3 +196,55 @@ class ChatRequest(BaseModel):
         if not value.strip():
             raise ValueError("must not be blank")
         return value
+
+
+# --- Conversations and feedback -------------------------------------------------------
+
+
+class ConversationOut(BaseModel):
+    """A conversation in the sidebar list."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    title: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class MessageOut(BaseModel):
+    """One stored message; citations are the same objects the chat stream sent."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    role: str
+    content: str
+    citations: list[dict[str, object]] | None = None
+    guard_score: float | None = None
+    flagged: bool = False
+    created_at: datetime
+    feedback: Literal["up", "down"] | None = None
+
+
+class ConversationDetail(ConversationOut):
+    """A conversation with all of its messages, oldest first."""
+
+    messages: list[MessageOut]
+
+
+class RenameRequest(BaseModel):
+    """New conversation title."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=200)
+
+
+class FeedbackRequest(BaseModel):
+    """Thumbs up/down, with an optional comment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rating: FeedbackRating
+    comment: str | None = Field(default=None, max_length=2000)

@@ -64,7 +64,7 @@ def test_unknown_role_fails_closed() -> None:
 )
 def test_every_chroma_filter_carries_the_access_constraint(request_filters: Request | None) -> None:
     where = build_filter(FakeUser("user"), request_filters).to_chroma()
-    clauses = where["$and"] if "$and" in where else [where]
+    clauses = where.get("$and", [where])
     assert {"access_level": {"$in": ["Public", "Internal"]}} in clauses
 
 

@@ -5,10 +5,9 @@ text files, ask questions in a chat interface, and get streamed answers grounded
 those documents, each claim carrying a clickable citation (document, page, section). When the
 documents do not contain the answer, the app says so instead of guessing.
 
-> **Build status:** Phases 1 to 3 of 6 are complete (deployment skeleton; database and
-> authentication; document ingestion and the documents API). Chat with citations, the web UI and
-> the evaluation tooling are the design target in [PRD.md](PRD.md) and [TDD.md](TDD.md), not yet
-> implemented.
+> **Build status:** all six phases are complete: deployment, database and authentication, document
+> ingestion, hybrid retrieval with the relevance guard, streamed chat with verified citations, the
+> web UI and the evaluation script. The design is in [PRD.md](PRD.md) and [TDD.md](TDD.md).
 
 | Document | Defines |
 | --- | --- |
@@ -45,16 +44,26 @@ in-memory BM25 index are derived from it and rebuildable.
 
 ## Quick start
 
-Requirements: Docker with Compose v2. A Gemini API key is needed from Phase 3 onwards (ingestion
-and chat); Phase 1 runs without one.
+Requirements: Docker with Compose v2 and a Gemini API key (ingestion and chat call Gemini).
 
 ```bash
 cp .env.example .env     # then fill in GOOGLE_API_KEY, JWT_SECRET, POSTGRES_PASSWORD
 docker compose up --build
 ```
 
-Open <http://localhost:8081>. The page shows the live status of the backend, Postgres and
-Chroma. API docs are at <http://localhost:8081/api/docs>.
+Open <http://localhost:8081>, then:
+
+1. **Sign up.** The first account becomes the administrator (only an admin can mark a document
+   `Restricted`).
+2. **Library:** upload PDF, DOCX, Markdown, HTML or text files. Each moves `queued`, `processing`,
+   `indexed`; department, type and date are detected unless you set them. Delete removes the file, its
+   text and its search index.
+3. **Chat:** ask a question. The answer streams in with citation chips (document and page); click one to
+   see the exact passage and the original PDF opened at that page. Use the filters above the chat
+   (department, type, date range, specific documents) to narrow the search. If the documents do not
+   contain the answer you get "Insufficient information available in the selected documents.".
+
+API docs are at <http://localhost:8081/api/docs>.
 
 Generate the two secrets with:
 
@@ -174,11 +183,14 @@ docker compose up -d backend
 ## Development
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up   # hot reload (added in Phase 6)
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d   # mounted source, backend reloads on change
+(cd frontend && npm install && npm run dev)        # UI on :5173, proxies /api to localhost:8081
 
 docker compose exec backend pytest                 # tests (no API key needed; see the note below)
 docker compose exec backend ruff check .           # lint
 docker compose exec backend ruff format --check .  # formatting
+docker compose -f docker-compose.yml -f docker-compose.dev.yml exec backend python -m eval.run_eval --verbose
+                                                   # retrieval + guard over eval/questions.jsonl (embedding calls only, no LLM)
 docker compose exec backend alembic revision --autogenerate -m "describe change"
 ```
 
@@ -210,12 +222,14 @@ All settings are environment variables, read only by `backend/app/config.py`. Bl
 | `EMBEDDING_DIM` | `768` | Output dimensionality (128 to 3072) |
 | `EMBEDDING_BATCH_SIZE` / `EMBEDDING_MAX_CONCURRENCY` | `32` / `4` | Ingestion throughput versus rate limits |
 | `EMBEDDING_MAX_RETRIES` | `6` | Retries per batch on rate limits and transient errors (backoff honours the server's retry hint) |
-| `LLM_MODEL` | `gemini-2.5-flash` | Answer generation |
+| `LLM_MODEL` | `gemini-3.8-flash` | Answer generation (`gemini-2.5-flash` is closed to new API keys) |
+| `LLM_TIMEOUT_SECONDS` | `60` | A model call is abandoned after this long |
+| `INTERACTIVE_MAX_RETRIES` / `INTERACTIVE_MAX_WAIT_SECONDS` | `2` / `30` | Rate-limit retries while a user waits (LLM and query embedding) |
 | `REWRITE_MODEL` | empty (= `LLM_MODEL`) | Follow-up question rewriting |
 | `LLM_TEMPERATURE` / `LLM_MAX_TOKENS` / `LLM_THINKING_BUDGET` | `0.0` / `1024` / `0` | Generation settings |
 | `RETRIEVAL_CANDIDATES` / `RETRIEVAL_TOP_K` | `30` / `5` | Candidates per channel; chunks sent to the LLM |
 | `RRF_K` | `60` | Reciprocal Rank Fusion constant |
-| `RELEVANCE_THRESHOLD` | `0.45` (provisional) | Refusal cutoff on cosine similarity; calibrate with the eval set |
+| `RELEVANCE_THRESHOLD` | `0.60` (calibrated) | Refusal cutoff on the best dense cosine similarity; re-calibrate after changing the embedding model |
 | `RERANK_ENABLED` | `false` | Cross-encoder reranking |
 | `CHUNK_TARGET_CHARS` / `CHUNK_OVERLAP_CHARS` | `800` / `100` | Chunking |
 | `MAX_UPLOAD_MB` | `50` | Per-file upload limit |
@@ -256,9 +270,12 @@ Deliberate choices and deviations from the spec documents. Newest phase last.
   it; the embedding/LLM wrappers raise a clear error at the point of use.
 * **Postgres uses the Debian `postgres:16` image**, as the TDD says, rather than Alpine, to avoid
   musl collation differences.
-* **Placeholder UI.** Until the React app lands in Phase 5, nginx serves a small static page
-  (`frontend/static/index.html`) that shows backend, Postgres and Chroma status. `nginx.conf` is
-  already in its final form (SPA fallback, `/api` proxy, SSE buffering off for `/api/chat`).
+* **The web UI is a small React app** (Vite, TypeScript, Tailwind, TanStack Query) built in the frontend
+  image and served by nginx (SPA fallback, `/api` proxy, SSE buffering off for `/api/chat`). To keep it
+  small, CLAUDE.md's fine-grained component tree was consolidated into a few files (`pages/`,
+  `components/chat`, `components/source`, `api/client.ts`); there is no dark mode. Answers are read with
+  `fetch`, not `EventSource`, because the stream needs the bearer token. The cited PDF is fetched with the
+  token and shown from a blob URL (`#page=N`), since an `<iframe>` cannot send headers.
 * **Test and lint tooling ships in the image by default** (`INSTALL_DEV=true`) so
   `docker compose exec backend pytest` works as documented; build with
   `--build-arg INSTALL_DEV=false` for a lean image. Tests use `httpx2` because Starlette
@@ -324,10 +341,30 @@ Deliberate choices and deviations from the spec documents. Newest phase last.
   reproduced, so every write is checked by querying each new vector with its own embedding, with automatic
   repair (re-insert, or rebuild from the stored vectors; no API cost), startup verification, and a
   `verify-index` command. Re-test this on every Chroma upgrade (TDD 4.1).
-* **The provisional `RELEVANCE_THRESHOLD=0.45` is too low for this model.** Measured on a small corpus (62
-  chunks): the best chunk for a relevant question scores 0.76 to 0.82 cosine, and the best chunk for an
-  unrelated question 0.56 at most, so 0.45 would never refuse. A cutoff near 0.65 separates these
-  samples, but the corpus is tiny: calibrate with the evaluation set (CLAUDE.md rule 17) before relying on it.
+* **`RELEVANCE_THRESHOLD` is 0.60**, calibrated on `eval/questions.jsonl` (15 questions, 62 chunks): off-topic
+  questions score at most 0.56, answerable ones at least 0.67. **There is no clean gap between answerable
+  and near-miss questions** (topic present, fact absent: 0.63 to 0.70 against 0.67 to 0.80), so a dense
+  score cannot stop them. They reach the model, whose prompt tells it to reply with the refusal sentence;
+  this worked live, at the cost of one LLM call. Raising the cutoff would refuse real answers. Details and
+  the table are in TDD 6.3. Very short queries can also score high, so the model's refusal is the second
+  line of defence.
+* **Default model `gemini-3.8-flash`.** `gemini-2.5-flash` answers `404 ... no longer available to new
+  users` for a new API key, so the default moved (TDD 6.2, 15). `LLM_MODEL` is configuration; confirm any
+  other model with one real call. A lighter model (`gemini-3.1-flash-lite`) reached the first token in 1.9 s
+  against 3.0 s on the same prompt with the same answer.
+* **Measured speed** (`gemini-3.8-flash`, free tier): first token 1.6 to 6.8 s, whole answer 2.9 to 7.4 s;
+  a refusal below the threshold takes 0.6 s because no LLM is called. The TDD targets (1.2 s, 3.5 s) are not met
+  with this model. Query embedding takes 0.5 to 0.9 s, accepted.
+* **Citations are verified while streaming.** `[n]` markers that map to no retrieved source are removed
+  before they are shown; an answer with a bad or missing citation is regenerated once, then stripped and
+  flagged. The final answer in the `done` event is authoritative (TDD 6.3, 7).
+* **Rate limits.** Free-tier Gemini keys have per-minute and per-day limits for chat as well as for
+  embeddings. A 429 is retried briefly with the server's hint (at most 2 times, 30 s each); then the chat
+  shows "Rate limit reached, please try again in a minute." It never hangs.
+* **Not implemented, by scope:** reranking (`RERANK_ENABLED` must stay `false`; hybrid retrieval ranked the
+  expected chunk first for all 10 answerable draft questions), the optional exact-token `where_document`
+  search (BM25 plus the lexical override cover it), dark mode, and tests for the conversation/feedback
+  endpoints and the UI (checked by hand and by build-time type checking).
 * **Known limitation:** PDFs whose text layer overprints other text (a watermark laid over the body)
   can interleave characters. The document still indexes and its page numbers are right.
 * **Not implemented, by scope:** OCR, re-ingesting a failed document in place (delete and upload
@@ -355,3 +392,8 @@ Deliberate choices and deviations from the spec documents. Newest phase last.
 | `exec /app/docker-entrypoint.sh: no such file or directory` | The script was checked out with Windows (CRLF) line endings. `.gitattributes` forces LF; re-checkout the file (or run `git add --renormalize .`). |
 | Chroma container is unhealthy | It has no curl; the healthcheck uses bash `/dev/tcp`. Check `docker compose logs chroma` for the real error (usually a permissions problem on `chroma_data`). |
 | Logs are one JSON object per line | By design (structured logging with a `request_id` on every request line). Migration output at startup is plain text. |
+| Chat says "Rate limit reached, please try again in a minute" | The free tier's per-minute (or per-day) Gemini limit. Wait a minute and ask again, or use a billing-enabled key. |
+| Chat error "The AI service could not answer (GoogleModelNotFoundError)" | The configured `LLM_MODEL` is not available to your key (`404 ... no longer available to new users`). Set `LLM_MODEL=gemini-3.8-flash` (or another model your key lists) and recreate the backend: `docker compose up -d backend` (a plain restart does not re-read `.env`). |
+| Chat error "The search index is unavailable or out of date" | PostgreSQL lists indexed chunks but a search channel returns nothing. Check `GET /api/ready` (`index`), then run `verify-index` or `reembed` (see "Checking the search index"). |
+| Everything is refused with "Insufficient information..." | Either nothing is indexed yet (Library shows `indexed`?), your filters exclude the documents, or the question scores below `RELEVANCE_THRESHOLD`. `--verbose` in `python -m eval.run_eval` shows the scores. |
+| The source drawer shows no PDF | Only PDFs are embedded; other types offer a download. The file is fetched with your token, so a logged-out tab shows nothing. |

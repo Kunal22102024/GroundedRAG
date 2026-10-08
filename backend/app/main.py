@@ -15,7 +15,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.api import auth, chat, documents, health
+from app.api import auth, chat, conversations, documents, health
 from app.config import get_settings
 from app.constants import API_PREFIX
 from app.db import database
@@ -72,6 +72,7 @@ def create_app() -> FastAPI:
     api_router.include_router(auth.router)
     api_router.include_router(documents.router)
     api_router.include_router(chat.router)
+    api_router.include_router(conversations.router)
     app.include_router(api_router)
     return app
 

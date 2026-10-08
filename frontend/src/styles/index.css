@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+body {
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
+
+.cite-chip {
+  @apply mx-0.5 inline-flex items-center rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 align-baseline text-xs font-medium text-indigo-700 hover:bg-indigo-100;
+}
