@@ -24,6 +24,14 @@ from app.constants import (
 _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+def reject_nul(value: str) -> str:
+    """PostgreSQL text cannot hold a NUL character; refuse it here instead of failing later with
+    a 500 (for a chat question, after the model has already been paid for)."""
+    if "\x00" in value:
+        raise ValueError("must not contain NUL characters")
+    return value
+
+
 class HealthResponse(BaseModel):
     """Liveness probe result."""
 
@@ -59,7 +67,7 @@ class _EmailPassword(BaseModel):
     @field_validator("email")
     @classmethod
     def _valid_email(cls, value: str) -> str:
-        email = value.strip().lower()
+        email = reject_nul(value).strip().lower()
         if not _EMAIL_PATTERN.match(email):
             raise ValueError("must be a valid email address")
         return email
@@ -174,6 +182,11 @@ class ChatFilters(BaseModel):
     date_to: date | None = None
     document_ids: list[uuid.UUID] | None = Field(default=None, max_length=200)
 
+    @field_validator("department", "document_type")
+    @classmethod
+    def _no_nul(cls, value: str | None) -> str | None:
+        return None if value is None else reject_nul(value)
+
     @model_validator(mode="after")
     def _dates_ordered(self) -> ChatFilters:
         if self.date_from and self.date_to and self.date_from > self.date_to:
@@ -195,7 +208,7 @@ class ChatRequest(BaseModel):
     def _not_blank(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("must not be blank")
-        return value
+        return reject_nul(value)
 
 
 # --- Conversations and feedback -------------------------------------------------------
@@ -240,6 +253,11 @@ class RenameRequest(BaseModel):
 
     title: str = Field(min_length=1, max_length=200)
 
+    @field_validator("title")
+    @classmethod
+    def _no_nul(cls, value: str) -> str:
+        return reject_nul(value)
+
 
 class FeedbackRequest(BaseModel):
     """Thumbs up/down, with an optional comment."""
@@ -248,3 +266,8 @@ class FeedbackRequest(BaseModel):
 
     rating: FeedbackRating
     comment: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("comment")
+    @classmethod
+    def _no_nul(cls, value: str | None) -> str | None:
+        return None if value is None else reject_nul(value)

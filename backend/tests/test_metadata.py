@@ -197,3 +197,28 @@ def test_access_level_defaults_to_internal_and_ignores_invalid_values() -> None:
     assert resolve("a.pdf").access_level == "Internal"
     assert resolve("a.pdf", ExplicitMetadata(access_level="bogus")).access_level == "Internal"
     assert resolve("a.pdf", ExplicitMetadata(access_level="public")).access_level == "Public"
+
+
+# --- Values from inside the file, and the plausibility check ------------------------------------------------
+
+
+def test_labels_read_from_the_file_are_clamped_to_the_column_width() -> None:
+    """Front matter is not length-checked by any form; 101 characters would fail the insert."""
+    props = DocumentProperties(department="D" * 300, document_type="T" * 300)
+    result = resolve("notes.md", props=props)
+    assert len(result.department) == len(result.document_type) == metadata.MAX_LABEL_CHARS
+
+
+@pytest.mark.parametrize(
+    ("value", "plausible"),
+    [
+        (date(2026, 10, 7), True),
+        (date(1990, 1, 1), True),
+        (date(1989, 12, 31), False),
+        (date(1985, 6, 1), False),
+        (date(2027, 10, 7), True),  # up to a year ahead is allowed
+        (date(2028, 1, 1), False),
+    ],
+)
+def test_is_plausible_date(value: date, plausible: bool) -> None:
+    assert metadata.is_plausible_date(value, TODAY) is plausible

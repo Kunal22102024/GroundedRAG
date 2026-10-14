@@ -141,7 +141,7 @@ def test_startup_refuses_when_postgres_has_chunks_but_chroma_is_empty(
         REAL_RUN_STARTUP()
 
 
-def test_a_count_difference_with_vectors_present_only_warns(
+def test_chunks_without_a_vector_are_logged_as_an_error_but_do_not_stop_startup(
     db: Session, fake_embeddings: FakeEmbeddings, caplog: pytest.LogCaptureFixture
 ) -> None:
     add_document(db, "indexed", True, fake_embeddings)
@@ -149,7 +149,22 @@ def test_a_count_difference_with_vectors_present_only_warns(
     with caplog.at_level(logging.WARNING):
         report = REAL_RUN_STARTUP()
     assert (report.indexed_chunks, report.vectors) == (3, 2)
-    assert any("differs" in r.getMessage() for r in caplog.records)
+    (record,) = [r for r in caplog.records if "no vector" in r.getMessage()]
+    assert record.levelno == logging.ERROR and "reembed" in record.getMessage()
+    assert record.missing == 1  # type: ignore[attr-defined]
+
+
+def test_vectors_without_a_chunk_are_only_a_warning(
+    vectors: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    from tests.test_index_health import fill
+
+    fill(vectors, 3)  # leftovers: nothing in Postgres points at them
+    with caplog.at_level(logging.WARNING):
+        report = REAL_RUN_STARTUP()
+    assert (report.indexed_chunks, report.vectors) == (0, 3)
+    (record,) = [r for r in caplog.records if "more vectors" in r.getMessage()]
+    assert record.levelno == logging.WARNING
 
 
 def test_startup_refuses_a_collection_built_for_another_embedding_setup(vectors: Any) -> None:

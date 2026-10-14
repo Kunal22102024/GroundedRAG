@@ -7,13 +7,30 @@
 # Chroma live on an `internal` network with no route to the outside world; the
 # backend joins both that network and `edge` (which has outbound access for the
 # Gemini API). ChromaDB has no per-user authorization and must never be exposed.
+#
+# The published port is bound to this machine only (BIND_ADDR=127.0.0.1). The first account
+# to sign up becomes the administrator and there is no TLS, so put the app on a network only
+# after creating your account (and closing signup with SIGNUP_ENABLED=false) and behind HTTPS.
 
 name: groundedrag
 
+# Applied to every service: no privilege escalation inside the container, and bounded logs
+# (without a limit Docker keeps every line the service ever wrote).
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   postgres:
+    <<: *service-defaults
     image: postgres:16
-    restart: unless-stopped
+    mem_limit: ${POSTGRES_MEM_LIMIT:-1g}
     # Run as the unprivileged postgres user from the start (rule 30). The data
     # directory in the image is already owned by it, so the named volume
     # inherits correct ownership.
@@ -33,9 +50,11 @@ services:
     networks: [internal]
 
   chroma:
+    <<: *service-defaults
     build:
       context: ./chroma
-    restart: unless-stopped
+    mem_limit: ${CHROMA_MEM_LIMIT:-2g}
+    cap_drop: [ALL]
     environment:
       ANONYMIZED_TELEMETRY: "FALSE"
     volumes:
@@ -57,9 +76,13 @@ services:
     networks: [internal]
 
   backend:
+    <<: *service-defaults
     build:
       context: ./backend
-    restart: unless-stopped
+    # A parser given a hostile file, or a flood of requests, must not take the host down with it.
+    # Parsing a large PDF is the heaviest thing it does; raise this if such files are expected.
+    mem_limit: ${BACKEND_MEM_LIMIT:-3g}
+    cap_drop: [ALL]
     env_file: .env
     environment:
       # Infrastructure wiring. These override anything in .env.
@@ -88,11 +111,14 @@ services:
     networks: [internal, edge]
 
   frontend:
+    <<: *service-defaults
     build:
       context: ./frontend
-    restart: unless-stopped
+    mem_limit: ${FRONTEND_MEM_LIMIT:-256m}
+    cap_drop: [ALL]
     ports:
-      - "${HTTP_PORT:-8081}:8080"   # host port 8081 -> container port 8080 (nginx)
+      # host port 8081 -> container port 8080 (nginx), on this machine only unless BIND_ADDR is set
+      - "${BIND_ADDR:-127.0.0.1}:${HTTP_PORT:-8081}:8080"
     depends_on:
       backend:
         condition: service_healthy

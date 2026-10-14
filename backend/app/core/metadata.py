@@ -21,6 +21,7 @@ from app.constants import DEPARTMENTS, DOCUMENT_TYPES, AccessLevel
 from app.core.parsers import DocumentProperties
 
 _MIN_YEAR = 1990
+MAX_LABEL_CHARS = 100  # width of the department and document_type columns
 _MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
@@ -101,6 +102,11 @@ def _plausible(candidate: date | None, today: date) -> date | None:
     if candidate is None or candidate.year < _MIN_YEAR or candidate > today + timedelta(days=366):
         return None
     return candidate
+
+
+def is_plausible_date(candidate: date, today: date) -> bool:
+    """True if ``candidate`` can be a creation date (not before 1990, not far in the future)."""
+    return _plausible(candidate, today) is not None
 
 
 def _split_name(filename: str) -> tuple[list[str], str]:
@@ -202,6 +208,10 @@ def resolve(
             canonical_document_type(properties.document_type) or type_from_text(properties.title),
         ),
     )
+
+    # Values read from inside the file are not length-checked by any form; the columns hold 100.
+    department = department[:MAX_LABEL_CHARS]
+    document_type = document_type[:MAX_LABEL_CHARS]
 
     from_file = _plausible(properties.created, today)
     named = dated_name(filename, today)

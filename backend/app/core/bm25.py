@@ -52,6 +52,17 @@ def tokenize(text: str) -> list[str]:
     return [sys.intern(t) for t in tokens if len(t) > 1 or t.isdigit()]
 
 
+def keyword_text(section_title: str, content: str) -> str:
+    """What the keyword channel indexes for a chunk: its heading, then its content.
+
+    The parsers keep a heading such as ``ERR_404_NET`` in ``section_title`` and out of the chunk
+    text, so without it a question about that exact token could not find the chunk. Only this
+    channel sees the heading; embeddings are made from the content alone.
+    """
+    title = section_title.strip()
+    return f"{title}\n{content}" if title else content
+
+
 @dataclass(frozen=True)
 class ChunkMeta:
     """The per-chunk fields the keyword channel needs to filter on."""

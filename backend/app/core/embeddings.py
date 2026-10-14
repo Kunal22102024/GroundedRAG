@@ -24,7 +24,7 @@ import logging
 import random
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -119,18 +119,57 @@ def _start_cooldown(seconds: float) -> None:
         _cooldown_until = max(_cooldown_until, _monotonic() + seconds)
 
 
+class _TextRateLimiter:
+    """At most ``EMBEDDING_TEXTS_PER_MINUTE`` document texts in any 60-second window.
+
+    A large upload would otherwise fire its batches as fast as the workers can, hit the key's
+    per-minute quota, and leave every chat question waiting behind the shared 429 cooldown. This
+    spaces the batches out ahead of time. Questions are not counted here; they bypass it.
+    """
+
+    WINDOW_SECONDS = 60.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: deque[tuple[float, int]] = deque()  # (when, number of texts)
+
+    def acquire(self, count: int) -> None:
+        """Block until ``count`` texts fit in the window, then record them."""
+        limit = get_settings().embedding_texts_per_minute
+        if limit <= 0:
+            return
+        count = min(count, limit)  # a batch larger than the whole budget still gets through
+        while True:
+            with self._lock:
+                now = _monotonic()
+                while self._events and now - self._events[0][0] >= self.WINDOW_SECONDS:
+                    self._events.popleft()
+                if sum(n for _, n in self._events) + count <= limit:
+                    self._events.append((now, count))
+                    return
+                wait = self.WINDOW_SECONDS - (now - self._events[0][0])
+            _sleep(max(wait, 0.05))
+
+    def reset(self) -> None:
+        with self._lock:
+            self._events.clear()
+
+
+_text_limiter = _TextRateLimiter()
+
 _cache_lock = threading.Lock()
 _query_cache: OrderedDict[str, list[float]] = OrderedDict()
 
 
 def clear_caches() -> None:
-    """Forget the client, the query cache and any rate-limit cooldown (used by tests)."""
+    """Forget the client, the query cache and any rate-limit state (used by tests)."""
     global _cooldown_until
     _client.cache_clear()
     with _cache_lock:
         _query_cache.clear()
     with _cooldown_lock:
         _cooldown_until = 0.0
+    _text_limiter.reset()
 
 
 # --- Calls with retries ------------------------------------------------------------------
@@ -233,6 +272,7 @@ def embed_documents(texts: Sequence[str]) -> list[list[float]]:
     dimension = settings.embedding_dim
 
     def run(batch: list[str]) -> list[list[float]]:
+        _text_limiter.acquire(len(batch))
         raw = _with_retries(
             lambda: client.embed_documents(
                 batch,
@@ -315,6 +355,7 @@ def probe() -> str:
                 output_dimensionality=settings.embedding_dim,
             ),
             max_retries=0,
+            max_wait=0,  # never sleep out a cooldown: a readiness check must answer at once
         )
     except EmbeddingRateLimitError:
         return "rate_limited"

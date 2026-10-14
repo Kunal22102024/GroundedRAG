@@ -38,8 +38,9 @@ groundedrag/
 ├── PRD.md                        # product requirements
 ├── TDD.md                        # technical design
 ├── README.md                     # setup, configuration reference, decisions, troubleshooting
-├── docker-compose.yml            # production-like stack (4 services, 2 networks, 3 volumes)
-├── docker-compose.dev.yml        # dev override: mounted source, hot reload
+├── docker-compose.yml            # production-like stack (4 services, 2 networks, 3 volumes); port bound to
+│                                 # BIND_ADDR (127.0.0.1), memory limits, no-new-privileges, log rotation
+├── docker-compose.dev.yml        # dev override: mounted source (backend and eval/), hot reload
 ├── .env.example                  # every environment variable, documented
 ├── .gitignore
 ├── .gitattributes                # forces LF endings so scripts/Dockerfiles work from Windows
@@ -49,7 +50,7 @@ groundedrag/
 │
 ├── backend/
 │   ├── Dockerfile                # python:3.11-slim, non-root, runs docker-entrypoint.sh
-│   ├── docker-entrypoint.sh      # alembic upgrade head, then ONE uvicorn worker
+│   ├── docker-entrypoint.sh      # refuses WEB_CONCURRENCY/UVICORN_WORKERS > 1; alembic upgrade head; ONE uvicorn worker
 │   ├── requirements.txt          # runtime deps (pinned)
 │   ├── requirements-dev.txt      # pytest, httpx2, ruff (installed in the image by default)
 │   ├── pyproject.toml            # pytest + ruff configuration
@@ -68,8 +69,7 @@ groundedrag/
 │   │   │   ├── auth.py
 │   │   │   ├── documents.py
 │   │   │   ├── chat.py
-│   │   │   ├── conversations.py
-│   │   │   ├── feedback.py
+│   │   │   ├── conversations.py      # conversations CRUD and POST /messages/{id}/feedback
 │   │   │   └── health.py
 │   │   │
 │   │   ├── services/             # business workflows; orchestrate core + db
@@ -92,7 +92,7 @@ groundedrag/
 │   │   │   ├── filters.py
 │   │   │   ├── fusion.py
 │   │   │   ├── retrieval.py
-│   │   │   ├── rerank.py
+│   │   │   ├── (rerank.py: planned, does not exist yet; RERANK_ENABLED is rejected while true)
 │   │   │   ├── query_rewrite.py
 │   │   │   ├── prompts.py
 │   │   │   ├── generation.py
@@ -104,56 +104,68 @@ groundedrag/
 │   │       └── models.py         # SQLAlchemy models
 │   │
 │   └── tests/
-│       ├── conftest.py           # forces dummy env (never the real DB); `db`/`database_url` fixtures create a
-│       │                         # throwaway migrated Postgres database; mocked LLM/embeddings
+│       ├── conftest.py           # pins every setting to its default and forces dummy env (never the real DB);
+│       │                         # `db`/`database_url` fixtures create a throwaway migrated Postgres database;
+│       │                         # mocked LLM/embeddings; REQUIRE_STACK=1 turns "no Postgres/Chroma" into a failure
 │       ├── test_config.py       # settings defaults and validation
 │       ├── test_health.py       # /health and /ready
 │       ├── test_middleware.py   # request ID, JSON logging, access-log privacy
-│       ├── test_pinned_versions.py  # chroma image tag == chromadb-client pin (rule 28)
+│       ├── test_pinned_versions.py  # chroma image tag == chromadb-client pin (rule 28; skipped inside the image)
+│       ├── test_entrypoint.py   # more than one worker is refused (rule 4)
 │       ├── test_models.py       # defaults, CHECK constraints, cascades (real Postgres)
 │       ├── test_migrations.py   # upgrade/downgrade, models == migration (incl. CHECKs and FK actions)
 │       ├── test_auth_service.py # hashing, JWT attacks, signup race, timing equalization, log privacy
-│       ├── test_auth_api.py     # signup/login/me, role changes applied to live tokens
+│       ├── test_auth_api.py     # signup/login/me, role changes applied to live tokens, SIGNUP_ENABLED
 │       ├── test_access_control.py  # role -> access-level map (retrieval-time tests join it with filters.py)
 │       ├── pdf_factory.py       # builds PDFs (pages, outlines, columns, scans) for tests; no binary fixtures
-│       ├── test_parsers.py      # pages, headings, columns, chrome removal, every format, failure messages
-│       ├── test_chunking.py     # sentence integrity, overlap rules, page ranges, size ceilings
+│       ├── test_parsers.py      # pages, headings, columns, chrome removal, every format, hostile-input timing
+│       ├── test_chunking.py     # sentence integrity, overlap rules, page ranges, size ceilings, timing
 │       ├── test_metadata.py     # precedence: upload > file name > file properties > upload date
-│       ├── test_embeddings.py   # task types, normalization, batching, retries, error classification
+│       ├── test_embeddings.py   # task types, normalization, batching, retries, per-minute budget, errors
 │       ├── test_vectorstore.py  # real Chroma: cosine, flat metadata, mismatch refusal, filters
+│       ├── test_index_health.py # unreachable/missing vectors, repair, rebuild recovery, write lock
 │       ├── test_bm25.py         # identifier-aware tokenizer, filtering, concurrent updates
-│       ├── test_ingestion.py    # end to end with a fake embedder; failure cleanup; ordering; worker pool
+│       ├── test_ingestion.py    # end to end with a fake embedder; failure cleanup; headings; size cap; worker pool
 │       ├── test_index_service.py  # startup consistency and refusal to start
-│       ├── test_maintenance.py  # reembed
+│       ├── test_maintenance.py  # reembed and verify-index
 │       ├── test_documents_api.py  # upload validation, visibility, file serving, delete
+│       ├── test_conversations_api.py  # ownership of conversations/feedback, saved citations, every route needs auth, no DB connection held
 │       ├── test_filters.py
 │       ├── test_fusion.py
-│       ├── test_guard.py
-│       ├── test_citations.py
-│       └── test_integration.py
+│       ├── test_guard.py        # relevance gate and the lexical override with its floor
+│       ├── test_citations.py    # citation filter, regeneration, finish reasons, blank answers
+│       ├── test_query_rewrite.py  # follow-up rewriting, bounded and treated as untrusted
+│       ├── test_llm.py          # model client construction and error handling
+│       ├── test_chat.py         # chat end to end (the integration test: upload -> index -> ask -> cited answer)
+│       └── test_eval_corpus.py  # eval/questions.jsonl agrees with eval/sample_docs/ (needs eval/ mounted)
 │
 ├── frontend/
-│   ├── Dockerfile                # multi-stage: node build → nginx-unprivileged (Phase 1: nginx only)
-│   ├── nginx.conf                # SPA fallback, /api proxy (re-resolving), SSE buffering off
-│   ├── static/index.html         # Phase 1 stack-status page; removed when the React app lands (Phase 5)
-│   ├── package.json, vite.config.ts, tailwind.config.ts, tsconfig.json
+│   ├── Dockerfile                # multi-stage: node build → nginx-unprivileged
+│   ├── nginx.conf                # SPA fallback and cache headers, /api proxy (re-resolving), SSE buffering off,
+│   │                             # per-route body limits, request-rate limits, sign-in checked before upload bodies
+│   ├── nginx-snippets/           # security-headers.conf (incl. Content-Security-Policy), proxy-common.conf
+│   ├── package.json, vite.config.ts, tsconfig.json   # Tailwind v4 is configured in styles/index.css
 │   └── src/
-│       ├── main.tsx              # entry: query client, router, auth provider
+│       ├── main.tsx              # entry: error boundary, query client, router, auth provider
 │       ├── App.tsx               # routes, protected layout (header, navigation), 404 page
-│       ├── api/client.ts         # fetch wrapper (token, 401 -> logout) and the /chat SSE reader
-│       ├── hooks/useAuth.tsx     # auth context: login, signup, logout
-│       ├── pages/                # LoginPage (login and signup), LibraryPage, ChatPage
+│       ├── api/client.ts         # fetch wrapper (token, 401 -> logout, readable errors) and the /chat SSE reader
+│       ├── hooks/useAuth.tsx     # auth context: login, signup, logout (clears cached data)
+│       ├── pages/                # LoginPage (login and signup, by `mode`), LibraryPage, ChatPage
 │       ├── components/
-│       │   ├── chat/             # Answer (text with citation chips), FilterBar
+│       │   ├── ErrorBoundary.tsx
+│       │   ├── ui/               # icons.tsx (inline SVG, LogoMark), primitives.tsx (Spinner, ProgressBar,
+│       │   │                     # Skeleton, StatusPill, AccessBadge, FileTypeBadge, Modal), Toast.tsx
+│       │   ├── chat/             # Answer (text with citation chips, streaming caret), FilterBar
 │       │   └── source/           # SourceDrawer (cited passage + original PDF at the page)
-│       ├── lib/                  # types.ts, files.ts (download, sizes, page labels)
-│       └── styles/index.css
+│       ├── lib/                  # types.ts, files.ts (download, sizes, page labels), ui.ts (shared classes), format.ts (dates)
+│       └── styles/index.css      # Tailwind v4 theme: animations (keyframes) and reduced-motion handling
+│   public/favicon.svg
 │
 ├── eval/
-│   ├── questions.jsonl           # question, expected_document, expected_page, answerable
-│   ├── sample_docs/              # small generated corpus for the sample questions
-│   ├── run_eval.py               # hit-rate@5, MRR, refusal accuracy, latency (p50/p95)
-│   └── README.md
+│   ├── questions.jsonl           # question, expected_document, expected_page, answerable, kind, requires?
+│   ├── sample_docs/              # five small generated documents (the three SANS PDFs are a documented download)
+│   ├── run_eval.py               # hit-rate@5, MRR, guard on the production retrieval, latency (p50/p95)
+│   └── README.md                 # corpus, how to run it, question kinds, reference result
 │
 └── data/                         # gitignored; runtime data when not using named volumes
 ```
@@ -167,10 +179,10 @@ groundedrag/
 | File | Purpose | Notes |
 | --- | --- | --- |
 | `main.py` | Creates the FastAPI app, registers middleware, mounts routers under `/api`, runs startup tasks | Startup: verify embedding model/dimension vs Chroma collection, ensure Chroma collection exists, load BM25 index from Postgres, mark stuck `processing` documents `failed`/re-queue |
-| `config.py` | `Settings` (Pydantic) read from env | The **only** place that reads environment variables |
+| `config.py` | `Settings` (Pydantic) read from env | The **only** place that reads environment variables. Validators reject inconsistent values (chunk size vs the embedding ceiling, `RETRIEVAL_TOP_K` > candidates, `RERANK_ENABLED=true`); `database_url` is excluded from `repr` |
 | `constants.py` | `REFUSAL_MESSAGE = "Insufficient information available in the selected documents."`, `ACCESS_LEVELS`, role → allowed-levels map, status enums | Import these; never retype the strings |
 | `schemas.py` | Pydantic models for every request and response | API contracts live here |
-| `deps.py` | `get_db`, `get_current_user`, `require_admin` (plus `DbSession`, `CurrentUser`, `AdminUser` aliases) | Auth is applied through dependencies, never ad hoc. `get_current_user` re-reads the user from Postgres on every request, so role changes and deletions apply to tokens already issued. Missing/invalid token is 401 (not HTTPBearer's default 403) |
+| `deps.py` | `get_db`, `get_current_user`, `require_admin` (plus `DbSession`, `CurrentUser`, `AdminUser` aliases) | Auth is applied through dependencies, never ad hoc. `get_current_user` re-reads the user from Postgres on every request, so role changes and deletions apply to tokens already issued, then **detaches the user and ends the read transaction** (otherwise a streamed answer holds one pooled connection for its whole length). Missing/invalid token is 401 (not HTTPBearer's default 403) |
 | `middleware.py` | Request ID, JSON logging, request timing (pure ASGI, so SSE streams are not buffered) | Never logs document text, questions, secrets, or query strings. `configure_logging` must leave `uvicorn.access` without handlers (uvicorn logs access lines, with query strings, whenever that logger has handlers) |
 
 ### 3.2 `api/` — HTTP layer
@@ -179,11 +191,10 @@ Handlers validate input, call one service function, and return a schema. **No bu
 
 | File | Purpose |
 | --- | --- |
-| `auth.py` | Signup, login, current-user. First registered user becomes `admin`. Signup and login both return `{access_token, token_type, expires_in, user}`. Handlers are plain `def` (bcrypt is CPU-bound; FastAPI runs them in a worker thread). 409 on duplicate email; one identical 401 for wrong password and unknown email |
-| `documents.py` | Upload (multi-file), list, detail, delete, serve original file |
+| `auth.py` | Signup, login, current-user. First registered user becomes `admin`. Signup and login both return `{access_token, token_type, expires_in, user}`. Handlers are plain `def` (bcrypt is CPU-bound; FastAPI runs them in a worker thread). 409 on duplicate email; one identical 401 for wrong password and unknown email; 403 when `SIGNUP_ENABLED=false` and an account exists (checked before the email lookup, so a closed door reveals no accounts) |
+| `documents.py` | Upload (multi-file; 413 above `MAX_FILES_PER_REQUEST`, 422 for a bad or implausible field), list, detail, delete, serve original file |
 | `chat.py` | `POST /chat` — streams Server-Sent Events |
-| `conversations.py` | List, read, rename, delete conversations |
-| `feedback.py` | Thumbs up/down on an assistant message |
+| `conversations.py` | List, read (citations the reader can no longer see come back `unavailable`), rename, delete conversations; thumbs up/down on an assistant message (`POST /messages/{id}/feedback`) |
 | `health.py` | `/health` (liveness, touches nothing) and `/ready` (Postgres, Chroma, and a cached embedding probe). Delegates to `health_service` |
 
 ### 3.3 `services/` — workflows
@@ -191,31 +202,32 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | File | Purpose |
 | --- | --- |
 | `health_service.py` | Readiness probes run concurrently in worker threads with a timeout; failure details are exception class names only. The embedding probe is a real API call, so a good result is cached 5 minutes and a failure 30 seconds (a free-tier key allows ~100 requests/minute) |
-| `index_service.py` | `run_startup`: open the Chroma collection (refuse a model/dimension/distance mismatch), fail interrupted `processing` documents and requeue `queued` ones, **refuse to start when Postgres has indexed chunks but Chroma is empty** (changed `EMBEDDING_DIM`, lost volume: serving an empty index would silently return nothing), rebuild BM25 from Postgres, start workers |
-| `auth_service.py` | bcrypt hashing (work factor `BCRYPT_ROUNDS`), HS256 JWT issue/verify (algorithm pinned, claims `sub`/`iat`/`exp` only), `register_user`, `authenticate`. Signup takes a Postgres advisory lock so concurrent first signups cannot create two admins; unknown-email logins still run a bcrypt check so timing does not reveal which emails exist. Typed errors (`EmailAlreadyRegistered`, `InvalidCredentials`, `InvalidToken`) are translated to HTTP in `api/` and `deps.py` |
-| `document_service.py` | Validate uploads (extension, declared type, magic bytes, size; per-file accept/reject), store under `<uuid><ext>`, create `queued` rows, enqueue ingestion. Role-aware listing (a document above your level is a 404, never a 403). Delete: park as `failed` first (immediately unsearchable), then BM25 → Chroma → rows → file; a busy document answers 409; a failed step leaves it retryable |
-| `ingestion.py` | Background job (one worker by default): parse → chunk → resolve metadata → **chunk rows to Postgres first** → embed → upsert to Chroma → BM25 → `indexed`. Any failure removes partial data from all three stores and sets a user-safe message. Per-document lock shared with delete. Logs ids, counts and timings only |
+| `index_service.py` | `run_startup`: first finish or discard an interrupted collection rebuild (`vectorstore.recover_interrupted_rebuild`), then open the Chroma collection (refuse a model/dimension/distance mismatch), fail interrupted `processing` documents and requeue `queued` ones, **refuse to start when Postgres has indexed chunks but Chroma is empty** (changed `EMBEDDING_DIM`, lost volume: serving an empty index would silently return nothing), rebuild BM25 from Postgres, start workers |
+| `auth_service.py` | bcrypt hashing (work factor `BCRYPT_ROUNDS`), HS256 JWT issue/verify (algorithm pinned, claims `sub`/`iat`/`exp` only), `register_user`, `authenticate`. Signup takes a Postgres advisory lock so concurrent first signups cannot create two admins; unknown-email logins still run a bcrypt check so timing does not reveal which emails exist, and both release the database connection before hashing. Typed errors (`EmailAlreadyRegistered`, `SignupDisabled`, `InvalidCredentials`, `InvalidToken`) are translated to HTTP in `api/` and `deps.py` |
+| `document_service.py` | Validate uploads (extension, declared type, magic bytes, size, creation-date plausibility; per-file accept/reject), store under `<uuid><ext>`, create `queued` rows, enqueue ingestion; a failure after some files were stored removes them. Role-aware listing (a document above your level is a 404, never a 403). Delete: park as `failed` first (immediately unsearchable), then BM25 → Chroma → blank the passages copied into saved messages (`messages.citations`) → rows → file; a busy document answers 409; a failed step leaves it retryable |
+| `ingestion.py` | Background job (one worker by default): parse → size check (`MAX_DOCUMENT_CHARS`) → chunk → resolve metadata → **chunk rows to Postgres first** → embed → upsert to Chroma → BM25 (heading + content) → `indexed`. Any failure removes partial data from all three stores and sets a user-safe message. Per-document lock shared with delete. Logs ids, counts, timings and, for unexpected errors, where it failed (never the exception message: it can quote document text) |
 | `chat_service.py` | Full chat turn: rewrite → filter → retrieve → guard → generate → verify citations → persist → stream events |
+| `conversation_service.py` | Conversations scoped to their owner; `readable_citations` marks citations whose document is gone or above the reader's level `unavailable` (no passage, no name); ratings are one atomic upsert |
 
 ### 3.4 `core/` — RAG building blocks (no web framework imports)
 
 | File | Purpose | Key rules |
 | --- | --- | --- |
-| `parsers.py` | PDF (page-aware, pdfplumber), DOCX, MD, HTML, TXT → list of `(page, section, text)` | PDF: physical page numbers; sections from the outline (titles may wrap over lines) or font size/boldness; two-column pages read column by column (tables are not split); running headers/footers/banners and bare page labels removed, never more than 30% of the text; hyphenation repaired. Scanned/blank PDFs raise `ScannedPdfError` ("scanned PDF, OCR not supported"). Error messages are user-safe and never contain text |
-| `chunking.py` | `Chunker` interface + structure-aware implementation (~800 chars, ~100 overlap) | Packs by sentence; never crosses a section; overlap is whole trailing sentences, same page and section only; a chunk is at most target + 1.5×overlap (enforced against `CHUNK_HARD_MAX_CHARS` = 1500, far under the 2,048-token embedding limit); records `page_number`..`page_end`; semantic chunker is a future implementation of the same interface |
-| `metadata.py` | Resolve department, type, creation date, access level | Order: explicit upload values → folder/filename → file properties → upload date; produces `creation_date_int`. A month- or year-only file name ("April2025") is refined to the exact day by a *consistent* file date. Implausible dates (before 1990, far future) are ignored |
+| `parsers.py` | PDF (page-aware, pdfplumber), DOCX, MD, HTML, TXT → list of `(page, section, text)` | PDF: physical page numbers; sections from the outline (titles may wrap over lines) or font size/boldness; two-column pages read column by column (tables are not split); running headers/footers/banners and bare page labels removed, never more than 30% of the text; hyphenation repaired. Scanned/blank PDFs raise `ScannedPdfError` ("scanned PDF, OCR not supported"). Error messages are user-safe and never contain text. **Every text parser must run in time linear in the input** (no unbounded regex quantifiers rescanning from each opener, no string growth per line: hostile files stalled the whole server before); `tests/test_parsers.py` asserts wall-time ceilings. DOCX reads text inside content controls (`w:sdt`) |
+| `chunking.py` | `Chunker` interface + structure-aware implementation (~800 chars, ~100 overlap) | Packs by sentence; never crosses a section; overlap is whole trailing sentences, same page and section only; a chunk is at most target + 1.5×overlap + 1 separator (enforced against `CHUNK_HARD_MAX_CHARS` = 1500, far under the 2,048-token embedding limit); records `page_number`..`page_end`; sentence splitting and long-text cutting are linear; semantic chunker is a future implementation of the same interface |
+| `metadata.py` | Resolve department, type, creation date, access level | Order: explicit upload values → folder/filename → file properties → upload date; produces `creation_date_int`. A month- or year-only file name ("April2025") is refined to the exact day by a *consistent* file date. Implausible dates (before 1990, far future) are ignored when read from a file name or file, and refused (422) when passed at upload; labels read from inside a file are clamped to the 100-character columns |
 | `llm.py` | Builds the `ChatGoogleGenerativeAI` instance from settings | The **only** place that constructs the LLM client |
-| `embeddings.py` | Wraps `GoogleGenerativeAIEmbeddings`: document vs query task types, batching, retries/backoff, L2 normalization, query LRU cache | The **only** place that calls the embedding API. Walks the exception chain (LangChain wraps the SDK error) to classify 429/quota/auth/input/transient; honours the server's "retry in N s" hint with a cooldown shared by all threads; never retries a bad key or a daily quota. Rejects inputs over 2,000 characters instead of letting the API truncate them |
-| `vectorstore.py` | Chroma client: create/get collection (cosine), upsert, dense query, delete by `document_id` | The **only** place that imports `chromadb`; passes embeddings explicitly. Create collections with `configuration={"hnsw": {"space": "cosine"}}` and `embedding_function=None` (the client's default is Chroma's built-in embedder; verified against 1.5.9). **Never trust a Chroma write**: Chroma can store a vector its index never returns (seen live: 15 of 155 after delete and re-upload). `ensure_reachable(ids)` queries each new vector with its own embedding and repairs misses (re-insert, then `rebuild_collection`); `find_unreachable`/`repair_unreachable` back startup verification and `python -m app.maintenance verify-index`. Call `ensure_reachable` after any code path that writes vectors |
-| `bm25.py` | In-memory BM25 index (`bm25s`), identifier-aware tokenizer, add/remove/rebuild, filtered top-N | Rebuilt from Postgres at startup; filter parity with Chroma via a predicate over the same metadata fields; immutable snapshots swapped atomically so searches never block on ingestion |
+| `embeddings.py` | Wraps `GoogleGenerativeAIEmbeddings`: document vs query task types, batching, retries/backoff, L2 normalization, query LRU cache | The **only** place that calls the embedding API. Walks the exception chain (LangChain wraps the SDK error) to classify 429/quota/auth/input/transient; honours the server's "retry in N s" hint with a cooldown shared by all threads; never retries a bad key or a daily quota. Rejects inputs over 2,000 characters instead of letting the API truncate them. Document batches are spaced to `EMBEDDING_TEXTS_PER_MINUTE` (questions are never held back); `probe()` never sleeps through a cooldown |
+| `vectorstore.py` | Chroma client: create/get collection (cosine), upsert, dense query, delete by `document_id` | The **only** place that imports `chromadb`; passes embeddings explicitly. Create collections with `configuration={"hnsw": {"space": "cosine"}}` and `embedding_function=None` (the client's default is Chroma's built-in embedder; verified against 1.5.9). **Never trust a Chroma write**: Chroma can store a vector its index never returns (seen live: 15 of 155 after delete and re-upload). `ensure_reachable(ids)` queries each new vector with its own embedding and repairs misses (re-insert, then `rebuild_collection`); `find_unreachable`/`repair_unreachable` back startup verification and `python -m app.maintenance verify-index`; an id that was never stored counts as unreachable. Call `ensure_reachable` after any code path that writes vectors (ingestion **and** `reembed`). All writers (upsert, delete, repair, rebuild) hold `_write_lock`; the HTTP session has timeouts (chromadb's default is none); `recover_interrupted_rebuild` runs before the collection is first opened |
+| `bm25.py` | In-memory BM25 index (`bm25s`), identifier-aware tokenizer, add/remove/rebuild, filtered top-N | Rebuilt from Postgres at startup; filter parity with Chroma via a predicate over the same metadata fields; immutable snapshots swapped atomically so searches never block on ingestion. Indexes `keyword_text(section_title, content)`: the heading is searchable by keyword but is not embedded |
 | `filters.py` | `build_filter(user, request_filters)` returning one neutral filter object plus Chroma `where` and SQL translations | **The only place filters are built**; always injects the access-level constraint |
 | `fusion.py` | `rrf(rankings, k)` | Pure function; RRF scores are for ordering only |
 | `retrieval.py` | Orchestrates embed query → dense + BM25 (parallel) → fusion → optional rerank; returns candidates with dense similarity and timings | |
-| `rerank.py` | Optional FlashRank cross-encoder (**not implemented yet**) | Behind `RERANK_ENABLED`, which must stay `false` |
-| `query_rewrite.py` | Turns a follow-up into a standalone question using prior turns | Skipped on the first turn; thinking disabled, small token limit |
+| `rerank.py` | Optional FlashRank cross-encoder (**does not exist yet**) | Behind `RERANK_ENABLED`, which must stay `false` (a `true` value fails settings validation) |
+| `query_rewrite.py` | Turns a follow-up into a standalone question using prior turns | Skipped on the first turn; thinking disabled, small token limit. The conversation is untrusted data (earlier answers quote documents); a rewrite far longer than the follow-up falls back to the original question |
 | `prompts.py` | System prompt and context-block formatting | Treats context as untrusted data; numbered sources `[1]`, `[2]` |
-| `generation.py` | Calls the LLM (streaming), assembles the answer, maps citations to chunks, verifies them, retries once | Handles `MAX_TOKENS`, safety blocks, empty candidates |
-| `guard.py` | Relevance gate (cosine or reranker score, plus lexical override) and citation verification helpers | Never thresholds on the RRF score |
+| `generation.py` | Calls the LLM (streaming), assembles the answer, maps citations to chunks, verifies them, retries once | Handles `MAX_TOKENS`, safety blocks, empty candidates; an answer with nothing left to show (only removed markers) is an `empty` error, never a saved blank message |
+| `guard.py` | Relevance gate (cosine or reranker score, plus lexical override) and citation verification helpers | Never thresholds on the RRF score. The lexical override applies only down to `RELEVANCE_THRESHOLD - LEXICAL_OVERRIDE_MARGIN` and only to a passage the model is given. `CitationFilter` treats `[n]`, `[n, m]` and a dash range between two real sources as citations; other brackets and anything inside code are left alone; a removed marker takes its preceding space and nothing else changes |
 
 ### 3.5 `db/`
 
@@ -250,7 +262,7 @@ Handlers validate input, call one service function, and return a schema. **No bu
 
 ### 4.3 Delete flow
 
-`DELETE /api/documents/{id}` → permission check (admin or owner) → delete Chroma vectors by `document_id` → delete Postgres rows → delete the file → refresh BM25. If a step fails, the document stays in a retryable state; it must never be left half-searchable.
+`DELETE /api/documents/{id}` → permission check (admin or owner) → park the document as `failed` (immediately unsearchable) → remove it from BM25 → delete Chroma vectors by `document_id` → blank its passages in saved `messages.citations` → delete Postgres rows (chunks cascade) → delete the file. If a step fails, the document stays parked and the delete can be repeated; it must never be left half-searchable. (`documents.py`: 404 for a document above the caller's level, 403 only after it is visible, 409 while it is being indexed.)
 
 ---
 
@@ -273,7 +285,7 @@ All routes live under `/api`. "Auth" means a valid JWT bearer token.
 | `GET /conversations/{id}` | user (owner) | `api/conversations.py` | Messages |
 | `PATCH /conversations/{id}` | user (owner) | `api/conversations.py` | Rename |
 | `DELETE /conversations/{id}` | user (owner) | `api/conversations.py` | Delete |
-| `POST /messages/{id}/feedback` | user (owner) | `api/feedback.py` | Thumbs up/down |
+| `POST /messages/{id}/feedback` | user (owner) | `api/conversations.py` | Thumbs up/down |
 | `GET /health` | none | `api/health.py` | Liveness |
 | `GET /ready` | none | `api/health.py` | Readiness |
 
@@ -283,30 +295,31 @@ All routes live under `/api`. "Auth" means a valid JWT bearer token.
 
 | Path | Page | Access |
 | --- | --- | --- |
-| `/login`, `/signup` | `LoginPage`, `SignupPage` | public |
+| `/login`, `/signup` | `LoginPage` (`mode="login"` / `"signup"`) | public |
 | `/` | redirect to `/chat` | protected |
 | `/chat`, `/chat/:conversationId` | `ChatPage` | protected |
 | `/library` | `LibraryPage` | protected |
 | `*` | `NotFoundPage` | public |
 
-nginx serves the SPA (with fallback to `index.html`), proxies `/api` to `backend:8000`, and disables buffering for `POST /api/chat`.
+nginx serves the SPA (with fallback to `index.html`, which is never cached; hashed `/assets/` are cached for a year and a missing one is a 404), proxies `/api` to `backend:8000`, disables buffering for `POST /api/chat`, limits request bodies per route and request rates for sign-in, chat and uploads, and checks the sign-in (`auth_request`) before it accepts an upload body.
 
 ---
 
 ## 6. Frontend File Purposes
 
-The table lists the intended components; the implementation consolidated them into the files shown in the repository tree (section 2).
+What exists (the implementation is consolidated; there are no separate `sse.ts`, `auth.ts`, `documents.ts`, `chat.ts`, `useDocuments`, `useChatStream`, `CitationChip` or `RefusalNotice` files):
 
 | Area | Files | Purpose |
 | --- | --- | --- |
-| `api/` | `client.ts` | `fetch` wrapper: base URL, JWT header, 401 → logout |
-| | `sse.ts` | Parses the `/chat` event stream (`status`, `token`, `citations`, `done`, `error`) |
-| | `auth.ts`, `documents.ts`, `chat.ts` | Typed endpoint functions |
-| `hooks/` | `useAuth`, `useDocuments` (polls while any document is `queued`/`processing`), `useConversations`, `useChatStream` | State and data fetching via TanStack Query |
-| `pages/` | `LibraryPage` | Upload dropzone, document table, status badges, delete confirmation |
-| | `ChatPage` | Conversation sidebar, message list, filter bar, input, source drawer |
-| `components/source/` | `SourceDrawer` | Opens on citation click: highlighted chunk, document name, page, section, embedded original (`#page=N` for PDFs; other types show chunk + download link) |
-| `components/chat/` | `CitationChip`, `RefusalNotice`, `FeedbackButtons` | Clickable citations, "not found in documents" state, thumbs up/down |
+| `api/` | `client.ts` | `fetch` wrapper (base URL, JWT header, 401 → logout, errors turned into readable sentences by `describeDetail`), `streamChat`, the `/chat` event-stream reader (it resolves only after a `done` or `error` event and reports a stream that ends without one), and `uploadDocuments`, which uses `XMLHttpRequest` because `fetch` cannot report upload progress |
+| `pages/LibraryPage` upload flow | `useUploads` | Per-file progress while bytes are sent (one request; the bytes are spread over the files by size), then each accepted document is polled (`GET /documents/{id}`) through queued → indexing → ready or failed; refused files show the server's reason; the upload can be cancelled; toasts announce results |
+| `hooks/` | `useAuth.tsx` | Auth context: login, signup, logout. Logging out clears the TanStack cache; only a 401 drops the session (a network error shows "cannot reach the server" instead) |
+| `pages/` | `LoginPage` | Sign in and sign up (by `mode`) |
+| | `LibraryPage` | Upload dropzone (keyboard-operable), document table (polls while any document is `queued`/`processing`), status badges, delete confirmation dialog |
+| | `ChatPage` | Conversation sidebar, message list, filter bar, input, source drawer, the thumbs up/down and refusal notice. A per-question id makes a stream that is no longer current inert (switching conversations, Stop), and the input stays busy until the stored conversation is reloaded |
+| `components/` | `ErrorBoundary` | A render error shows a way out instead of a blank page |
+| `components/chat/` | `Answer`, `FilterBar` | Text with clickable citation chips (also inside bold text; unavailable sources are shown as such), lists; pre-retrieval filters |
+| `components/source/` | `SourceDrawer` | Opens on citation click: highlighted chunk, document name, page, section, embedded original (`#page=N` for PDFs; other types show chunk + download link); Escape closes it |
 
 ---
 
@@ -317,7 +330,7 @@ The table lists the intended components; the implementation consolidated them in
 1. **Layering:** `api → services → core / db`. `core/` never imports FastAPI. `api/` never calls Chroma, BM25, or the LLM directly.
 2. **Single points of contact:** only `vectorstore.py` imports `chromadb`; only `embeddings.py` calls the embedding API; only `llm.py` builds the LLM client; only `config.py` reads environment variables; only `filters.py` builds filters.
 3. **PostgreSQL is the source of truth.** Chroma and BM25 are derived and rebuildable. Write chunks to Postgres before Chroma.
-4. **Single backend worker** (the BM25 index is in-process). Do not add `--workers`.
+4. **Single backend worker** (the BM25 index is in-process). Do not add `--workers`. `docker-entrypoint.sh` pins `--workers 1` and refuses to start when `WEB_CONCURRENCY`/`UVICORN_WORKERS` ask for more (`tests/test_entrypoint.py`).
 5. **Model IDs and thresholds come from config.** Never hardcode `gemini-*` names, dimensions, or the relevance threshold in code.
 
 ### 7.2 Retrieval and grounding
@@ -349,14 +362,16 @@ The table lists the intended components; the implementation consolidated them in
 21. Never log document text, user questions, tokens, or API keys.
 22. Secrets only through `.env` (ignored by git). Commit `.env.example` only.
 23. Uploaded files are stored under generated names; validate extension, content type, and size; never use user-supplied paths.
-24. Deleting a document must remove vectors, rows, and file; its content must never appear in later answers.
-25. Passwords: bcrypt, at most 72 bytes (rejected at signup, never silently truncated). Tokens: short-lived HS256 JWT carrying only the user id. Only nginx publishes a port; Postgres and Chroma stay internal. Compose enforces this with an `internal: true` network (Postgres, Chroma, backend) and an `edge` network (nginx, backend; gives the backend outbound access to Gemini). Postgres and Chroma have no route to the internet and nginx cannot resolve them.
+24. Deleting a document must remove vectors, rows, and file; its content must never appear in later answers. That includes the passages copied into saved conversations (blanked on delete) and, for a reader who may no longer see a document, in reopened conversations (`unavailable`). The answer text of an old message is kept as a record.
+25. Passwords: bcrypt, at most 72 bytes (rejected at signup, never silently truncated). Tokens: short-lived HS256 JWT carrying only the user id. Only nginx publishes a port; Postgres and Chroma stay internal. Compose enforces this with an `internal: true` network (Postgres, Chroma, backend) and an `edge` network (nginx, backend; gives the backend outbound access to Gemini). Postgres and Chroma have no route to the internet and nginx cannot resolve them. The port is published on `BIND_ADDR` (default `127.0.0.1`).
+25a. **Hold no database connection across slow work.** A request must not keep a session open while it streams an answer, hashes a password or waits for the embedding API; end the transaction first (`deps.get_current_user`, `auth_service.authenticate`). `tests/test_conversations_api.py` checks Postgres for `idle in transaction` mid-stream.
+25b. **Text parsing is linear in the input** (see `core/parsers.py` in section 3.4) and a document is bounded by `MAX_DOCUMENT_CHARS`.
 
 ### 7.6 Docker
 
 26. Four services: `frontend` (nginx), `backend`, `chroma`, `postgres`. Named volumes `pg_data`, `chroma_data`, `uploads`.
 27. Healthchecks plus `depends_on: condition: service_healthy`; the backend runs `alembic upgrade head` on start.
-28. Pin the ChromaDB image and client library versions together (`chroma/Dockerfile` tag == `chromadb-client` in `requirements.txt`). This cannot be checked at runtime (the server's `/api/v2/version` returns a fixed `"1.0.0"`), so `tests/test_pinned_versions.py` enforces it; bump both in one change.
+28. Pin the ChromaDB image and client library versions together (`chroma/Dockerfile` tag == `chromadb-client` in `requirements.txt`). This cannot be checked at runtime (the server's `/api/v2/version` returns a fixed `"1.0.0"`), so `tests/test_pinned_versions.py` enforces it; bump both in one change. **That test is skipped inside the backend image** (it has no `chroma/` directory): run it with the directory mounted (README, Development) before any change to either pin.
 29. No embedding model is baked into the image; only the optional FlashRank model may be.
 30. Containers run as non-root: backend uid 10001, chroma uid 10001 (via `chroma/Dockerfile`, which pre-creates `/data` so the named volume inherits ownership), nginx via `nginx-unprivileged` (host port 8081, container port 8080), postgres via `user: postgres`.
 
@@ -375,12 +390,13 @@ The table lists the intended components; the implementation consolidated them in
 
 ## 9. Testing & Evaluation Rules
 
-* **Database tests** run against a throwaway database (`groundedrag_test_<random>`) that the fixtures create on the stack's Postgres, migrate with the real Alembic migrations, and drop afterwards; they skip when no server is reachable and refuse to truncate any other database. New concurrency-sensitive code needs a test that **fails when the protection is removed** (see the signup-lock test, which widens the race window on purpose); mutate a copy of the code to check.
+* **Database tests** run against a throwaway database (`groundedrag_test_<random>`) that the fixtures create on the stack's Postgres, migrate with the real Alembic migrations, and drop afterwards; they skip when no server is reachable (unless `REQUIRE_STACK=1`, which turns that into a failure: use it wherever a green run has to mean something) and refuse to truncate any other database. `conftest.py` drops every setting from the environment except the infrastructure wiring, so a `.env` override cannot change a test's outcome. New concurrency-sensitive code needs a test that **fails when the protection is removed** (see the signup-lock test, which widens the race window on purpose); mutate a copy of the code to check.
 * **Index-health tests simulate the symptom** (a wrapped `query` that never returns chosen vectors) because real Chroma cannot be made to lose vectors on demand; detection, re-insertion and rebuilding run for real. Scripts that drop or rebuild collections must force a scratch `CHROMA_COLLECTION` name first: run against `.env` they would hit the real collection.
 * **Real services in tests:** vector store, ingestion, startup and API tests run against the stack's real Chroma (a unique `test_<id>` collection per run) and a throwaway Postgres database, with a deterministic bag-of-words fake embedder (`FakeEmbeddings` in `conftest.py`). Startup is neutralized by an autouse fixture; call `REAL_RUN_STARTUP` to test it.
 * **Unit tests:** parsers, chunking (page numbers preserved, no mid-sentence cuts, overlap, token ceiling), filter building, RRF, guard (including lexical override), citation verification, access-level filtering.
-* **Integration test:** upload a small sample document → wait for `indexed` → query → assert a valid citation. Mock the LLM and embeddings in tests (no network calls, no API key needed).
-* **Evaluation (`eval/run_eval.py`):** hit-rate@5 and MRR for dense-only, keyword-only, hybrid, hybrid + rerank; refusal accuracy on unanswerable questions; per-stage latency p50/p95. Include exact-token questions and about 10 unanswerable ones.
+* **Integration test:** `tests/test_chat.py` uploads a small sample document → waits for `indexed` → queries → asserts a valid citation. Mock the LLM and embeddings in tests (no network calls, no API key needed).
+* **Coverage that must not erode:** every route except the public ones refuses a missing or bad token (`test_conversations_api.py` reads the route list from the OpenAPI schema, so a new route is covered automatically); conversations and feedback are scoped to their owner; text parsers have wall-time ceilings on hostile input.
+* **Evaluation (`eval/run_eval.py`):** hit-rate@5 and MRR for dense-only, keyword-only and hybrid (hybrid + rerank once reranking exists); the guard decided by the production `retrieval.retrieve` + `guard.evaluate`; per-stage latency p50/p95. The set includes exact-token questions and 12 unanswerable ones (`eval/README.md`); `test_eval_corpus.py` keeps questions and corpus in step. The exit status fails on off-topic leakage, a wrongly stopped answerable question, or a low hybrid hit-rate.
 * A change is not done until `pytest` passes and, if it touches retrieval, embeddings, the guard, or prompts, the eval script has been run and compared with the previous result.
 
 ---
@@ -423,15 +439,16 @@ The table lists the intended components; the implementation consolidated them in
 cp .env.example .env              # set GOOGLE_API_KEY, JWT_SECRET, DB password
 docker compose up --build         # app at http://localhost:8081
 
-# development with hot reload
+# development with hot reload (the override also mounts eval/, which the plain stack does not contain)
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up
 
 # tests, lint and evaluation
-docker compose exec backend pytest
+docker compose exec backend pytest                    # REQUIRE_STACK=1 makes a missing Postgres/Chroma a failure
 docker compose exec backend ruff check . && docker compose exec backend ruff format --check .
-docker compose exec backend python -m eval.run_eval
+docker compose -f docker-compose.yml -f docker-compose.dev.yml exec backend python -m eval.run_eval
 
 # host port 8081 already in use? Set HTTP_PORT in .env (e.g. HTTP_PORT=8082)
+# reachable from other machines? Set BIND_ADDR=0.0.0.0 (read README, "Accounts and roles", first)
 
 # migrations
 docker compose exec backend alembic revision --autogenerate -m "describe change"
@@ -446,7 +463,7 @@ docker compose exec backend alembic upgrade head
 2. Register, log in, upload a multi-page PDF and a DOCX; statuses go queued → processing → indexed.
 3. Ask a question: streamed answer with working citation chips; clicking one opens the drawer with the exact chunk and the original PDF at the cited page.
 4. An exact-token query (error code or ID present in a document) is found even when phrased awkwardly, and is not wrongly refused.
-5. An unrelated question returns the refusal sentence **without calling the LLM**.
+5. An unrelated question returns the refusal sentence **without calling the LLM** (the follow-up rewrite, which runs before the guard on a conversation's later turns, is the one LLM call that can precede it).
 6. A department filter returns zero chunks from other departments; a `user` cannot retrieve `Restricted` documents.
 7. Deleting a document removes it from the library and its content never appears in answers again.
 8. After `docker compose down` and `up`, documents, users, and conversations persist.
@@ -462,4 +479,10 @@ docker compose exec backend alembic upgrade head
 * `gemini-2.5-flash` is closed to new API keys (404 "no longer available to new users"), so the default is `gemini-3.8-flash`; keep the model ID in configuration and re-run the eval before migrating.
 * Free-tier Gemini keys have per-minute and per-day limits (embeddings and chat). Chat retries a rate limit briefly, then shows a friendly error.
 * Reranking (`core/rerank.py`) is not implemented; `RERANK_ENABLED` must stay `false`.
+* The first account to sign up is the administrator and signup is open until `SIGNUP_ENABLED=false`; there is no TLS, no account lockout and no per-user quotas. nginx rate limits are per client address, which behind Docker Desktop can be one address for everybody.
+* The sign-in token is kept in `localStorage`; the Content-Security-Policy in `frontend/nginx-snippets/security-headers.conf` is the mitigation. It allows `blob:` for the PDF drawer and has not been exercised in every browser's PDF viewer.
+* Headings are searchable by keyword but are not part of the embedded text, so a purely semantic question about a heading's wording can miss (changing that means re-embedding and recalibrating the threshold).
+* The text of an old assistant message is kept when the document it cited is deleted (the passages and citation chips are not).
+* The conversation sidebar is hidden below the `md` breakpoint; there is no conversation list on a phone-sized screen.
+* The UI has no automated tests (no JS test framework is installed); its logic was checked by build-time type checking and by running the SSE reader and answer renderer under Node.
 * ChromaDB has no per-user authorization; it must stay on the internal Docker network.

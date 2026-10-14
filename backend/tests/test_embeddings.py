@@ -489,3 +489,69 @@ def wrapped_from(inner: BaseException) -> Exception:
 )
 def test_classification_table(exc: BaseException, kind: str) -> None:
     assert classify(exc).kind == kind
+
+
+def reset_limits() -> None:
+    """Forget the document budget and any cooldown (``clear_caches`` needs the real client)."""
+    embeddings._text_limiter.reset()
+    with embeddings._cooldown_lock:
+        embeddings._cooldown_until = 0.0
+
+
+# --- Spreading a large upload out, and answering the readiness probe at once -------------------------------
+
+
+def test_document_batches_are_spaced_to_the_per_minute_budget(
+    client: FakeClient, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "embedding_batch_size", 10)
+    monkeypatch.setattr(settings, "embedding_max_concurrency", 1)
+    monkeypatch.setattr(settings, "embedding_texts_per_minute", 20)
+    reset_limits()
+
+    embeddings.embed_documents([f"text {n}" for n in range(60)])  # six batches of ten
+
+    # Two batches fit in a minute, so batches 3-4 and 5-6 each wait for a window to pass.
+    assert clock.now - 1000.0 == pytest.approx(120.0, abs=1.0)
+    assert len(client.calls) == 6 and all(wait > 0 for wait in clock.sleeps)
+
+
+def test_questions_are_never_held_back_by_the_document_budget(
+    client: FakeClient, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(get_settings(), "embedding_texts_per_minute", 1)
+    reset_limits()
+    for n in range(6):
+        embeddings.embed_query(f"question number {n}", interactive=True)
+    assert clock.sleeps == [] and len(client.calls) == 6
+
+
+def test_a_budget_of_zero_turns_the_limiter_off(
+    client: FakeClient, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(get_settings(), "embedding_batch_size", 5)
+    monkeypatch.setattr(get_settings(), "embedding_texts_per_minute", 0)
+    embeddings.embed_documents([f"text {n}" for n in range(200)])
+    assert clock.sleeps == []
+
+
+def test_a_batch_larger_than_the_whole_budget_still_goes_through(
+    client: FakeClient, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(get_settings(), "embedding_batch_size", 10)
+    monkeypatch.setattr(get_settings(), "embedding_max_concurrency", 1)
+    monkeypatch.setattr(get_settings(), "embedding_texts_per_minute", 5)
+    reset_limits()
+    vectors = embeddings.embed_documents([f"text {n}" for n in range(20)])  # two batches of ten
+    assert len(vectors) == 20
+    assert clock.now - 1000.0 == pytest.approx(60.0, abs=1.0)  # the second waits one window
+
+
+def test_the_readiness_probe_never_sleeps_through_a_cooldown(
+    client: FakeClient, clock: Clock
+) -> None:
+    reset_limits()
+    embeddings._start_cooldown(150.0)  # what a 429 with a long retry hint leaves behind
+    assert embeddings.probe() == "rate_limited"
+    assert clock.sleeps == [] and client.calls == []  # answered at once, without a request

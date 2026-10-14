@@ -61,28 +61,50 @@ def reembed() -> tuple[int, int]:
         if not batch:
             return
         vectors = embeddings.embed_documents([chunk.content for chunk, _, _ in batch])
-        vectorstore.upsert(
-            ids=[chunk.id for chunk, _, _ in batch],
-            embeddings=vectors,
-            documents=[chunk.content for chunk, _, _ in batch],
-            metadatas=[
-                vectorstore.chunk_metadata(
-                    document_id=str(chunk.document_id),
-                    document_name=name,
-                    department=chunk.department,
-                    document_type=chunk.document_type,
-                    creation_date=created,  # type: ignore[arg-type]
-                    creation_date_int=chunk.creation_date_int,
-                    access_level=chunk.access_level,
-                    page_number=chunk.page_number,
-                    page_end=chunk.page_end,
-                    section_title=chunk.section_title,
+        # Embedding takes a while, and the chunk rows above come from a cursor opened earlier: a
+        # document deleted in the meantime must not get its vectors written back.
+        with get_sessionmaker()() as check:
+            alive = set(
+                check.scalars(
+                    select(Chunk.id)
+                    .join(Document, Document.id == Chunk.document_id)
+                    .where(
+                        Chunk.id.in_([chunk.id for chunk, _, _ in batch]),
+                        Document.status == DocumentStatus.INDEXED.value,
+                    )
                 )
-                for chunk, name, created in batch
-            ],
+            )
+        kept = [
+            (row, vector) for row, vector in zip(batch, vectors, strict=True) if row[0].id in alive
+        ]
+        if kept:
+            vectorstore.upsert(
+                ids=[chunk.id for (chunk, _, _), _ in kept],
+                embeddings=[vector for _, vector in kept],
+                documents=[chunk.content for (chunk, _, _), _ in kept],
+                metadatas=[
+                    vectorstore.chunk_metadata(
+                        document_id=str(chunk.document_id),
+                        document_name=name,
+                        department=chunk.department,
+                        document_type=chunk.document_type,
+                        creation_date=created,  # type: ignore[arg-type]
+                        creation_date_int=chunk.creation_date_int,
+                        access_level=chunk.access_level,
+                        page_number=chunk.page_number,
+                        page_end=chunk.page_end,
+                        section_title=chunk.section_title,
+                    )
+                    for (chunk, name, created), _ in kept
+                ],
+            )
+            # Chroma can store a vector its index never returns; prove these are searchable (rule 14).
+            vectorstore.ensure_reachable([chunk.id for (chunk, _, _), _ in kept])
+        embedded += len(kept)
+        logger.info(
+            "reembed progress",
+            extra={"embedded": embedded, "skipped": skipped, "dropped": len(batch) - len(kept)},
         )
-        embedded += len(batch)
-        logger.info("reembed progress", extra={"embedded": embedded, "skipped": skipped})
         batch.clear()
 
     with get_sessionmaker()() as db:

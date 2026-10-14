@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     embedding_max_concurrency: int = Field(default=4, ge=1, le=32)
     # Retries per batch for rate limits (429) and transient (5xx/network) errors.
     embedding_max_retries: int = Field(default=6, ge=0, le=20)
+    # Document texts embedded per minute, so a large upload leaves headroom for chat questions
+    # (a free-tier key allows about 100 requests per minute). 0 turns the limiter off.
+    embedding_texts_per_minute: int = Field(default=90, ge=0)
 
     llm_model: str = "gemini-3.8-flash"
     rewrite_model: str | None = None
@@ -54,17 +57,30 @@ class Settings(BaseSettings):
     rrf_k: int = Field(default=60, ge=1)
     # Calibrated with eval/questions.jsonl on gemini-embedding-001 @ 768 dims (TDD 6.3).
     relevance_threshold: float = Field(default=0.60, ge=0.0, le=1.0)
+    # An exact identifier in the top keyword hit (ERR_404_NET) lets a question through the gate
+    # even below the threshold, but never by more than this margin: a question that is nowhere
+    # near the documents is refused whatever numbers it contains. Measured on the eval corpus,
+    # unrelated questions score about 0.55 and identifier questions 0.67 or more.
+    lexical_override_margin: float = Field(default=0.15, ge=0.0, le=1.0)
     rerank_enabled: bool = False
 
     # --- Ingestion ----------------------------------------------------------
     chunk_target_chars: int = Field(default=800, ge=200)
     chunk_overlap_chars: int = Field(default=100, ge=0)
     max_upload_mb: int = Field(default=50, ge=1)
+    # Files accepted in one upload request.
+    max_files_per_request: int = Field(default=20, ge=1, le=200)
+    # Extracted text beyond this size fails the document instead of tying up the worker.
+    max_document_chars: int = Field(default=5_000_000, ge=10_000)
     # Documents indexed at the same time. 1 keeps embedding API usage predictable.
     ingestion_workers: int = Field(default=1, ge=1, le=8)
 
     # --- Infrastructure -----------------------------------------------------
-    database_url: str
+    # repr=False keeps the password out of any logged or printed settings object.
+    database_url: str = Field(repr=False)
+    db_pool_size: int = Field(default=10, ge=1, le=100)
+    db_max_overflow: int = Field(default=10, ge=0, le=100)
+    db_pool_timeout_seconds: float = Field(default=30.0, gt=0)
     chroma_host: str = "chroma"
     chroma_port: int = Field(default=8000, ge=1, le=65535)
     chroma_collection: str = "chunks"
@@ -72,10 +88,22 @@ class Settings(BaseSettings):
 
     # --- Authentication and logging -----------------------------------------
     jwt_secret: SecretStr
-    jwt_expire_minutes: int = Field(default=60, ge=1)
+    jwt_expire_minutes: int = Field(default=60, ge=1, le=10_080)  # at most a week
     # bcrypt work factor. 12 costs roughly 250 ms per hash; tests lower it.
     bcrypt_rounds: int = Field(default=12, ge=4, le=15)
+    # False closes self-service signup. While no account exists yet, signup still works so a
+    # fresh deployment can create its first (admin) user.
+    signup_enabled: bool = True
     log_level: str = "INFO"
+
+    @field_validator("rerank_enabled")
+    @classmethod
+    def _rerank_not_implemented(cls, value: bool) -> bool:
+        if value:
+            raise ValueError(
+                "RERANK_ENABLED=true is not supported: core/rerank.py is not implemented"
+            )
+        return value
 
     @field_validator("jwt_secret")
     @classmethod
@@ -96,13 +124,17 @@ class Settings(BaseSettings):
     def _overlap_smaller_than_target(self) -> Self:
         if self.chunk_overlap_chars >= self.chunk_target_chars:
             raise ValueError("CHUNK_OVERLAP_CHARS must be smaller than CHUNK_TARGET_CHARS")
-        # A chunk can be the target plus up to 1.5x the overlap (CLAUDE.md rule 16: stay far
-        # below the embedding model's 2,048-token input limit instead of relying on truncation).
-        longest = self.chunk_target_chars + int(self.chunk_overlap_chars * 1.5)
+        # A chunk can be the target plus up to 1.5x the overlap plus one separator character
+        # (CLAUDE.md rule 16: stay far below the embedding model's 2,048-token input limit
+        # instead of relying on truncation).
+        longest = self.chunk_target_chars + int(self.chunk_overlap_chars * 1.5) + 1
         if longest > CHUNK_HARD_MAX_CHARS:
             raise ValueError(
-                f"CHUNK_TARGET_CHARS plus 1.5 x CHUNK_OVERLAP_CHARS must not exceed {CHUNK_HARD_MAX_CHARS}"
+                f"CHUNK_TARGET_CHARS plus 1.5 x CHUNK_OVERLAP_CHARS plus 1 must not exceed "
+                f"{CHUNK_HARD_MAX_CHARS}"
             )
+        if self.retrieval_top_k > self.retrieval_candidates:
+            raise ValueError("RETRIEVAL_TOP_K must not exceed RETRIEVAL_CANDIDATES")
         return self
 
     @property

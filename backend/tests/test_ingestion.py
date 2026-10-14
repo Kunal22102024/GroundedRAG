@@ -344,7 +344,7 @@ def test_a_vector_store_failure_after_postgres_was_written_is_cleaned_up(
     assert_nothing_left_behind(db, doc)
 
 
-def test_an_unexpected_error_gets_a_generic_message_and_is_logged_with_a_traceback(
+def test_an_unexpected_error_gets_a_generic_message_and_is_logged_by_location_only(
     db: Session, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     def explode(path: Path, extension: str) -> Any:
@@ -358,11 +358,11 @@ def test_an_unexpected_error_gets_a_generic_message_and_is_logged_with_a_traceba
     assert doc.status == "failed" and "unexpectedly" in (doc.error_message or "")
     assert "TOPSECRET" not in (doc.error_message or "")
     record = next(r for r in caplog.records if r.getMessage() == "ingestion failed")
-    assert (
-        record.levelno == logging.ERROR
-        and record.exc_info is not None
-        and record.error == "ZeroDivisionError"
-    )  # type: ignore[attr-defined]
+    # Where it failed is logged, but not the exception message, which can quote document text.
+    assert record.levelno == logging.ERROR and record.exc_info is None
+    assert record.error == "ZeroDivisionError"  # type: ignore[attr-defined]
+    assert "explode" in record.trace  # type: ignore[attr-defined]
+    assert "TOPSECRET" not in " ".join(f"{r.getMessage()} {r.__dict__}" for r in caplog.records)
 
 
 def test_stale_vectors_of_a_failed_document_are_removed_too(
@@ -522,4 +522,51 @@ def test_a_vector_that_cannot_be_made_searchable_fails_the_document_and_cleans_u
     ingestion.ingest_document(doc.id)
     doc = fresh(db, doc)
     assert doc.status == "failed" and "search index is unavailable" in (doc.error_message or "")
+    assert_nothing_left_behind(db, doc)
+
+
+# --- Headings are searchable by keyword, and oversized text is refused ---------------------------------------
+
+
+HEADING_ONLY_ID = "# Gateway\n\n## ERR_999_XYZ\n\nRestart the upstream proxy and clear its cache.\n"
+
+
+def test_a_heading_only_identifier_is_found_by_the_keyword_channel(db: Session) -> None:
+    """The heading lives in section_title, not in the chunk text, yet the keyword index has it."""
+    doc = upload(db, make_user(db), "runbook.md", HEADING_ONLY_ID.encode())
+    ingestion.ingest_document(doc.id)
+
+    rows = chunk_rows(db, fresh(db, doc))
+    assert [r.section_title for r in rows] == ["ERR_999_XYZ"]
+    assert "ERR_999_XYZ" not in rows[0].content
+    hit = bm25.get_index().search("ERR_999_XYZ", 3)
+    assert [h.chunk_id for h in hit] == [rows[0].id]
+
+
+def test_the_rebuilt_keyword_index_matches_the_one_built_during_ingestion(db: Session) -> None:
+    from app.services import index_service
+
+    doc = upload(db, make_user(db), "runbook.md", HEADING_ONLY_ID.encode())
+    ingestion.ingest_document(doc.id)
+    before = [h.chunk_id for h in bm25.get_index().search("ERR_999_XYZ", 3)]
+
+    bm25.reset_index()
+    assert bm25.get_index().search("ERR_999_XYZ", 3) == []
+    with get_sessionmaker()() as session:
+        index_service.load_bm25(session)  # what a restart does
+    assert [h.chunk_id for h in bm25.get_index().search("ERR_999_XYZ", 3)] == before != []
+
+
+def test_a_document_with_more_text_than_the_limit_fails_with_a_clear_message(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(get_settings(), "max_document_chars", 10_000)
+    big = "# Big\n\n" + "\n\n".join(
+        f"Paragraph {n} says something about retention." for n in range(400)
+    )
+    doc = upload(db, make_user(db), "big.md", big.encode())
+    ingestion.ingest_document(doc.id)
+
+    doc = fresh(db, doc)
+    assert doc.status == "failed" and "10,000 characters" in (doc.error_message or "")
     assert_nothing_left_behind(db, doc)

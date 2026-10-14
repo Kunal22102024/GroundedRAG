@@ -17,6 +17,7 @@ import re
 import unicodedata
 import zipfile
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -102,19 +103,25 @@ def clean_text(text: str) -> str:
 
 
 def _join_wrapped(lines: list[str]) -> str:
-    """Join hard-wrapped lines into one paragraph, repairing end-of-line hyphenation."""
-    out = ""
+    """Join hard-wrapped lines into one paragraph, repairing end-of-line hyphenation.
+
+    Collects the lines and joins once: growing one string line by line is quadratic, which a
+    file of a few hundred thousand short lines turns into minutes.
+    """
+    parts: list[str] = []
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        if not out:
-            out = line
-        elif out.endswith("-") and len(out) > 1 and out[-2].isalpha() and line[:1].islower():
-            out = out[:-1] + line  # "exam-" + "ple" -> "example"
+        if not parts:
+            parts.append(line)
+            continue
+        last = parts[-1]
+        if last.endswith("-") and len(last) > 1 and last[-2].isalpha() and line[:1].islower():
+            parts[-1] = last[:-1] + line  # "exam-" + "ple" -> "example"
         else:
-            out = f"{out} {line}"
-    return out
+            parts.append(line)
+    return " ".join(parts)
 
 
 def _letters(text: str) -> int:
@@ -656,10 +663,36 @@ def _parse_docx(path: Path) -> ParsedDocument:
     title = ""
     headings = 0
 
-    for child in document.element.body.iterchildren():
+    def blocks(parent: Any) -> Iterator[Any]:
+        """Paragraphs and tables in order, looking inside content controls (``w:sdt``).
+
+        Form fields, templates and many exported documents wrap whole sections in content
+        controls; reading only the body's direct children silently drops all of that text.
+        """
+        for node in parent.iterchildren():
+            if node.tag == qn("w:sdt"):
+                content = node.find(qn("w:sdtContent"))
+                if content is not None:
+                    yield from blocks(content)
+            else:
+                yield node
+
+    def paragraph_text(element: Any, paragraph: Any) -> str:
+        if element.find(qn("w:sdt")) is None:  # the usual case: python-docx reads it correctly
+            return str(paragraph.text)
+        # An inline content control: python-docx skips its runs, so read the text nodes directly.
+        pieces: list[str] = []
+        for node in element.iter(qn("w:t"), qn("w:tab"), qn("w:br"), qn("w:cr")):
+            if node.tag == qn("w:t"):
+                pieces.append(node.text or "")
+            else:
+                pieces.append("\t" if node.tag == qn("w:tab") else "\n")
+        return "".join(pieces)
+
+    for child in blocks(document.element.body):
         if child.tag == qn("w:p"):
             paragraph = Paragraph(child, document)
-            text = clean_text(paragraph.text)
+            text = clean_text(paragraph_text(child, paragraph))
             if not text:
                 continue
             try:
@@ -717,9 +750,8 @@ _ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _SETEXT_UNDERLINE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _HORIZONTAL_RULE = re.compile(r"^ {0,3}([-*_])(?: ?\1){2,}[ \t]*$")
-_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
-_MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)[^)]*\)")
-_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_MD_LABEL_MAX = 500  # longest link text or image alt text that is recognised
+_MD_LINE_LIMIT = 2000  # the heading patterns are only tried on lines up to this long
 _FRONT_MATTER_KEY = re.compile(r"^([A-Za-z_][\w -]*):\s*(.*)$")
 
 
@@ -749,10 +781,62 @@ def _iso_date(value: str) -> date | None:
         return None
 
 
+def _strip_html_comments(text: str) -> str:
+    """Remove ``<!-- ... -->``; an unterminated comment is left as text. Linear in the text."""
+    out: list[str] = []
+    position = 0
+    while True:
+        start = text.find("<!--", position)
+        if start < 0:
+            break
+        end = text.find("-->", start + 4)
+        if end < 0:
+            break
+        out.append(text[position:start])
+        position = end + 3
+    out.append(text[position:])
+    return "".join(out)
+
+
+def _flatten_links(text: str) -> str:
+    """``![alt](url)`` becomes ``alt`` and ``[label](url "title")`` becomes ``label (url)``.
+
+    One left-to-right pass built on ``str.find``. A regular expression for this rescans the rest
+    of the text from every ``[`` that never closes: 40,000 brackets cost seconds with the GIL
+    held (the whole server stalls) and a 1 MB file costs hours.
+    """
+    out: list[str] = []
+    done = 0  # everything before this index has been handled
+    search = 0
+    close = -1  # the first ")" at or after ``search``, reused while it is still ahead
+    while True:
+        mid = text.find("](", search)
+        if mid < 0:
+            break
+        search = mid + 2
+        start = text.rfind("[", max(done, mid - _MD_LABEL_MAX - 1), mid)
+        if start < 0 or text.find("]", start + 1, mid) >= 0:
+            continue
+        if close < search:
+            close = text.find(")", search)
+            if close < 0:
+                break  # no ")" is left, so nothing further can be a link
+        label, target = text[start + 1 : mid], text[search:close]
+        if start > done and text[start - 1] == "!":
+            out.append(text[done : start - 1])
+            out.append(label)
+        elif label and target and not target[0].isspace():
+            out.append(text[done:start])
+            out.append(f"{label} ({target.split()[0]})")
+        else:
+            continue
+        done = search = close + 1
+    out.append(text[done:])
+    return "".join(out)
+
+
 def _markdown_inline(text: str) -> str:
-    text = _HTML_COMMENT.sub("", text)
-    text = _MD_IMAGE.sub(r"\1", text)
-    return _MD_LINK.sub(r"\1 (\2)", text)
+    return _flatten_links(_strip_html_comments(text))
 
 
 def _parse_markdown(raw: bytes) -> ParsedDocument:
@@ -795,7 +879,7 @@ def _parse_markdown(raw: bytes) -> ParsedDocument:
             index += 1
             continue
 
-        atx = _ATX_HEADING.match(line)
+        atx = _ATX_HEADING.match(line) if len(line) <= _MD_LINE_LIMIT else None
         following = lines[index + 1] if index + 1 < len(lines) else ""
         if atx:
             flush()
@@ -827,7 +911,7 @@ def _parse_markdown(raw: bytes) -> ParsedDocument:
         created=_iso_date(front.get("date", "") or front.get("created", "")),
         department=front.get("department", ""),
         document_type=front.get("document_type", "") or front.get("type", ""),
-    )
+    )  # front-matter labels are clamped to the column width in metadata.resolve
     return ParsedDocument(segments, properties, 1, {"headings": headings})
 
 
@@ -958,10 +1042,14 @@ _TXT_UNDERLINE = re.compile(r"^(={3,}|-{3,}|~{3,})\s*$")
 
 def _txt_is_heading(line: str) -> bool:
     text = line.strip()
+    # A lone token such as ERR_404_NET or EM-09 is an identifier standing on its own line, not a
+    # title: as a heading it would be dropped from the text and no question could find it.
+    lone_identifier = " " not in text and any(ch.isdigit() or ch == "_" for ch in text)
     return (
         3 <= len(text) <= 80
         and _letters(text) >= 3
         and text == text.upper()
+        and not lone_identifier
         and not text.endswith((".", ",", ";", ":"))
         and not _BULLET.match(text)
     )

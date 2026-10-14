@@ -7,7 +7,8 @@ documents do not contain the answer, the app says so instead of guessing.
 
 > **Build status:** all six phases are complete: deployment, database and authentication, document
 > ingestion, hybrid retrieval with the relevance guard, streamed chat with verified citations, the
-> web UI and the evaluation script. The design is in [PRD.md](PRD.md) and [TDD.md](TDD.md).
+> web UI and the evaluation script. A later audit pass fixed correctness, security and test gaps
+> (see "Decisions", *Audit pass*). The design is in [PRD.md](PRD.md) and [TDD.md](TDD.md).
 
 | Document | Defines |
 | --- | --- |
@@ -54,7 +55,8 @@ docker compose up --build
 Open <http://localhost:8081>, then:
 
 1. **Sign up.** The first account becomes the administrator (only an admin can mark a document
-   `Restricted`).
+   `Restricted`). The app listens on this machine only (`BIND_ADDR=127.0.0.1`). Before you share it
+   on a network, create your account, then set `SIGNUP_ENABLED=false` (see "Accounts and roles").
 2. **Library:** upload PDF, DOCX, Markdown, HTML or text files. Each moves `queued`, `processing`,
    `indexed`; department, type and date are detected unless you set them. Delete removes the file, its
    text and its search index.
@@ -88,9 +90,12 @@ Named volumes `pg_data`, `chroma_data` and `uploads` survive `docker compose dow
 
 ## Accounts and roles
 
-Anyone can sign up (`POST /api/auth/signup`). **The first account ever created becomes `admin`;
-every later one is a `user`**, so create your own account first. Roles decide which documents a
-person may read once uploads exist (PRD 4.4):
+Anyone who can reach the app can sign up (`POST /api/auth/signup`). **The first account ever created
+becomes `admin`; every later one is a `user`**, so create your own account first. Once the people
+who need one have an account, set `SIGNUP_ENABLED=false` in `.env` and recreate the backend
+(`docker compose up -d backend`): signup then answers 403, while signing in is unaffected. (A fresh
+install with no account at all can always create its first one, so it can never lock you out.)
+Roles decide which documents a person may read once uploads exist (PRD 4.4):
 
 | Role | Reads | May assign `Restricted` on upload | May delete |
 | --- | --- | --- | --- |
@@ -101,9 +106,17 @@ Passwords are 8 to 72 bytes. Tokens last `JWT_EXPIRE_MINUTES` (default 60) and a
 `Authorization: Bearer <token>`. Try it from the interactive docs at `/api/docs` ("Authorize"), or:
 
 ```bash
-curl -s -X POST localhost:8081/api/auth/signup -H 'Content-Type: application/json' \n     -d '{"email": "you@company.com", "password": "a long passphrase"}'
+curl -s -X POST localhost:8081/api/auth/signup -H 'Content-Type: application/json' \
+     -d '{"email": "you@company.com", "password": "a long passphrase"}'   # the reply holds access_token
+curl -s -X POST localhost:8081/api/auth/login -H 'Content-Type: application/json' \
+     -d '{"email": "you@company.com", "password": "a long passphrase"}'   # same reply, for an existing account
 curl -s localhost:8081/api/auth/me -H "Authorization: Bearer $TOKEN"
 ```
+
+nginx limits how fast sign-in and sign-up can be tried (`429 Too many requests` with a
+`Retry-After` header) and how large their bodies can be. It does not lock accounts, and it cannot
+tell clients apart behind Docker Desktop's network, so treat it as a brake on scripts and put
+real exposure behind a reverse proxy with TLS.
 
 There is no user-management screen yet: to promote someone, update the database directly
 (`docker compose exec postgres psql -U groundedrag -c "UPDATE users SET role='admin' WHERE email='...'"`).
@@ -112,8 +125,9 @@ The change applies immediately, even to tokens issued before it.
 ## Documents
 
 Supported formats: PDF, DOCX, Markdown (`.md`, `.markdown`), HTML (`.html`, `.htm`) and plain text,
-up to `MAX_UPLOAD_MB` each. Upload one or many files in a single request (needs a signed-in user and
-a `GOOGLE_API_KEY`, because indexing calls Gemini):
+up to `MAX_UPLOAD_MB` each. Upload one or many files in a single request (at most
+`MAX_FILES_PER_REQUEST`; needs a signed-in user and a `GOOGLE_API_KEY`, because indexing calls
+Gemini). nginx checks the sign-in before it accepts the body, and refuses a request over 256 MB:
 
 ```bash
 curl -s -X POST localhost:8081/api/documents -H "Authorization: Bearer $TOKEN" \
@@ -139,6 +153,10 @@ size. Originals are stored under generated names, never under the name you uploa
 | `department` | a known department as a folder or first word (HR, Engineering, Legal, Operations, IT) | Markdown front matter |
 | `document_type` | words such as policy/standard, manual/handbook, spec/rfc, contract/agreement | title, front matter |
 | `creation_date` | `2026-01-15`, `20260115`, `April2025`, `2026` (a month or year is refined to the exact day by a consistent PDF date) | PDF creation date, DOCX/HTML/Markdown date |
+
+A `creation_date` you pass must be in 1990 or later and at most a year ahead; anything else is
+refused with 422 instead of being quietly replaced by a date from another source. A document whose
+extracted text is longer than `MAX_DOCUMENT_CHARS` (5 million) fails with a message saying so.
 | `access_level` | defaults to `Internal`; `Restricted` only for admins | |
 
 **What happens to problem files:** a scanned or blank PDF fails with *"This looks like a scanned PDF,
@@ -148,15 +166,21 @@ failed document leaves nothing in the search index and stays listed so you can s
 **Only PDFs are shown inline** when you open an original; every other type downloads. Opening an
 uploaded HTML page on the app's own origin would let it run script next to your session token.
 
-**A deleted document is gone everywhere**: search index, vector store, database and file. If a step
-fails, the document is parked as `failed` (already unsearchable) and you simply delete it again.
+**A deleted document is gone everywhere**: search index, vector store, database, file, and the
+passages copied into saved conversations. If a step fails, the document is parked as `failed`
+(already unsearchable) and you simply delete it again. Old answers keep their text as a record of
+the conversation, but their citation chips for that document read "source no longer available" and
+open nothing. The same applies to a citation of a document the reader may no longer see (for
+example after an administrator is demoted).
 
 ### Free-tier Gemini keys
 
 A free-tier key allows about **100 embedding requests per minute** (every chunk counts), and may have
-a daily cap. Indexing backs off and resumes automatically, but it runs at roughly 100 chunks a minute:
-a 300-page manual is on the order of 15 minutes. A billing-enabled key removes the limit (and is the
-right choice for confidential documents, TDD section 9). `GET /api/ready` reports whether the key works.
+a daily cap. Indexing spaces its requests out (`EMBEDDING_TEXTS_PER_MINUTE`, default 90, so chat
+questions keep working during a large upload), backs off on a 429 and resumes automatically, but it
+runs at roughly 90 chunks a minute: a 300-page manual is on the order of 15 minutes. A
+billing-enabled key removes the limit (raise `EMBEDDING_TEXTS_PER_MINUTE`, or set it to 0) and is the
+right choice for confidential documents, TDD section 9. `GET /api/ready` reports whether the key works.
 
 ### Checking the search index
 
@@ -190,13 +214,19 @@ docker compose exec backend pytest                 # tests (no API key needed; s
 docker compose exec backend ruff check .           # lint
 docker compose exec backend ruff format --check .  # formatting
 docker compose -f docker-compose.yml -f docker-compose.dev.yml exec backend python -m eval.run_eval --verbose
-                                                   # retrieval + guard over eval/questions.jsonl (embedding calls only, no LLM)
+                                                   # retrieval + guard over eval/questions.jsonl (embedding calls only, no LLM); see eval/README.md
 docker compose exec backend alembic revision --autogenerate -m "describe change"
 ```
 
+If `HTTP_PORT` is not 8081, start the UI dev server with
+`VITE_PROXY_TARGET=http://localhost:<port> npm run dev`.
+
 Database tests create a throwaway database (`groundedrag_test_<random>`) on the running Postgres
 container, migrate it with the real Alembic migrations, and drop it afterwards; your real data is
-never touched. They are skipped when no Postgres is reachable, so run the tests inside the stack.
+never touched. They are skipped when no Postgres is reachable, so run the tests inside the stack, and
+set `REQUIRE_STACK=1` (as CI should) to make an unreachable Postgres or Chroma a **failure** rather
+than a skip: a run in which every database test skipped proves nothing. The tests pin every setting
+to its documented default, so a `.env` override cannot change their outcome.
 
 `backend/tests/test_pinned_versions.py` needs the repo's `chroma/` directory, which is not in the
 backend image, so it is skipped inside the container. Run it with the directory mounted:
@@ -212,16 +242,21 @@ All settings are environment variables, read only by `backend/app/config.py`. Bl
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GOOGLE_API_KEY` | none | Gemini API key. Needed from Phase 3; use a paid-tier key for confidential documents |
+| `GOOGLE_API_KEY` | none | Gemini API key, needed to index documents and to chat; use a paid-tier key for confidential documents |
 | `JWT_SECRET` | none, **required** | Token signing key, at least 32 characters |
-| `JWT_EXPIRE_MINUTES` | `60` | Login token lifetime |
+| `JWT_EXPIRE_MINUTES` | `60` | Login token lifetime (1 to 10080) |
 | `BCRYPT_ROUNDS` | `12` | Password hashing cost (4 to 15); about 250 ms per hash at 12 |
+| `SIGNUP_ENABLED` | `true` | `false` closes signup once the first account exists |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `groundedrag` / **required** / `groundedrag` | Database credentials (compose builds `DATABASE_URL` from them; keep the password URL-safe) |
 | `HTTP_PORT` | `8081` | Host port for the web UI (nginx listens on 8080 inside the container) |
+| `BIND_ADDR` | `127.0.0.1` | Address that port is published on; `0.0.0.0` shares the app on your network (no TLS: see "Accounts and roles") |
+| `BACKEND_MEM_LIMIT` / `CHROMA_MEM_LIMIT` / `POSTGRES_MEM_LIMIT` / `FRONTEND_MEM_LIMIT` | `3g` / `2g` / `1g` / `256m` | Container memory ceilings |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_TIMEOUT_SECONDS` | `10` / `10` / `30` | Postgres connections the backend may hold, and how long a request waits for one |
 | `EMBEDDING_MODEL` | `models/gemini-embedding-001` | Embedding model |
 | `EMBEDDING_DIM` | `768` | Output dimensionality (128 to 3072) |
 | `EMBEDDING_BATCH_SIZE` / `EMBEDDING_MAX_CONCURRENCY` | `32` / `4` | Ingestion throughput versus rate limits |
 | `EMBEDDING_MAX_RETRIES` | `6` | Retries per batch on rate limits and transient errors (backoff honours the server's retry hint) |
+| `EMBEDDING_TEXTS_PER_MINUTE` | `90` | Document texts embedded per minute, so an upload cannot starve chat of quota; `0` turns it off (billing-enabled keys) |
 | `LLM_MODEL` | `gemini-3.8-flash` | Answer generation (`gemini-2.5-flash` is closed to new API keys) |
 | `LLM_TIMEOUT_SECONDS` | `60` | A model call is abandoned after this long |
 | `INTERACTIVE_MAX_RETRIES` / `INTERACTIVE_MAX_WAIT_SECONDS` | `2` / `30` | Rate-limit retries while a user waits (LLM and query embedding) |
@@ -230,9 +265,12 @@ All settings are environment variables, read only by `backend/app/config.py`. Bl
 | `RETRIEVAL_CANDIDATES` / `RETRIEVAL_TOP_K` | `30` / `5` | Candidates per channel; chunks sent to the LLM |
 | `RRF_K` | `60` | Reciprocal Rank Fusion constant |
 | `RELEVANCE_THRESHOLD` | `0.60` (calibrated) | Refusal cutoff on the best dense cosine similarity; re-calibrate after changing the embedding model |
-| `RERANK_ENABLED` | `false` | Cross-encoder reranking |
-| `CHUNK_TARGET_CHARS` / `CHUNK_OVERLAP_CHARS` | `800` / `100` | Chunking |
+| `LEXICAL_OVERRIDE_MARGIN` | `0.15` | How far below the threshold an exact identifier match (`ERR_404_NET`) may still let a question through; `0` turns the override off |
+| `RERANK_ENABLED` | `false` | Must stay `false`: reranking is not implemented, and `true` is rejected at startup |
+| `CHUNK_TARGET_CHARS` / `CHUNK_OVERLAP_CHARS` | `800` / `100` | Chunking; target plus 1.5 x overlap plus 1 must not exceed 1500 |
 | `MAX_UPLOAD_MB` | `50` | Per-file upload limit |
+| `MAX_FILES_PER_REQUEST` | `20` | Files accepted in one upload request |
+| `MAX_DOCUMENT_CHARS` | `5000000` | A document with more extracted text fails instead of tying up the worker |
 | `INGESTION_WORKERS` | `1` | Documents indexed at the same time |
 | `CHROMA_COLLECTION` | `chunks` | Collection prefix; model and dimension are appended (`chunks__gemini-embedding-001__768`) |
 | `LOG_LEVEL` | `INFO` | Log verbosity |
@@ -263,9 +301,9 @@ Deliberate choices and deviations from the spec documents. Newest phase last.
 * **Two Docker networks.** `internal: true` for Postgres/Chroma/backend and `edge` for
   nginx/backend, so the data stores have no route to the internet and the web tier cannot reach
   them. The backend sits on both because it must call Gemini.
-* **`/ready` checks Postgres and Chroma only for now.** The embedding-model reachability probe from
-  the TDD is added with `core/embeddings.py` (Phase 3) as a cached probe, so readiness polling does
-  not burn API quota.
+* **`/ready` checks Postgres, Chroma, the embedding service and index consistency.** The embedding
+  reachability probe (added with `core/embeddings.py` in Phase 3) is cached, so readiness polling does
+  not burn API quota. Phase 1 shipped with the first two checks only.
 * **`GOOGLE_API_KEY` is optional at the settings level.** The backend (and `pytest`) boots without
   it; the embedding/LLM wrappers raise a clear error at the point of use.
 * **Postgres uses the Debian `postgres:16` image**, as the TDD says, rather than Alpine, to avoid
@@ -302,8 +340,9 @@ Deliberate choices and deviations from the spec documents. Newest phase last.
   internal domains such as `company.local` are accepted. They are stored lower-cased.
 * **Passwords above 72 bytes are rejected** (bcrypt would otherwise ignore the excess, and bcrypt 5
   refuses it). The limit is in bytes, so 37 accented characters already exceed it.
-* **Not implemented, by scope:** login rate limiting or lockout, password reset, email
-  verification, and user management. A shared-intranet deployment should add throttling at nginx.
+* **Not implemented, by scope:** account lockout, password reset, email verification, and user
+  management. Request rate limits exist at nginx only (see *Audit pass*); a shared deployment still
+  needs TLS in front.
 * **Auth handlers are plain `def`**, not `async`, because bcrypt is CPU-bound; FastAPI runs them in
   a worker thread so the event loop stays free for streaming.
 * **Test database per session, not per test.** Tables are truncated between tests; a test refuses to
@@ -363,22 +402,115 @@ Deliberate choices and deviations from the spec documents. Newest phase last.
   shows "Rate limit reached, please try again in a minute." It never hangs.
 * **Not implemented, by scope:** reranking (`RERANK_ENABLED` must stay `false`; hybrid retrieval ranked the
   expected chunk first for all 10 answerable draft questions), the optional exact-token `where_document`
-  search (BM25 plus the lexical override cover it), dark mode, and tests for the conversation/feedback
-  endpoints and the UI (checked by hand and by build-time type checking).
+  search (BM25 plus the lexical override cover it), dark mode, and automated UI tests (the UI is checked
+  by hand and by build-time type checking; its logic that mattered, the SSE reader and answer rendering,
+  was exercised under Node during the audit pass).
 * **Known limitation:** PDFs whose text layer overprints other text (a watermark laid over the body)
   can interleave characters. The document still indexes and its page numbers are right.
 * **Not implemented, by scope:** OCR, re-ingesting a failed document in place (delete and upload
   again), and per-user storage quotas.
 
+**Audit pass** (every item below came from reading the code and was reproduced, or covered by a test
+that fails without the fix)
+
+*Answers and the guard*
+
+* **The lexical override has a floor.** An exact identifier in the best keyword hit used to pass the
+  guard at any similarity, so `What is 100 USD in EUR?` reached the model because a chunk contained
+  `100`. It now needs `similarity >= RELEVANCE_THRESHOLD - LEXICAL_OVERRIDE_MARGIN` (0.45), and the
+  matching text must come from a passage the model is actually given. On the eval corpus unrelated
+  questions score about 0.55 and identifier questions 0.64 or more, so no real question is affected.
+* **Section headings are keyword-searchable.** A heading such as `ERR_404_NET` lives in
+  `chunks.section_title`, not in the chunk text, so a question about it found nothing. The keyword index
+  (and the override check) now include the heading; embeddings do not, so nothing is re-embedded and the
+  calibrated threshold stays valid. The keyword index is rebuilt from Postgres at startup, so restarting
+  the backend is enough for existing documents. (The text parser also stops promoting a lone `ERR_404_NET`
+  line to a heading.)
+* **The citation filter leaves ordinary brackets alone.** `[0-9]`, `[2023-2025]` and `args[0]` were
+  rewritten or deleted as if they were citations; a dash range now counts only between two real sources,
+  and brackets inside code are code. A removed marker takes its own preceding space with it, and nothing
+  else in the answer is rewritten (the old global tidy-up turned `a .env file` into `a.env file` in the
+  final answer).
+* **A blank answer is an error, not a saved message** (rule 19): a reply made only of removed markers is
+  retried once and then reported.
+* **Follow-up rewriting treats the conversation as untrusted** (earlier answers quote documents), caps
+  the rewrite's length, and falls back to the original question when the model writes an essay.
+
+*Documents and indexing*
+
+* **Parsing time is linear.** Hostile or just odd files took far longer than their size suggests, with
+  the GIL held so the whole server stalled for everyone (measured: 8 s for 40 KB of unclosed Markdown
+  brackets, 52 s for 200 KB of unclosed links, 148 s for 400,000 short text lines, 50 s for 60 KB of
+  `A. A. A.`). The patterns are replaced by single passes (the same inputs now take well under a
+  second), and `MAX_DOCUMENT_CHARS` bounds the rest. A sandboxed
+  parser subprocess was considered and **not** built: it would add a process boundary for a problem
+  that linear-time code and the container memory limit already contain.
+* **Ingestion logs say where an unexpected failure happened, not what the exception said**: library
+  error messages can quote the text being processed (rule 21).
+* **Vector store.** Writers take one lock, so a rebuild cannot lose or resurrect a concurrent write; the
+  Chroma client has real timeouts (its own default is none); an id that was never stored counts as
+  unreachable instead of passing the check; and a crash between dropping the old collection and
+  renaming the rebuilt one is recovered at startup (it used to strand every vector). `reembed` proves
+  its vectors are searchable and does not write back a document deleted while its batch was embedding.
+* **Saved conversations do not outlive the right to read them.** Deleting a document blanks the
+  passages copied into saved answers; reading a conversation marks citations the reader can no longer
+  see (deleted document, lowered role) as unavailable. The answer text itself stays, as a record.
+
+*Security and resilience*
+
+* **A chat stream no longer holds a database connection for its whole length** (measured: one
+  `idle in transaction` per stream), and a login releases its connection before the 250 ms password
+  check, so a burst of either cannot exhaust the pool.
+* **nginx is the first line of defence.** Per-route body limits (32 KB for sign-in, 64 KB for a question,
+  1 MB elsewhere, 256 MB for uploads), request-rate limits for sign-in, chat and uploads, and the
+  sign-in is checked **before** an upload body is accepted (an unauthenticated 256 MB POST used to be
+  buffered in full). 413 and 429 answers are JSON like the API's own.
+* **Defaults that matter for a first deployment.** The port is published on `127.0.0.1` only,
+  `SIGNUP_ENABLED` can close signup, the single-worker rule is enforced by the entrypoint (a
+  `WEB_CONCURRENCY` above 1 stops the container), containers drop capabilities, cannot gain privileges
+  and have memory and log-size limits, and `RERANK_ENABLED=true` is rejected instead of ignored.
+* **`/api/docs` stays reachable.** It was briefly planned to be hidden; the README documents it as a way
+  to try the API, and it lists routes only.
+* **Content-Security-Policy.** Because the sign-in token lives in `localStorage`, nginx now sends a
+  policy that allows only scripts from this origin. The PDF drawer needs `object-src`/`frame-src`
+  to allow `blob:`; if a browser refuses to show a PDF there, relax `object-src` in
+  `frontend/nginx-snippets/security-headers.conf` first.
+* **Not changed, on purpose:** the first signup still becomes administrator (a fresh install must be
+  able to start), the token stays in `localStorage` (the CSP is the mitigation), and there are no
+  per-user quotas.
+
+*Interface*
+
+* The Stop button used to leave the chat permanently busy, and switching conversations while an answer
+  streamed could write the old answer into the new one; both are fixed with a per-question id. A stream
+  that ends without `done` is reported instead of hanging, errors are readable sentences (not raw
+  JSON), logging out clears the cached data, a server restart no longer signs people out, the answer
+  renderer handles citations inside bold text and numbered lists, and the library and drawer are
+  usable by keyboard.
+
+*Evaluation*
+
+* `eval/sample_docs/` and `eval/README.md` were referred to but missing; the five small generated
+  documents are now committed, the set grew from 15 to 24 questions (12 unanswerable), and `run_eval`
+  calls the production retrieval and guard, fails on off-topic leakage, and skips questions whose
+  documents are not indexed instead of crashing. Result with the full corpus: hybrid hit-rate@5 1.00,
+  off-topic stopped 5/5, answerable wrongly stopped 0/12. Off-topic questions score at most 0.544 and the
+  weakest answerable one 0.638, so `RELEVANCE_THRESHOLD=0.60` stands.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `Bind for 0.0.0.0:8081 failed: port is already allocated` | Another process or container uses host port 8081. Set `HTTP_PORT=8082` (or any free port) in `.env`, then `docker compose up -d`. Find the owner with `docker ps` or `netstat -ano \| findstr :8081`. |
+| `Bind for 127.0.0.1:8081 failed: port is already allocated` | Another process or container uses host port 8081. Set `HTTP_PORT=8082` (or any free port) in `.env`, then `docker compose up -d`. Find the owner with `docker ps` or `netstat -ano \| findstr :8081`. |
+| The app opens on this machine but not from another computer | The port is published on `127.0.0.1` only (`BIND_ADDR`). Set `BIND_ADDR=0.0.0.0` in `.env` and recreate the stack; read "Accounts and roles" first, because there is no TLS and signup is open until you close it. |
 | `required variable POSTGRES_PASSWORD is missing a value` | `.env` is missing or incomplete. Run `cp .env.example .env` and fill in the required values. |
 | Backend restarts with `ValidationError ... jwt_secret` | `JWT_SECRET` is empty or shorter than 32 characters. |
 | Backend cannot log in to Postgres after editing `POSTGRES_PASSWORD` | The password is fixed when the `pg_data` volume is first created. Restore the old value, or reset with `docker compose down -v` (**deletes all data**). |
 | My account is not an admin | Someone else signed up first. Promote yourself with the `UPDATE users SET role='admin' ...` command in "Accounts and roles". |
+| Signup answers `403 Signup is disabled on this server.` | `SIGNUP_ENABLED=false` and an account already exists. Set it to `true` and run `docker compose up -d backend` to let people register again. |
+| `429 Too many requests` | nginx's request-rate limit for sign-in/sign-up, chat or uploads. Wait a few seconds (`Retry-After`) and retry. Behind Docker Desktop every client can look like one address, so a busy office can hit it; raise the `rate`/`burst` values in `frontend/nginx.conf`. |
+| `413 The request is too large` | A body over nginx's limit for that route: 32 KB for sign-in, 64 KB for a question, 256 MB for one upload request (the per-file limit is `MAX_UPLOAD_MB`, and at most `MAX_FILES_PER_REQUEST` files). |
+| The backend container exits at once with `WEB_CONCURRENCY=...: GroundedRAG must run ONE worker` | A platform or `.env` variable asks uvicorn for several workers. The BM25 index is in-process memory, so remove the variable. |
 | `401` right after logging in | Check the header is exactly `Authorization: Bearer <token>`, the token has not expired (`expires_in` seconds), and `JWT_SECRET` has not changed since it was issued (changing it invalidates every token). |
 | Database tests are all skipped | No Postgres was reachable. Run `docker compose exec backend pytest` with the stack up. |
 | A document is `failed` with "rate limited" or "quota" | A free-tier Gemini key allows about 100 embedding requests per minute (and may have a daily cap). Wait and upload again, or use a billing-enabled key. The error message and the logs say which limit was hit. |
@@ -392,8 +524,11 @@ Deliberate choices and deviations from the spec documents. Newest phase last.
 | `exec /app/docker-entrypoint.sh: no such file or directory` | The script was checked out with Windows (CRLF) line endings. `.gitattributes` forces LF; re-checkout the file (or run `git add --renormalize .`). |
 | Chroma container is unhealthy | It has no curl; the healthcheck uses bash `/dev/tcp`. Check `docker compose logs chroma` for the real error (usually a permissions problem on `chroma_data`). |
 | Logs are one JSON object per line | By design (structured logging with a `request_id` on every request line). Migration output at startup is plain text. |
+| Chat says "The AI service is temporarily unavailable" | Google answered `503 ... high demand` for the chat model (the backend log shows `"code": 503`). It is Google's overload, not the app. Wait and retry, or set another model your key can use, e.g. `LLM_MODEL=gemini-3.1-flash-lite`, then `docker compose up -d backend`. |
 | Chat says "Rate limit reached, please try again in a minute" | The free tier's per-minute (or per-day) Gemini limit. Wait a minute and ask again, or use a billing-enabled key. |
 | Chat error "The AI service could not answer (GoogleModelNotFoundError)" | The configured `LLM_MODEL` is not available to your key (`404 ... no longer available to new users`). Set `LLM_MODEL=gemini-3.8-flash` (or another model your key lists) and recreate the backend: `docker compose up -d backend` (a plain restart does not re-read `.env`). |
 | Chat error "The search index is unavailable or out of date" | PostgreSQL lists indexed chunks but a search channel returns nothing. Check `GET /api/ready` (`index`), then run `verify-index` or `reembed` (see "Checking the search index"). |
 | Everything is refused with "Insufficient information..." | Either nothing is indexed yet (Library shows `indexed`?), your filters exclude the documents, or the question scores below `RELEVANCE_THRESHOLD`. `--verbose` in `python -m eval.run_eval` shows the scores. |
-| The source drawer shows no PDF | Only PDFs are embedded; other types offer a download. The file is fetched with your token, so a logged-out tab shows nothing. |
+| The source drawer shows no PDF | Only PDFs are embedded; other types offer a download. The file is fetched with your token, so a logged-out tab shows nothing. If a PDF is blank or the browser reports it was blocked, the Content-Security-Policy may be too strict for that browser's PDF viewer: relax `object-src` in `frontend/nginx-snippets/security-headers.conf` and rebuild the frontend. |
+| A citation chip reads "source no longer available" | The cited document was deleted, or you may no longer read it (for example your role was lowered). The answer text is kept; the passage is not. |
+| A chat answer stops with "The connection closed before the answer finished" | The stream ended without a final event (the backend restarted, or a proxy cut the connection). Ask again. |

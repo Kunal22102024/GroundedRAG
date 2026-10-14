@@ -250,3 +250,39 @@ def test_openapi_describes_auth_routes_and_bearer_scheme(client: TestClient) -> 
     for path in ("/api/auth/signup", "/api/auth/login", "/api/auth/me"):
         assert path in spec["paths"]
     assert spec["components"]["securitySchemes"]["HTTPBearer"]["scheme"] == "bearer"
+
+
+# --- SIGNUP_ENABLED --------------------------------------------------------------------------------
+
+
+def test_signup_can_be_closed_once_the_first_account_exists(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(get_settings(), "signup_enabled", False)
+
+    # A fresh deployment must never be locked out: the first account is always allowed.
+    first = signup(client, "boss@example.com")
+    assert first.status_code == 201 and first.json()["user"]["role"] == "admin"
+
+    closed = signup(client, "newcomer@example.com")
+    assert (
+        closed.status_code == 403
+        and closed.json()["detail"] == "Signup is disabled on this server."
+    )
+    # A closed door must not reveal which addresses have an account.
+    assert signup(client, "boss@example.com").status_code == 403
+
+    login = client.post("/api/auth/login", json={"email": "boss@example.com", "password": PASSWORD})
+    assert login.status_code == 200  # signing in is unaffected
+
+    monkeypatch.setattr(get_settings(), "signup_enabled", True)
+    assert signup(client, "newcomer@example.com").status_code == 201
+
+
+def test_a_refused_signup_creates_no_account(
+    client: TestClient, db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signup(client, "boss@example.com")
+    monkeypatch.setattr(get_settings(), "signup_enabled", False)
+    signup(client, "ghost@example.com")
+    assert db.execute(text("select count(*) from users")).scalar_one() == 1

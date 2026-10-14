@@ -28,6 +28,11 @@ def signup(body: SignupRequest, db: DbSession) -> AuthResponse:
     """Create an account and sign it in. The very first account becomes `admin`."""
     try:
         user = auth_service.register_user(db, body.email, body.password)
+    except auth_service.SignupDisabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Signup is disabled on this server.",
+        ) from None
     except auth_service.EmailAlreadyRegistered:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="An account with this email already exists"

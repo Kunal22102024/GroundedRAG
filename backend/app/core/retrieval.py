@@ -207,7 +207,8 @@ def retrieve(question: str, search_filter: SearchFilter) -> RetrievalResult:
             break
 
     best = max((c.similarity for c in candidates if c.similarity is not None), default=None)
-    top_keyword_text = next(
-        (rows[h.chunk_id].content for h in keyword_hits if h.chunk_id in rows), None
-    )
+    # The lexical override may only rest on a passage the model will actually be given.
+    by_id = {c.chunk_id: c for c in candidates}
+    top = next((by_id[h.chunk_id] for h in keyword_hits if h.chunk_id in by_id), None)
+    top_keyword_text = bm25.keyword_text(top.section_title, top.text) if top else None
     return RetrievalResult(candidates, best, top_keyword_text, timings)

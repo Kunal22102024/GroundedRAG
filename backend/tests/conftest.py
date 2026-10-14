@@ -7,7 +7,9 @@ database even when run inside the Docker stack (where real values exist).
 
 Database tests use a throwaway database (``groundedrag_test_<random>``) created
 on the stack's PostgreSQL server, migrated with the real Alembic migrations and
-dropped at the end of the session. They skip when no server is reachable.
+dropped at the end of the session. They skip when no server is reachable, unless
+``REQUIRE_STACK=1`` is set (as in CI): then a missing server is a failure, because a run in which
+every database and Chroma test skipped proves nothing.
 """
 
 from __future__ import annotations
@@ -29,6 +31,17 @@ from sqlalchemy.orm import Session
 # server. It is only ever used to CREATE/DROP throwaway databases.
 _SERVER_URL = os.environ.get("DATABASE_URL")
 
+# Tests assert the documented defaults (one ingestion worker, temperature 0, 800-character chunks,
+# the 0.60 threshold, ...). Those must not depend on whatever the container's .env overrides, so
+# every setting is dropped from the environment except the infrastructure wiring, and the few
+# values tests need are forced below.
+from app.config import Settings  # noqa: E402  (building a Settings is lazy; this reads no env)
+
+_KEEP_FROM_ENV = {"DATABASE_URL", "CHROMA_HOST", "CHROMA_PORT"}
+for _field in Settings.model_fields:
+    if _field.upper() not in _KEEP_FROM_ENV:
+        os.environ.pop(_field.upper(), None)
+
 # Force (not setdefault): inside the container the real DATABASE_URL is set.
 os.environ["DATABASE_URL"] = "postgresql+psycopg://test:test@127.0.0.1:1/test"
 os.environ["JWT_SECRET"] = "test-secret-test-secret-test-secret-0123456789"
@@ -36,8 +49,17 @@ os.environ["GOOGLE_API_KEY"] = ""
 os.environ["LOG_LEVEL"] = "INFO"
 os.environ["BCRYPT_ROUNDS"] = "4"  # minimum cost; real hashing speed is not under test
 os.environ["EMBEDDING_MAX_RETRIES"] = "3"
+os.environ["EMBEDDING_TEXTS_PER_MINUTE"] = "0"  # the limiter has its own tests
 # A collection name no real deployment uses, unique per run, so tests never touch real vectors.
 os.environ["CHROMA_COLLECTION"] = f"test_{uuid.uuid4().hex[:8]}"
+
+
+def stack_unavailable(reason: str) -> None:
+    """Skip the test, or fail it when ``REQUIRE_STACK=1`` says the stack must be there."""
+    if os.environ.get("REQUIRE_STACK") == "1":
+        pytest.fail(f"{reason} (REQUIRE_STACK=1)")
+    pytest.skip(reason)
+
 
 TEST_DB_PREFIX = "groundedrag_test_"
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
@@ -103,14 +125,16 @@ def use_database(url: str) -> Iterator[None]:
 def temporary_database() -> Iterator[str]:
     """Create an empty throwaway database on the server and yield its URL."""
     if not _SERVER_URL:
-        pytest.skip("no PostgreSQL server configured (run the tests inside the compose stack)")
+        stack_unavailable(
+            "no PostgreSQL server configured (run the tests inside the compose stack)"
+        )
     admin = create_engine(_SERVER_URL, isolation_level="AUTOCOMMIT")
     try:
         with admin.connect() as connection:
             connection.execute(text("SELECT 1"))
     except SQLAlchemyError:
         admin.dispose()
-        pytest.skip("PostgreSQL server is not reachable")
+        stack_unavailable("PostgreSQL server is not reachable")
 
     name = f"{TEST_DB_PREFIX}{uuid.uuid4().hex[:10]}"
     with admin.connect() as connection:
@@ -199,7 +223,7 @@ def vectors() -> Iterator[object]:
     try:
         vectorstore.heartbeat()
     except vectorstore.VectorStoreError:
-        pytest.skip("ChromaDB is not reachable (run the tests inside the compose stack)")
+        stack_unavailable("ChromaDB is not reachable (run the tests inside the compose stack)")
     vectorstore.reset_collection_cache()
     with contextlib.suppress(vectorstore.VectorStoreError):
         vectorstore.drop_collection()

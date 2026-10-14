@@ -34,6 +34,7 @@ from app.db.models import Conversation, Message
 logger = logging.getLogger(__name__)
 
 INTERNAL_ERROR_MESSAGE = "Something went wrong while answering. Please try again."
+CONVERSATION_DELETED_MESSAGE = "This conversation was deleted while the answer was being written."
 
 
 class ConversationNotFound(Exception):
@@ -127,8 +128,9 @@ def _persist(
             db.flush()
         else:
             conversation = db.get(Conversation, plan.conversation_id)
-            if conversation is not None:
-                conversation.updated_at = now
+            if conversation is None:  # deleted while the answer was being written
+                raise ConversationNotFound
+            conversation.updated_at = now
         # Explicit timestamps: both rows share one transaction, and `now()` would tie them.
         db.add(
             Message(
@@ -187,7 +189,11 @@ async def _turn(plan: ChatPlan) -> AsyncIterator[SseEvent]:
     timings.update(result.timings)
 
     decision = guard.evaluate(
-        question, result.best_similarity, result.top_keyword_text, settings.relevance_threshold
+        question,
+        result.best_similarity,
+        result.top_keyword_text,
+        settings.relevance_threshold,
+        settings.lexical_override_margin,
     )
     guard_info = {
         "passed": decision.passed,
@@ -276,6 +282,8 @@ def error_event(exc: BaseException) -> SseEvent:
     code, message, retry_after = "internal", INTERNAL_ERROR_MESSAGE, None
     if isinstance(exc, llm.LlmError):
         code, message, retry_after = exc.code, exc.message, exc.retry_after
+    elif isinstance(exc, ConversationNotFound):
+        code, message = "conversation_deleted", CONVERSATION_DELETED_MESSAGE
     elif isinstance(exc, retrieval.IndexUnavailableError):
         code, message = "index_unavailable", exc.message
     elif isinstance(exc, embeddings.EmbeddingRateLimitError):

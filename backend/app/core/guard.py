@@ -4,9 +4,11 @@
   CLAUDE.md rule 7) with ``RELEVANCE_THRESHOLD``. Below it, the LLM is not called.
 * **Lexical override.** An exact token such as ``ERR_404_NET`` can have low dense similarity even
   when the right chunk exists. If the question contains an identifier-like token and the top
-  keyword hit contains that exact token (case-insensitive), the gate passes regardless of the score.
+  keyword hit contains that exact token (case-insensitive), the gate passes below the threshold,
+  but only down to ``threshold - margin``: a question nowhere near the documents is still refused.
 * **Citation filter.** ``CitationFilter`` checks ``[n]`` markers while the answer streams: a marker
   that does not map to a retrieved source is removed before the user ever sees it (rule 9).
+  Brackets that are not citations (``[0-9]``, ``[2023-2025]``, anything inside code) are left alone.
 """
 
 from __future__ import annotations
@@ -67,12 +69,21 @@ def evaluate(
     best_similarity: float | None,
     top_keyword_text: str | None,
     threshold: float,
+    margin: float,
 ) -> GuardDecision:
-    """Decide whether the retrieved context is relevant enough to answer from."""
+    """Decide whether the retrieved context is relevant enough to answer from.
+
+    ``top_keyword_text`` is the text of the best keyword hit among the passages that would be
+    sent to the model; ``margin`` is how far below ``threshold`` an exact identifier match may
+    still pass.
+    """
     if best_similarity is not None and best_similarity >= threshold:
         return GuardDecision(True, "relevant", best_similarity, threshold)
-    if top_keyword_text and any(
-        contains_token(top_keyword_text, token) for token in identifier_tokens(question)
+    if (
+        best_similarity is not None
+        and best_similarity >= threshold - margin
+        and top_keyword_text
+        and any(contains_token(top_keyword_text, token) for token in identifier_tokens(question))
     ):
         return GuardDecision(True, "lexical_override", best_similarity, threshold)
     reason = "below_threshold" if best_similarity is not None else "no_candidates"
@@ -84,18 +95,23 @@ def evaluate(
 _GROUP = re.compile(r"\[\s*\d+(?:\s*[,;–-]\s*\d+)*\s*\]")
 _GROUP_PREFIX = re.compile(r"\[[\d\s,;–-]*")
 _MAX_MARKER_CHARS = 32
-_MAX_RANGE = 20
 
 
-def _numbers(group: str) -> list[int]:
-    """The source numbers in ``[1, 3]`` or ``[1-3]``, in order (ranges are expanded)."""
+def _numbers(group: str, source_count: int) -> list[int] | None:
+    """The source numbers in ``[1, 3]`` or ``[1-3]``, in order (ranges are expanded).
+
+    Returns None when the brackets are not a citation at all. A dash range is one only if it runs
+    upward between two real sources, so ``[0-9]`` and ``[2023-2025]`` stay ordinary text.
+    """
     numbers: list[int] = []
-    for part in re.split(r"[,;]", group.strip("[] \t")):
+    for part in re.split(r"[,;]", group.strip("[]").strip()):
         bounds = [int(x) for x in re.findall(r"\d+", part)]
-        if len(bounds) == 2 and 0 <= bounds[1] - bounds[0] < _MAX_RANGE:
+        if len(bounds) == 1:
+            numbers.extend(bounds)
+        elif len(bounds) == 2 and 1 <= bounds[0] <= bounds[1] <= source_count:
             numbers.extend(range(bounds[0], bounds[1] + 1))
         else:
-            numbers.extend(bounds)
+            return None
     return numbers
 
 
@@ -105,19 +121,31 @@ class CitationFilter:
     Feed it text as it arrives; it returns the text that is safe to show. A marker that may still
     be incomplete (``[1`` at the end of a piece) is held back until it resolves. ``[1, 2]`` is
     normalized to ``[1][2]``; numbers outside ``1..source_count`` are dropped and counted.
+
+    Two details keep the answer text intact. A removed marker takes the one space in front of it
+    along, so ``"25 days [9]."`` becomes ``"25 days."`` without touching any other spacing; that
+    is why a single space is held back until the next character shows what follows it. And
+    brackets inside inline code or a fenced block (``args[0]``) are code, not citations.
     """
 
     def __init__(self, source_count: int) -> None:
         self.source_count = source_count
         self.cited: list[int] = []
         self.invalid = 0
-        self._pending = ""
+        self._pending = ""  # a possible marker that is still being read
+        self._held = ""  # a space not shown yet, in case a removed marker follows it
+        self._ticks = 0  # length of the current run of backticks
+        self._inline_code = False
+        self._code_fence = False
 
     def _resolve(self, group: str) -> str:
         if not _GROUP.fullmatch(group):
-            return group  # brackets that are not a citation, e.g. "[]" or a code sample
+            return group  # brackets that are not a citation, e.g. "[]"
+        numbers = _numbers(group, self.source_count)
+        if numbers is None:
+            return group  # e.g. "[0-9]" or "[2023-2025]"
         kept: list[int] = []
-        for number in _numbers(group):
+        for number in numbers:
             if 1 <= number <= self.source_count:
                 if number not in kept:
                     kept.append(number)
@@ -127,35 +155,77 @@ class CitationFilter:
                 self.invalid += 1
         return "".join(f"[{n}]" for n in kept)
 
+    def _put(self, text: str, out: list[str]) -> None:
+        """Show ``text``, preceded by the space that was held back."""
+        if self._held:
+            out.append(self._held)
+            self._held = ""
+        out.append(text)
+
+    def _give_up_marker(self, out: list[str]) -> None:
+        """What was read after a ``[`` turned out not to be a citation: show it as it is."""
+        if self._pending:
+            self._put(self._pending, out)
+            self._pending = ""
+
+    def _end_backtick_run(self) -> None:
+        ticks, self._ticks = self._ticks, 0
+        if ticks >= 3:
+            self._code_fence = not self._code_fence
+            self._inline_code = False
+        elif not self._code_fence:
+            self._inline_code = not self._inline_code
+
+    def _step(self, char: str, out: list[str]) -> None:
+        if char == "`":
+            self._give_up_marker(out)
+            self._ticks += 1
+            self._put(char, out)
+            return
+        if self._ticks:
+            self._end_backtick_run()
+        if char == "\n":
+            self._inline_code = False  # inline code never spans a line break
+        if self._inline_code or self._code_fence:
+            self._put(char, out)
+            return
+        if not self._pending:
+            if char == "[":
+                self._pending = "["
+            elif char in " \t":
+                if self._held:
+                    out.append(self._held)
+                self._held = char
+            else:
+                self._put(char, out)
+            return
+        if char == "[":  # the previous bracket never closed, so it was not a citation
+            self._give_up_marker(out)
+            self._pending = "["
+            return
+        self._pending += char
+        if char == "]":
+            resolved = self._resolve(self._pending)
+            self._pending = ""
+            if resolved:
+                self._put(resolved, out)
+            else:
+                self._held = ""  # every number was invalid: the marker leaves with its space
+        elif not _GROUP_PREFIX.fullmatch(self._pending) or len(self._pending) > _MAX_MARKER_CHARS:
+            self._give_up_marker(out)
+
     def feed(self, text: str) -> str:
         """Take the next piece of the answer; return what may be shown now."""
         out: list[str] = []
         for char in text:
-            if not self._pending:
-                if char == "[":
-                    self._pending = "["
-                else:
-                    out.append(char)
-                continue
-            if char == "[":  # the previous bracket never closed, so it was not a citation
-                out.append(self._pending)
-                self._pending = "["
-                continue
-            self._pending += char
-            if char == "]":
-                out.append(self._resolve(self._pending))
-                self._pending = ""
-            elif (
-                not _GROUP_PREFIX.fullmatch(self._pending) or len(self._pending) > _MAX_MARKER_CHARS
-            ):
-                out.append(self._pending)
-                self._pending = ""
+            self._step(char, out)
         return "".join(out)
 
     def finish(self) -> str:
         """End of the answer: a half-written marker (cut off by the token limit) is dropped."""
         pending, self._pending = self._pending, ""
-        return "" if _GROUP_PREFIX.fullmatch(pending) else pending
+        held, self._held = self._held, ""
+        return held + ("" if _GROUP_PREFIX.fullmatch(pending) else pending)
 
 
 def filter_citations(text: str, source_count: int) -> tuple[str, list[int], int]:
@@ -166,13 +236,16 @@ def filter_citations(text: str, source_count: int) -> tuple[str, list[int], int]
 
 
 def clean_text(text: str) -> str:
-    """Tidy the gaps left where invalid markers were removed."""
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    text = re.sub(r"[ \t]+([.,;:!?])", r"\1", text)
+    """Trim the answer. The gaps left by removed markers are closed by ``CitationFilter``; the
+    text is otherwise left exactly as the model wrote it (``.env``, ``:8080`` and code samples
+    must not be rewritten)."""
     return text.strip()
 
 
+_EMPHASIS = re.compile(r"[*_`\"'“”]")
+
+
 def is_refusal(text: str) -> bool:
-    """True if the model answered with the refusal sentence (optionally quoted or cited)."""
-    plain = re.sub(r"\[[\d\s,;–-]*\]", "", text).strip().strip("\"'`“”").strip()
+    """True if the model answered with the refusal sentence (optionally quoted, cited or bold)."""
+    plain = _EMPHASIS.sub("", re.sub(r"\[[\d\s,;–-]*\]", "", text)).strip()
     return plain.casefold().rstrip(".") == REFUSAL_MESSAGE.casefold().rstrip(".")

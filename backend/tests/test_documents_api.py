@@ -557,3 +557,60 @@ def test_a_failed_deletion_parks_the_document_and_can_be_retried(
     monkeypatch.setattr(vectorstore, "delete_document", real_delete)
     assert client.delete(f"/api/documents/{document['id']}", headers=user).status_code == 204
     assert_gone(db, upload_dir, document["id"])
+
+
+# --- Upload validation added by the audit ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["1985-06-01", "1989-12-31", "2099-01-01"])
+def test_an_implausible_creation_date_is_refused_instead_of_silently_replaced(
+    client: TestClient, admin: Headers, bad: str
+) -> None:
+    response = upload(client, admin, ("a.md", MD, "text/markdown"), creation_date=bad)
+    assert response.status_code == 422
+    assert "creation_date" in response.json()["detail"] and "1990" in response.json()["detail"]
+    assert (
+        upload(client, admin, ("a.md", MD, "text/markdown"), creation_date="2026-01-15").status_code
+        == 202
+    )
+
+
+def test_a_request_with_too_many_files_is_refused_whole(
+    client: TestClient, admin: Headers, monkeypatch: pytest.MonkeyPatch, upload_dir: Path
+) -> None:
+    monkeypatch.setattr(get_settings(), "max_files_per_request", 2)
+    files = [(f"d{n}.md", MD, "text/markdown") for n in range(3)]
+    response = upload(client, admin, *files)
+    assert response.status_code == 413 and "At most 2 files" in response.json()["detail"]
+    assert list(upload_dir.glob("*")) == []  # nothing was stored
+    assert upload(client, admin, *files[:2]).status_code == 202
+
+
+def test_a_failure_while_storing_a_later_file_leaves_nothing_on_disk(
+    db: Session, upload_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full disk on the third file must not strand the first two on disk with no row."""
+    from app.core.metadata import ExplicitMetadata
+    from app.db.models import User
+    from app.services import document_service
+    from app.services.document_service import IncomingFile
+
+    owner = User(email="u@example.com", password_hash="x", role="user")
+    db.add(owner)
+    db.commit()
+    real, calls = document_service._store_file, {"n": 0}
+
+    def flaky(file: IncomingFile, extension: str, max_bytes: int) -> tuple[str, int]:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise OSError("no space left on device")
+        return real(file, extension, max_bytes)
+
+    monkeypatch.setattr(document_service, "_store_file", flaky)
+    files = [IncomingFile(f"d{n}.md", None, io.BytesIO(MD), len(MD)) for n in range(4)]
+    with pytest.raises(OSError):
+        document_service.create_documents(
+            db, owner, files, ExplicitMetadata(), submit=lambda _id: None
+        )
+    assert list(upload_dir.glob("*")) == []
+    assert db.scalar(select(func.count()).select_from(Document)) == 0

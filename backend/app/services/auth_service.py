@@ -35,6 +35,10 @@ class EmailAlreadyRegistered(AuthError):
     """Signup with an email that already has an account."""
 
 
+class SignupDisabled(AuthError):
+    """Self-service signup is switched off (``SIGNUP_ENABLED=false``) and an account exists."""
+
+
 class InvalidCredentials(AuthError):
     """Wrong email or password. Deliberately does not say which."""
 
@@ -80,16 +84,21 @@ def _lock_signups(db: Session) -> None:
 def register_user(db: Session, email: str, password: str) -> User:
     """Create an account. The first account ever registered becomes ``admin``.
 
-    Raises ``EmailAlreadyRegistered`` if the email is taken.
+    Raises ``EmailAlreadyRegistered`` if the email is taken, and ``SignupDisabled`` when signup is
+    switched off and an account already exists (the first account can always be created, so a
+    fresh deployment is never locked out).
     """
     email = normalize_email(email)
     password_hash = hash_password(password)  # slow: do it before holding the lock
 
     _lock_signups(db)
+    is_first_user = db.scalar(select(func.count()).select_from(User)) == 0
+    if not is_first_user and not get_settings().signup_enabled:
+        db.rollback()  # checked before the email lookup: a closed door must not reveal accounts
+        raise SignupDisabled
     if db.scalar(select(User.id).where(User.email == email)) is not None:
         db.rollback()
         raise EmailAlreadyRegistered
-    is_first_user = db.scalar(select(func.count()).select_from(User)) == 0
     user = User(
         email=email,
         password_hash=password_hash,
@@ -109,6 +118,11 @@ def register_user(db: Session, email: str, password: str) -> User:
 def authenticate(db: Session, email: str, password: str) -> User:
     """Return the user for valid credentials, else raise ``InvalidCredentials``."""
     user = db.scalar(select(User).where(User.email == normalize_email(email)))
+    if user is not None:
+        db.expunge(user)  # keeps its loaded columns for the caller
+    # A bcrypt check takes about 250 ms. Give the connection back first: some forty concurrent
+    # logins would otherwise hold every pooled connection and stall the whole API.
+    db.rollback()
     if user is None:
         verify_password(password, _dummy_hash())  # equalize timing; result is irrelevant
         logger.info("login failed")

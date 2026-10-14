@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 import pytest
 
@@ -229,7 +230,8 @@ def test_punctuation_only_chunks_are_dropped() -> None:
 
 @pytest.mark.parametrize(
     ("target", "overlap"),
-    [(50, 10), (800, 800), (800, -1), (1400, 200)],
+    # 1200 + 1.5 x 200 + 1 separator is one character over the ceiling; so is 1350 + 150 + 1.
+    [(50, 10), (800, 800), (800, -1), (1400, 200), (1200, 200), (1350, 100)],
 )
 def test_invalid_configuration_is_rejected(target: int, overlap: int) -> None:
     with pytest.raises(ValueError):
@@ -237,6 +239,62 @@ def test_invalid_configuration_is_rejected(target: int, overlap: int) -> None:
 
 
 def test_the_largest_allowed_configuration_still_respects_the_ceiling() -> None:
-    biggest = StructureAwareChunker(1200, 200)
+    biggest = StructureAwareChunker(1199, 200)
     for chunk in biggest.chunk([Segment(1, "", numbered_sentences(200))]):
         assert len(chunk.content) <= CHUNK_HARD_MAX_CHARS
+
+
+def test_the_longest_possible_chunk_is_exactly_at_the_bound_not_over_it() -> None:
+    """Overlap (up to the cap) + one separator + a full-size piece: the worst case of the packer."""
+    target, overlap = 1349, 100
+    cap = int(overlap * 1.5)
+    chunker_ = StructureAwareChunker(target, overlap)
+    short = "x" * (cap - 5) + "."  # becomes the overlap of the next chunk
+    full = ("y" * (target - 1)) + "."
+    chunks = chunker_.chunk(
+        [
+            Segment(1, "S", short),
+            Segment(1, "S", full),
+            Segment(1, "S", short),
+            Segment(1, "S", full),
+        ]
+    )
+    assert max(len(c.content) for c in chunks) <= target + cap + 1 <= CHUNK_HARD_MAX_CHARS
+
+
+# --- Hostile text: the time taken grows with the length, not with its square ------------------------------
+
+
+def seconds(fn: object) -> float:
+    start = time.perf_counter()
+    fn()  # type: ignore[operator]
+    return time.perf_counter() - start
+
+
+def test_a_run_of_abbreviation_like_boundaries_is_split_in_linear_time() -> None:
+    """'A. A. A. ...' skips every boundary; re-splitting the growing candidate took 50 s per 60 KB."""
+    assert seconds(lambda: split_sentences("A. " * 60_000)) < 2.0
+    assert seconds(lambda: split_sentences("see e.g. Foo " * 40_000)) < 2.0
+
+
+def test_abbreviations_and_list_numbers_still_do_not_end_a_sentence() -> None:
+    assert split_sentences("See Fig. 3 for details. Next one.") == [
+        "See Fig. 3 for details.",
+        "Next one.",
+    ]
+    assert split_sentences("1. First item. 2. Second item.") == [
+        "1. First item.",
+        "2. Second item.",
+    ]
+    assert split_sentences("Ask J. Smith about it. Done.") == ["Ask J. Smith about it.", "Done."]
+
+
+def test_a_huge_text_without_whitespace_is_cut_in_linear_time() -> None:
+    chunks_: list[object] = []
+    elapsed = seconds(lambda: chunks_.extend(chunker().chunk([Segment(1, "", "x" * 3_000_000)])))
+    assert elapsed < 5.0 and len(chunks_) > 1000
+
+
+def test_a_large_realistic_document_is_chunked_quickly() -> None:
+    segments = [Segment(1, f"S{n}", numbered_sentences(40, n * 40)) for n in range(400)]
+    assert seconds(lambda: chunker().chunk(segments)) < 5.0

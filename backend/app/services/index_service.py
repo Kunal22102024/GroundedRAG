@@ -74,6 +74,7 @@ def load_bm25(db: Session) -> int:
             Chunk.document_type,
             Chunk.creation_date_int,
             Chunk.access_level,
+            Chunk.section_title,
             Chunk.content,
         )
         .join(Document, Document.id == Chunk.document_id)
@@ -90,7 +91,7 @@ def load_bm25(db: Session) -> int:
                 creation_date_int=row.creation_date_int,
                 access_level=row.access_level,
             ),
-            row.content,
+            bm25.keyword_text(row.section_title, row.content),
         )
         for row in rows
     )
@@ -102,6 +103,9 @@ def run_startup() -> StartupReport:
     from app.config import get_settings
 
     collection = get_settings().collection_name
+    # First of all: opening the collection would create an empty one if a crash during a rebuild
+    # had left the real collection missing and its verified copy beside it.
+    vectorstore.recover_interrupted_rebuild()
     vectorstore.get_collection()  # raises VectorStoreMismatchError on a model/dimension mismatch
 
     with get_sessionmaker()() as db:
@@ -115,9 +119,17 @@ def run_startup() -> StartupReport:
                 "empty. This happens after changing EMBEDDING_MODEL/EMBEDDING_DIM or losing the Chroma "
                 "volume. Run `python -m app.maintenance reembed` (see README), or restore the old settings."
             )
-        if indexed != vectors:
+        if vectors < indexed:
+            # Some chunks have no vector, so those passages can only be found by keyword search.
+            # Not a reason to refuse to start (the rest works), but never a quiet warning;
+            # /api/ready reports it too.
+            logger.error(
+                "some indexed chunks have no vector: run `python -m app.maintenance reembed`",
+                extra={"indexed_chunks": indexed, "vectors": vectors, "missing": indexed - vectors},
+            )
+        elif vectors > indexed:
             logger.warning(
-                "vector count differs from indexed chunk count",
+                "more vectors than indexed chunks (leftovers of deleted documents)",
                 extra={"indexed_chunks": indexed, "vectors": vectors},
             )
         loaded = load_bm25(db)

@@ -102,6 +102,8 @@ async def generate_answer(
             break
         yield Restart("citations")
 
+    if not text:  # only whitespace or markers that were removed: never save a blank answer
+        raise llm.LlmError("empty", EMPTY_MESSAGE)
     if refused:
         text = REFUSAL_MESSAGE
     yield AnswerResult(

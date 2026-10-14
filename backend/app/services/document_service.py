@@ -37,7 +37,7 @@ from app.constants import (
     allowed_access_levels,
 )
 from app.core import bm25, metadata, vectorstore
-from app.db.models import Document, User
+from app.db.models import Document, Message, User
 from app.services import ingestion
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,10 @@ class DocumentBusy(DocumentError):
 
 class DocumentDeleteFailed(DocumentError):
     """A deletion step failed; the document is parked in a retryable state."""
+
+
+class TooManyFiles(DocumentError):
+    """One upload request carried more files than ``MAX_FILES_PER_REQUEST``."""
 
 
 class UploadRejected(Exception):
@@ -163,6 +167,11 @@ def parse_explicit_metadata(
             parsed_date = date.fromisoformat(creation_date.strip())
         except ValueError:
             raise InvalidMetadata("creation_date must look like 2026-01-15.") from None
+        # An implausible date used to be dropped silently and replaced by another source's date.
+        if not metadata.is_plausible_date(parsed_date, date.today()):
+            raise InvalidMetadata(
+                "creation_date must be in 1990 or later and at most a year from today."
+            )
     level: str | None = None
     if access_level and access_level.strip():
         level = metadata.canonical_access_level(access_level)
@@ -263,57 +272,65 @@ def create_documents(
     submit = submit or ingestion.submit  # looked up per call so it can be replaced
     if explicit.access_level == AccessLevel.RESTRICTED.value and user.role != Role.ADMIN:
         raise UploadForbidden("Only administrators may upload Restricted documents.")
+    limit = get_settings().max_files_per_request
+    if len(files) > limit:
+        raise TooManyFiles(f"At most {limit} files can be uploaded at once.")
 
     max_bytes = get_settings().max_upload_bytes
     result = UploadResult()
     stored: list[Path] = []
     documents: list[Document] = []
 
-    for file in files:
-        display = clean_filename(file.filename)
-        shown = display[:120] or "(unnamed file)"
-        try:
-            if not display:
-                raise UploadRejected("The file has no name.")
-            extension = os.path.splitext(display)[1].lower()
-            if extension not in ALLOWED_EXTENSIONS:
-                allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
-                raise UploadRejected(
-                    f"Unsupported file type '{extension[:12]}'. Allowed: {allowed}."
+    try:
+        for file in files:
+            display = clean_filename(file.filename)
+            shown = display[:120] or "(unnamed file)"
+            try:
+                if not display:
+                    raise UploadRejected("The file has no name.")
+                extension = os.path.splitext(display)[1].lower()
+                if extension not in ALLOWED_EXTENSIONS:
+                    allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+                    raise UploadRejected(
+                        f"Unsupported file type '{extension[:12]}'. Allowed: {allowed}."
+                    )
+                _check_declared(file, extension, max_bytes)
+                stored_name, size = _store_file(file, extension, max_bytes)
+            except UploadRejected as exc:
+                result.rejected.append(RejectedFile(shown, str(exc)))
+                continue
+
+            stored.append(Path(get_settings().upload_dir) / stored_name)
+            folder_department = metadata.department_from_name(file.filename or "")
+            documents.append(
+                Document(
+                    owner_id=user.id,
+                    name=display,
+                    stored_path=stored_name,
+                    mime_type=ALLOWED_EXTENSIONS[extension],
+                    size_bytes=size,
+                    status=DocumentStatus.QUEUED.value,
+                    # Upload values win; a folder or file-name department is a convention-based
+                    # fallback.
+                    department=explicit.department or folder_department,
+                    document_type=explicit.document_type or "",
+                    creation_date=explicit.creation_date,
+                    access_level=explicit.access_level or AccessLevel.INTERNAL.value,
                 )
-            _check_declared(file, extension, max_bytes)
-            stored_name, size = _store_file(file, extension, max_bytes)
-        except UploadRejected as exc:
-            result.rejected.append(RejectedFile(shown, str(exc)))
-            continue
-
-        stored.append(Path(get_settings().upload_dir) / stored_name)
-        folder_department = metadata.department_from_name(file.filename or "")
-        documents.append(
-            Document(
-                owner_id=user.id,
-                name=display,
-                stored_path=stored_name,
-                mime_type=ALLOWED_EXTENSIONS[extension],
-                size_bytes=size,
-                status=DocumentStatus.QUEUED.value,
-                # Upload values win; a folder or file-name department is a convention-based fallback.
-                department=explicit.department or folder_department,
-                document_type=explicit.document_type or "",
-                creation_date=explicit.creation_date,
-                access_level=explicit.access_level or AccessLevel.INTERNAL.value,
             )
-        )
 
-    if documents:
-        try:
+        if documents:
             db.add_all(documents)
             db.commit()
-        except Exception:
-            db.rollback()
-            for path in stored:
-                path.unlink(missing_ok=True)
-            raise
+    except BaseException:
+        # A full disk on the third file, or a database error: nothing may be left on disk that
+        # no row points at, however the request ended.
+        db.rollback()
+        for path in stored:
+            path.unlink(missing_ok=True)
+        raise
+
+    if documents:
         for document in documents:
             db.refresh(document)
             submit(document.id)
@@ -414,6 +431,26 @@ def delete_document(db: Session, user: User, document_id: uuid.UUID) -> None:
         lock.release()
 
 
+def _scrub_citations(db: Session, document_id: uuid.UUID) -> None:
+    """Blank the passage text copied into saved answers that cite this document (rule 24).
+
+    A chat citation stores the cited chunk's text so a conversation can be reopened later; without
+    this the content of a deleted document would stay readable in old conversations. Safe to repeat.
+    """
+    wanted = str(document_id)
+    rows = db.execute(
+        select(Message.id, Message.citations).where(
+            Message.citations.contains([{"document_id": wanted}])
+        )
+    ).all()
+    for message_id, citations in rows:
+        scrubbed = [
+            {**citation, "text": ""} if citation.get("document_id") == wanted else citation
+            for citation in citations or []
+        ]
+        db.execute(update(Message).where(Message.id == message_id).values(citations=scrubbed))
+
+
 def _delete_locked(db: Session, document: Document) -> None:
     document_id, stored = document.id, document.stored_path
     # 1. Park it: from here on it can no longer be returned by any search path.
@@ -425,9 +462,11 @@ def _delete_locked(db: Session, document: Document) -> None:
     db.commit()
 
     try:
-        # 2-3. Derived indexes, then 4. the source-of-truth rows (chunks cascade).
+        # 2-4. Derived indexes, the passages copied into saved conversations, then the
+        # source-of-truth rows (chunks cascade).
         bm25.get_index().remove_document(str(document_id))
         vectorstore.delete_document(str(document_id))
+        _scrub_citations(db, document_id)
         db.execute(delete(Document).where(Document.id == document_id))
         db.commit()
     except Exception as exc:

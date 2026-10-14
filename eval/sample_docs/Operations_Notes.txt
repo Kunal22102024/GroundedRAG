@@ -1,0 +1,7 @@
+SHIFT HANDOVER
+
+Operators must hand over open incidents to the next shift before leaving the control room.
+
+BACKUP SCHEDULE
+
+Nightly backups run at 01:30 and are retained for 35 days.

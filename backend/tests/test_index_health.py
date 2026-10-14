@@ -231,3 +231,131 @@ def test_a_failed_rebuild_leaves_the_original_collection_untouched(
     assert [
         c.name for c in vectors.get_client().list_collections() if c.name.endswith("__rebuild")
     ] == []
+
+
+# --- Ids that were never stored, timeouts, and a rebuild a crash cut short ---------------------------------------
+
+
+def test_ids_that_were_never_stored_count_as_unreachable_and_fail_loudly(vectors: Any) -> None:
+    """A write that stored nothing is just as unsearchable as one the index cannot reach."""
+    ids = fill(vectors, 10)
+    asked = [*ids[:3], "ghost_chunk_0000"]
+    assert vectors.find_unreachable(asked) == ["ghost_chunk_0000"]
+    with pytest.raises(VectorStoreError, match="missing from the index"):
+        vectors.ensure_reachable(asked)
+    assert vectors.ensure_reachable(ids[:3]) == 0  # the real ones are fine
+
+
+def test_the_client_has_request_timeouts_instead_of_waiting_forever(vectors: Any) -> None:
+    timeout = vectors.get_client()._server._session.timeout
+    assert timeout.read == 60.0 and timeout.connect == 5.0
+
+
+def make_copy(vs: Any, count: int) -> Any:
+    """A ``<name>__rebuild`` collection holding ``count`` vectors, as a rebuild leaves it."""
+    name = f"{get_settings().collection_name}__rebuild"
+    copy = vs.get_client().create_collection(
+        name=name,
+        configuration={"hnsw": {"space": "cosine"}},
+        metadata=vs._expected_metadata(),
+        embedding_function=None,
+    )
+    rng = random.Random(9)
+    ids = [f"copy_chunk_{n:04d}" for n in range(count)]
+    copy.add(ids=ids, embeddings=[unit(rng) for _ in ids], documents=ids)
+    return copy
+
+
+def names(vs: Any) -> set[str]:
+    """This test run's collections only: the Chroma server also holds the real ones."""
+    prefix = get_settings().collection_name
+    return {
+        n for n in (getattr(c, "name", c) for c in vs.get_client().list_collections())
+        if n.startswith(prefix)
+    }  # fmt: skip
+
+
+def test_nothing_to_recover_when_no_rebuild_was_interrupted(vectors: Any) -> None:
+    fill(vectors, 5)
+    assert vectors.recover_interrupted_rebuild() is None
+    assert vectors.count() == 5
+
+
+def test_an_incomplete_copy_beside_a_normal_collection_is_discarded(vectors: Any) -> None:
+    fill(vectors, 10)
+    make_copy(vectors, 4)  # the process died while copying
+    assert vectors.recover_interrupted_rebuild() == "discarded"
+    assert vectors.count() == 10
+    assert names(vectors) == {get_settings().collection_name}
+
+
+def test_a_verified_copy_replaces_a_collection_that_is_missing(vectors: Any) -> None:
+    """Died between deleting the old collection and renaming the copy: every vector was stranded."""
+    fill(vectors, 10)
+    make_copy(vectors, 10)
+    vectors.drop_collection()  # the crash happened right after this
+    assert vectors.recover_interrupted_rebuild() == "completed"
+    assert vectors.count() == 10
+    assert names(vectors) == {get_settings().collection_name}
+    assert vectors.find_unreachable() == []
+
+
+def test_a_fuller_copy_replaces_an_empty_collection_created_by_a_restart(vectors: Any) -> None:
+    """A restart before this fix opened (and so created) an empty collection beside the copy."""
+    vectors.get_collection()  # exists, empty
+    make_copy(vectors, 7)
+    assert vectors.recover_interrupted_rebuild() == "completed"
+    assert vectors.count() == 7
+
+
+def test_startup_recovers_the_interrupted_rebuild_before_it_opens_the_collection(
+    vectors: Any, db: Any
+) -> None:
+    from tests.conftest import REAL_RUN_STARTUP
+
+    fill(vectors, 6)
+    make_copy(vectors, 6)
+    vectors.drop_collection()
+    report = REAL_RUN_STARTUP()  # no indexed chunks in Postgres, so only the vectors matter
+    assert report.vectors == 6
+
+
+def test_writers_wait_for_a_rebuild_instead_of_being_lost_in_it(vectors: Any) -> None:
+    import threading
+    import time as _time
+
+    fill(vectors, 20)
+    started, finished = threading.Event(), threading.Event()
+    real_add = None
+
+    collection = vectors.get_collection()
+    real_get = collection.get
+
+    def slow_get(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        _time.sleep(0.3)  # keep the rebuild busy long enough for a writer to arrive
+        return real_get(*args, **kwargs)
+
+    collection.get = slow_get  # type: ignore[method-assign]
+    order: list[str] = []
+
+    def rebuild() -> None:
+        vectors.rebuild_collection()
+        order.append("rebuild done")
+        finished.set()
+
+    thread = threading.Thread(target=rebuild)
+    thread.start()
+    assert started.wait(10)
+    rng = random.Random(5)
+    meta = vectors.chunk_metadata(
+        document_id="late", document_name="x", department="", document_type="",
+        creation_date=date(2026, 1, 1), creation_date_int=20260101, access_level="Internal",
+        page_number=1, page_end=1, section_title="",
+    )  # fmt: skip
+    vectors.upsert(["late_chunk_0000"], [unit(rng)], ["late"], [meta])  # blocks until the swap
+    order.append("upsert done")
+    thread.join(20)
+    assert order == ["rebuild done", "upsert done"]
+    assert real_add is None and "late_chunk_0000" in vectors.all_ids()  # not lost in the copy
+    assert vectors.count() == 21

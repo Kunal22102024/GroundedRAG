@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
@@ -81,11 +82,28 @@ def submit(document_id: uuid.UUID) -> None:
     _executor.submit(_run_safely, document_id)
 
 
+def _trace(exc: BaseException) -> str:
+    """Where an exception happened (file:line:function, innermost first) without its message.
+
+    Library error messages can quote the text being processed, and rule 21 says document text is
+    never logged; the call sites are enough to debug from.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)[-6:]
+    return " <- ".join(f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in reversed(frames))
+
+
 def _run_safely(document_id: uuid.UUID) -> None:
     try:
         ingest_document(document_id)
-    except Exception:  # last resort: a worker thread must never die silently
-        logger.exception("unexpected ingestion error", extra={"document_id": str(document_id)})
+    except Exception as exc:  # last resort: a worker thread must never die silently
+        logger.error(
+            "unexpected ingestion error",
+            extra={
+                "document_id": str(document_id),
+                "error": type(exc).__name__,
+                "trace": _trace(exc),
+            },
+        )
 
 
 # --- Helpers ---------------------------------------------------------------------------------
@@ -168,6 +186,11 @@ def _ingest(document_id: uuid.UUID) -> None:
         stage = time.perf_counter()
         parsed = parsers.parse_document(path, extension)
         timings["parse_ms"] = _ms(stage)
+        if sum(len(segment.text) for segment in parsed.segments) > settings.max_document_chars:
+            raise parsers.ParseError(
+                f"The document has more than {settings.max_document_chars:,} characters of text, "
+                "which is more than can be indexed. Split it into smaller files."
+            )
 
         stage = time.perf_counter()
         drafts = StructureAwareChunker(
@@ -205,7 +228,7 @@ def _ingest(document_id: uuid.UUID) -> None:
                     creation_date_int=resolved.creation_date_int,
                     access_level=resolved.access_level,
                 ),
-                d.content,
+                bm25.keyword_text(d.section_title, d.content),
             )
             for d in drafts
         )
@@ -299,12 +322,10 @@ def _fail(document_id: uuid.UUID, exc: BaseException, sessions: sessionmaker[Ses
     expected = isinstance(
         exc, (parsers.ParseError, embeddings.EmbeddingError, vectorstore.VectorStoreError)
     )
-    logger.log(
-        logging.WARNING if expected else logging.ERROR,
-        "ingestion failed",
-        extra={"document_id": str(document_id), "error": type(exc).__name__},
-        exc_info=None if expected else exc,
-    )
+    extra = {"document_id": str(document_id), "error": type(exc).__name__}
+    if not expected:
+        extra["trace"] = _trace(exc)
+    logger.log(logging.WARNING if expected else logging.ERROR, "ingestion failed", extra=extra)
     cleanup_document(document_id, sessions)
     with sessions() as db:
         db.execute(

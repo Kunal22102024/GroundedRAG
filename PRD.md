@@ -2,7 +2,7 @@
 
 **Product Name:** GroundedRAG — Enterprise Internal Knowledge Engine
 
-**Document Version:** 1.1
+**Document Version:** 1.2
 
 **Target Release:** Q4 2026
 
@@ -53,7 +53,7 @@ In one line: a "Google Search + ChatGPT" for a company's internal files, giving 
 * **Natural Language Query Bar:** Accepts conversational queries, exact error codes, or technical terms.
 * **Conversational Follow-ups:** Follow-up questions (e.g., "what about for contractors?") are understood in the context of the conversation.
 * **Pre-Retrieval Metadata Filters:** Side drawer or header dropdowns allowing users to narrow searches by:
-  * **Department:** `[All, HR, Engineering, Legal, Operations]`
+  * **Department:** `[All, HR, Engineering, Legal, Operations, IT]`
   * **Document Type:** `[Policy, Manual, Technical Spec, Contract]`
   * **Date Range:** Filter documents created or updated within specific timeframes.
   * **Specific Documents:** Restrict a question to chosen files.
@@ -63,7 +63,7 @@ In one line: a "Google Search + ChatGPT" for a company's internal files, giving 
 
 * **Inline Citation Tags:** Every assertion made in the generated answer includes a clickable tag (e.g., `[IT_Security_Policy.pdf • Page 14]`).
 * **Source Preview Drawer:** Clicking a citation opens a side panel displaying the exact text chunk extracted from the original file, and the original document opened at that page, for verification.
-* **Out-of-Scope Graceful Handling:** If the retrieved documents do not contain enough information to answer with confidence (top-chunk relevance score below the configured threshold, default **0.45** on a 0–1 cosine-similarity scale), the system explicitly states that the information was not found rather than guessing.
+* **Out-of-Scope Graceful Handling:** If the retrieved documents do not contain enough information to answer with confidence (top-chunk relevance score below the configured threshold, default **0.60** on a 0–1 cosine-similarity scale, calibrated for `gemini-embedding-001`; see TDD 6.3), the system explicitly states that the information was not found rather than guessing.
 
 ### 4.4 Access Control
 
@@ -111,7 +111,7 @@ In one line: a "Google Search + ChatGPT" for a company's internal files, giving 
 
 ### Functional Requirements
 
-1. **Document Ingestion:** The system must process and index uploaded files within 30 seconds for files up to 50 pages.
+1. **Document Ingestion:** The system must process and index uploaded files within 30 seconds for files up to 50 pages. *(Measured: not reachable on a free-tier Gemini key, which allows about 100 embedding requests per minute, so indexing runs at roughly 90 chunks a minute; a billing-enabled key meets it. See TDD 12.)*
 2. **Citation Accuracy:** 100% of generated claims must map to at least one valid retrieved source chunk.
 3. **Filtering:** Applying a metadata filter must strictly exclude any document outside the selected metadata criteria prior to answer generation.
 4. **Access Enforcement:** A user must never receive content from a document above their access level.
@@ -119,7 +119,7 @@ In one line: a "Google Search + ChatGPT" for a company's internal files, giving 
 
 ### Non-Functional Requirements
 
-* **Response Latency:** End-to-end query response time must be under **3.5 seconds** (p95 latency).
+* **Response Latency:** End-to-end query response time must be under **3.5 seconds** (p95 latency). *(Measured with `gemini-3.8-flash`: 2.9 to 7.4 s; a refusal below the threshold takes about 0.6 s because no model is called. See TDD 12.)*
 * **Usability:** Zero training required for end-users; the interface follows standard search engine / chat conventions.
 * **Security & Privacy:** Documents are processed in isolated workspaces; raw files and embeddings are restricted based on user access roles.
 * **Durability:** Documents, users, and conversations persist across restarts.
@@ -148,4 +148,5 @@ In one line: a "Google Search + ChatGPT" for a company's internal files, giving 
 
 ## Changelog
 
+* **1.2:** Brought the numbers in line with what was built and measured: the refusal threshold default is **0.60** (the 0.45 below was calibrated for no model and would never refuse with `gemini-embedding-001`; TDD 6.3), IT is a department, and the ingestion and latency requirements carry their measured status. Behavior added by the audit pass that users can see: signup can be closed, saved citations to deleted or no-longer-readable documents show as unavailable, and uploads and sign-in attempts are rate limited.
 * **1.1:** Unified the refusal threshold at 0.45 on a cosine-similarity scale (previously 0.45 here and 0.35 in the TDD on an RRF score). Added access control, document deletion, follow-up questions, and the scanned-PDF out-of-scope note.

@@ -80,10 +80,21 @@ _ABBREVIATIONS = frozenset(
 )
 
 
-def _ends_with_abbreviation(candidate: str) -> bool:
-    if _LIST_MARKER_ONLY.match(candidate):
+# Longer than any abbreviation above, so only the end of a candidate ever has to be looked at.
+_ABBREVIATION_WINDOW = 16
+_LIST_MARKER_MAX_CHARS = 12
+
+
+def _ends_with_abbreviation(text: str, start: int, end: int) -> bool:
+    """True if ``text[start:end]`` ends in an abbreviation or is only a list number ("3.").
+
+    Reads a fixed-size window instead of the whole candidate, so the cost does not grow with the
+    length of text in which every boundary is skipped ("A. A. A. ...").
+    """
+    if end - start <= _LIST_MARKER_MAX_CHARS and _LIST_MARKER_ONLY.match(text[start:end]):
         return True
-    last = re.split(r"\s+", candidate.rstrip())[-1].rstrip(".!?\"')]").lower()
+    words = text[max(start, end - _ABBREVIATION_WINDOW) : end].split()
+    last = words[-1].rstrip(".!?\"')]").lower() if words else ""
     return last in _ABBREVIATIONS or (len(last) == 1 and last.isalpha())  # "J. Smith"
 
 
@@ -92,10 +103,9 @@ def split_sentences(text: str) -> list[str]:
     sentences: list[str] = []
     start = 0
     for match in _SENTENCE_BOUNDARY.finditer(text):
-        candidate = text[start : match.end(1)]
-        if _ends_with_abbreviation(candidate):
+        if _ends_with_abbreviation(text, start, match.end(1)):
             continue
-        sentences.append(candidate.strip())
+        sentences.append(text[start : match.end(1)].strip())
         start = match.end()
     tail = text[start:].strip()
     if tail:
@@ -106,15 +116,22 @@ def split_sentences(text: str) -> list[str]:
 def _split_long(text: str, limit: int) -> list[str]:
     """Cut text that is longer than ``limit`` at word boundaries (hard cut as a last resort)."""
     parts: list[str] = []
-    while len(text) > limit:
-        cut = max(text.rfind(" ", 0, limit + 1), text.rfind("\n", 0, limit + 1))
-        if cut < limit // 2:  # no usable whitespace: a single enormous token
-            cut = limit
-        parts.append(text[:cut].strip())
-        text = text[cut:].strip()
-    if text:
-        parts.append(text)
-    return [p for p in parts if p]
+    position, end = 0, len(text)
+    while end - position > limit:
+        window_end = position + limit + 1
+        cut = max(text.rfind(" ", position, window_end), text.rfind("\n", position, window_end))
+        if cut - position < limit // 2:  # no usable whitespace: a single enormous token
+            cut = position + limit
+        part = text[position:cut].strip()
+        if part:
+            parts.append(part)
+        position = cut
+        while position < end and text[position].isspace():
+            position += 1
+    rest = text[position:].strip()
+    if rest:
+        parts.append(rest)
+    return parts
 
 
 # --- Packing ------------------------------------------------------------------------
@@ -156,7 +173,8 @@ class StructureAwareChunker:
         self.target = target_chars
         self.overlap = overlap_chars
         self.overlap_cap = int(overlap_chars * 1.5)
-        if self.target + self.overlap_cap > CHUNK_HARD_MAX_CHARS:
+        # The longest chunk is the overlap, one separator, then a piece of at most the target.
+        if self.target + self.overlap_cap + 1 > CHUNK_HARD_MAX_CHARS:
             raise ValueError("chunk size would exceed CHUNK_HARD_MAX_CHARS")
 
     def chunk(self, segments: Sequence[Segment]) -> list[ChunkDraft]:
@@ -245,6 +263,7 @@ class StructureAwareChunker:
         for content, first, last, section in merged:
             if sum(ch.isalnum() for ch in content) < 3:
                 continue  # stray punctuation or a lone page marker
-            assert len(content) <= CHUNK_HARD_MAX_CHARS, "chunk exceeds the embedding-safe ceiling"
+            if len(content) > CHUNK_HARD_MAX_CHARS:  # not an assert: `python -O` would drop it
+                raise ValueError("chunk exceeds the embedding-safe ceiling")
             result.append(ChunkDraft(len(result), content, first, last, section))
         return result

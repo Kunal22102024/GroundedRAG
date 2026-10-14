@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -552,3 +554,122 @@ def test_extension_matching_is_case_insensitive(tmp_path: Path) -> None:
 def test_clean_text_normalizes_ligatures_invisible_and_control_characters() -> None:
     dirty = "oﬃce­  work​flow\x07  tab\there"
     assert parsers.clean_text(dirty) == "office workflow tab here"
+
+
+# --- Hostile input: parsing time grows with the length, not with its square ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[" * 200_000,
+        "![" * 100_000,
+        "[a](" * 50_000,
+        "](" * 200_000,
+        "<!--" * 100_000,
+        "# a" + " " * 100_000 + "b",
+        "# " + "# " * 50_000,
+    ],
+    ids=["brackets", "images", "links", "link_openers", "comments", "padded_heading", "hashes"],
+)
+def test_markdown_parses_hostile_input_in_linear_time(tmp_path: Path, text: str) -> None:
+    """Each of these took 8 s to 50 s or more per 200 KB with the old regular expressions."""
+    path = write(tmp_path, "h.md", text)
+    start = time.perf_counter()
+    with contextlib.suppress(EmptyDocumentError):  # e.g. a document that is only a heading
+        parse_document(path, ".md")
+    assert time.perf_counter() - start < 3.0
+
+
+def test_text_with_hundreds_of_thousands_of_short_lines_parses_quickly(tmp_path: Path) -> None:
+    path = write(tmp_path, "l.txt", "\n".join(["word"] * 400_000))
+    start = time.perf_counter()
+    parse_document(path, ".txt")
+    assert time.perf_counter() - start < 3.0
+
+
+def test_wrapped_lines_are_joined_and_hyphenation_is_repaired() -> None:
+    join = parsers._join_wrapped
+    assert join(["alpha", "  beta ", "", "gamma"]) == "alpha beta gamma"
+    assert join(["an exam-", "ple of it"]) == "an example of it"
+    assert join(["keep a dash -", "after a space"]) == "keep a dash - after a space"
+    assert join(["Upper-", "Case stays"]) == "Upper- Case stays"
+    assert join([]) == ""
+
+
+def test_markdown_links_images_and_comments_are_flattened(tmp_path: Path) -> None:
+    md = (
+        'Read [the guide](https://x.io/g "Title") and ![logo](logo.png) now.\n\n'
+        "[a](u)![b](v)[c](w)\n\n"
+        "A [plain] (bracket) stays, and so does [unfinished](\n\n"
+        "Before <!-- hidden --> after <!-- never closed\n"
+    )
+    doc = parse_document(write(tmp_path, "l.md", md), ".md")
+    assert [s.text for s in doc.segments] == [
+        "Read the guide (https://x.io/g) and logo now.",
+        "a (u)bc (w)",
+        "A [plain] (bracket) stays, and so does [unfinished](",
+        "Before after <!-- never closed",
+    ]
+
+
+def test_an_image_with_an_embedded_data_uri_is_dropped_whatever_its_size(tmp_path: Path) -> None:
+    md = f"Chart: ![sales](data:image/png;base64,{'A' * 300_000}) ends here.\n"
+    text = parse_document(write(tmp_path, "d.md", md), ".md").segments[0].text
+    assert text == "Chart: sales ends here."
+
+
+def test_a_lone_identifier_line_in_a_text_file_is_content_not_a_heading(tmp_path: Path) -> None:
+    text = "OVERVIEW\n\nERR_404_NET\n\nSECTION 3\n\nBody under section three is here.\n"
+    doc = parse_document(write(tmp_path, "i.txt", text), ".txt")
+    pairs = [(s.section, s.text) for s in doc.segments]
+    assert ("OVERVIEW", "ERR_404_NET") in pairs
+    assert ("SECTION 3", "Body under section three is here.") in pairs
+
+
+# --- DOCX content controls ---------------------------------------------------------------------------------
+
+
+def _docx_with_content_controls(tmp_path: Path) -> Path:
+    import docx
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls
+
+    document = docx.Document()
+    document.add_heading("Leave Policy", level=1)
+    document.add_paragraph("Ordinary paragraph before the controls.")
+    body = document.element.body
+    sectpr = body[-1]  # the section properties stay last
+
+    block = parse_xml(
+        f"<w:sdt {nsdecls('w')}><w:sdtPr/><w:sdtContent>"
+        "<w:p><w:r><w:t>Paragraph inside a content control.</w:t></w:r></w:p>"
+        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Grade</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>Band</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+        "</w:sdtContent></w:sdt>"
+    )
+    nested = parse_xml(
+        f"<w:sdt {nsdecls('w')}><w:sdtContent><w:sdt><w:sdtContent>"
+        "<w:p><w:r><w:t>Nested control text.</w:t></w:r></w:p>"
+        "</w:sdtContent></w:sdt></w:sdtContent></w:sdt>"
+    )
+    inline = parse_xml(
+        f"<w:p {nsdecls('w')}><w:r><w:t xml:space='preserve'>Employee: </w:t></w:r>"
+        "<w:sdt><w:sdtContent><w:r><w:t>Ada Lovelace</w:t></w:r></w:sdtContent></w:sdt>"
+        "<w:r><w:t xml:space='preserve'> is entitled to 25 days.</w:t></w:r></w:p>"
+    )
+    for element in (block, nested, inline):
+        sectpr.addprevious(element)
+    path = tmp_path / "controls.docx"
+    document.save(str(path))
+    return path
+
+
+def test_docx_text_inside_content_controls_is_not_dropped(tmp_path: Path) -> None:
+    doc = parse_document(_docx_with_content_controls(tmp_path), ".docx")
+    pairs = [(s.section, s.text) for s in doc.segments]
+    assert ("Leave Policy", "Ordinary paragraph before the controls.") in pairs
+    assert ("Leave Policy", "Paragraph inside a content control.") in pairs
+    assert ("Leave Policy", "Grade | Band") in pairs, "a table inside a content control"
+    assert ("Leave Policy", "Nested control text.") in pairs
+    assert ("Leave Policy", "Employee: Ada Lovelace is entitled to 25 days.") in pairs

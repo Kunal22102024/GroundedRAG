@@ -48,6 +48,11 @@ def get_current_user(
     user = auth_service.get_user(db, user_id)
     if user is None:  # account deleted since the token was issued
         raise _unauthorized("Invalid or expired token")
+    # The request's session would otherwise keep this read transaction, and one pooled connection,
+    # open until the response is finished: for a streamed answer, the whole generation. The user
+    # is detached with its columns loaded; handlers only read ``id``, ``role`` and ``email``.
+    db.expunge(user)
+    db.rollback()
     return user
 
 

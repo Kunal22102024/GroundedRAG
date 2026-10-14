@@ -30,12 +30,14 @@ from app.services.document_service import (
     DocumentNotFound,
     IncomingFile,
     InvalidMetadata,
+    TooManyFiles,
     UploadForbidden,
 )
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 _PDF = "application/pdf"
+_NO_NUL = r"^[^\x00]*$"  # PostgreSQL text cannot hold a NUL character
 
 
 def _not_found() -> HTTPException:
@@ -83,6 +85,8 @@ def upload_documents(
         )
     except InvalidMetadata as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from None
+    except TooManyFiles as exc:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc)) from None
     except UploadForbidden as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from None
 
@@ -104,11 +108,13 @@ def upload_documents(
 def list_documents(
     user: CurrentUser,
     db: DbSession,
-    department: str | None = None,
-    document_type: str | None = None,
+    department: Annotated[str | None, Query(max_length=100, pattern=_NO_NUL)] = None,
+    document_type: Annotated[str | None, Query(max_length=100, pattern=_NO_NUL)] = None,
     status_filter: Annotated[DocumentStatus | None, Query(alias="status")] = None,
     access_level: AccessLevel | None = None,
-    q: Annotated[str | None, Query(description="Part of the file name", max_length=200)] = None,
+    q: Annotated[
+        str | None, Query(description="Part of the file name", max_length=200, pattern=_NO_NUL)
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> DocumentListResponse:

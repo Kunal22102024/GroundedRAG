@@ -39,6 +39,7 @@ def get_conversation(
     except service.NotFound:
         raise _not_found() from None
     ratings = service.ratings_for(db, user, conversation.messages)
+    citations = service.readable_citations(db, user, conversation.messages)
     return ConversationDetail(
         id=conversation.id,
         title=conversation.title,
@@ -50,7 +51,7 @@ def get_conversation(
                 id=m.id,
                 role=m.role,
                 content=m.content,
-                citations=m.citations,
+                citations=citations[m.id],
                 guard_score=m.guard_score,
                 flagged=m.flagged,
                 created_at=m.created_at,

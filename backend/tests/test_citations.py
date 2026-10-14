@@ -56,13 +56,66 @@ def test_a_marker_cut_off_by_the_token_limit_is_dropped() -> None:
     assert feed_all("The limit is 3 attempts [1", 2)[0] == "The limit is 3 attempts "
 
 
-def test_tidy_up_after_removed_markers() -> None:
-    assert guard.filter_citations("Done [9] . Next  point [8].", 2)[0] == "Done. Next point."
+def test_a_removed_marker_takes_the_space_before_it_and_nothing_else() -> None:
+    assert guard.filter_citations("Done [9]. Next point [8].", 2)[0] == "Done. Next point."
+    assert guard.filter_citations("A [7] B [8] C", 2)[0] == "A B C"
+    assert guard.filter_citations("A [7] [8] B", 2)[0] == "A B"
+    assert (
+        guard.filter_citations("Leave is 25 days[9], then more.", 2)[0]
+        == "Leave is 25 days, then more."
+    )
+
+
+def test_the_answer_text_is_otherwise_left_exactly_as_written() -> None:
+    """Whitespace before punctuation is the author's, not a gap left by a removed marker."""
+    text = "Store secrets in a .env file, use the .NET runtime, and open :8080 [1]."
+    assert guard.filter_citations(text, 1) == (text, [1], 0)
+    spaced = "Run it  twice : once , then again [1]."
+    assert guard.filter_citations(spaced, 1)[0] == spaced
+
+
+@pytest.mark.parametrize(
+    "text", ["Pattern [0-9][0-9] here.", "In [2023-2025] sales grew.", "See [1-20]."]
+)
+def test_a_dash_between_numbers_is_a_citation_only_between_real_sources(text: str) -> None:
+    shown, cited, invalid = feed_all(text, 5)
+    assert (shown, cited, invalid) == (text, [], 0)
+
+
+def test_a_range_between_real_sources_is_expanded() -> None:
+    assert feed_all("Fact [1-3].", 3) == ("Fact [1][2][3].", [1, 2, 3], 0)
+    assert feed_all("Fact [3-1].", 3)[0] == "Fact [3-1]."  # backwards: not a citation
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Use `args[0]` or `x[7]` here.",
+        "```python\nvalue = items[9]\n```\nDone [1].",
+        "Use ``a[5]`` here.",
+    ],
+)
+def test_brackets_inside_code_are_not_citations(text: str) -> None:
+    shown, cited, invalid = feed_all(text, 2)
+    assert shown == text and invalid == 0 and cited == ([1] if "Done [1]" in text else [])
+
+
+def test_inline_code_ends_at_the_line_break_so_a_stray_backtick_cannot_hide_a_bad_marker() -> None:
+    shown, _, invalid = feed_all("It`s odd.\nNext line cites [9].", 2)
+    assert "[9]" not in shown and invalid == 1
+
+
+@pytest.mark.parametrize("piece", [1, 2, 3, 7])
+def test_code_and_spacing_are_the_same_when_the_stream_is_split_anywhere(piece: int) -> None:
+    text = "Run `args[0]` now [9]. Then:\n```\nx[1]\n```\nDone [1] and [2, 9]."
+    assert feed_all(text, 2, piece) == feed_all(text, 2)
 
 
 def test_refusal_sentence_is_recognised_even_when_quoted_or_cited() -> None:
     assert guard.is_refusal(REFUSAL_MESSAGE)
     assert guard.is_refusal(f'"{REFUSAL_MESSAGE}" [1]')
+    assert guard.is_refusal(f"**{REFUSAL_MESSAGE}**")
+    assert guard.is_refusal(f"_{REFUSAL_MESSAGE[:-1]}_.")
     assert not guard.is_refusal("Leave is 25 days [1].")
 
 
@@ -171,3 +224,23 @@ def test_an_empty_response_is_an_error(fake_llm: FakeChatModel) -> None:
     with pytest.raises(llm.LlmError) as caught:
         run()
     assert caught.value.code == "empty"
+
+
+@pytest.mark.parametrize("reply", ["[7]", "   \n ", "[7] [8]"])
+def test_an_answer_with_nothing_left_to_show_is_an_error_not_a_blank_message(
+    fake_llm: FakeChatModel, reply: str
+) -> None:
+    """Rule 19: the model wrote only whitespace or markers that were removed (twice)."""
+    fake_llm.reply(reply).reply(reply)
+    with pytest.raises(llm.LlmError) as caught:
+        run()
+    assert caught.value.code == "empty"
+    assert len(fake_llm.calls) == 2  # it was retried once before giving up
+
+
+def test_a_blank_first_attempt_is_retried_and_a_good_second_one_wins(
+    fake_llm: FakeChatModel,
+) -> None:
+    fake_llm.reply("[7]").reply("Leave is 25 days [1].")
+    result = run()[-1]
+    assert result.text == "Leave is 25 days [1]." and result.retried

@@ -158,3 +158,47 @@ def test_verify_index_command_line(vectors: Any, capsys: pytest.CaptureFixture[s
     fill(vectors, 12)
     assert maintenance.main(["verify-index"]) == 0
     assert "12 vectors checked, 0 repaired" in capsys.readouterr().out
+
+
+# --- Rule 14 and deletions during a run ------------------------------------------------------------------------
+
+
+def test_reembed_proves_every_written_vector_is_searchable(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed(db, chunks=4)
+    checked: list[str] = []
+    real = vectorstore.ensure_reachable
+
+    def spy(ids: Any) -> int:
+        checked.extend(ids)
+        return real(ids)
+
+    monkeypatch.setattr(vectorstore, "ensure_reachable", spy)
+    maintenance.reembed()
+    assert sorted(checked) == sorted(vectorstore.all_ids()) and len(checked) == 4
+
+
+def test_a_document_deleted_while_its_batch_is_embedded_gets_no_vectors_back(
+    db: Session, monkeypatch: pytest.MonkeyPatch, fake_embeddings: FakeEmbeddings
+) -> None:
+    from sqlalchemy import delete
+
+    from app.db.database import get_sessionmaker
+
+    keep = seed(db, chunks=2, name="keep.pdf")
+    gone = seed(db, chunks=2, name="gone.pdf")
+    real = fake_embeddings.embed_documents
+
+    def delete_meanwhile(texts: list[str]) -> list[list[float]]:
+        out = real(texts)
+        with get_sessionmaker()() as other:  # a user deletes the document while it is embedded
+            other.execute(delete(Document).where(Document.id == gone.id))
+            other.commit()
+        return out
+
+    monkeypatch.setattr(embeddings, "embed_documents", delete_meanwhile)
+    embedded, _ = maintenance.reembed()
+    stored = vectorstore.all_ids()
+    assert embedded == 2 and len(stored) == 2
+    assert all(chunk_id.startswith(str(keep.id)) for chunk_id in stored)

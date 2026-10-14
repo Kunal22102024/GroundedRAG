@@ -87,7 +87,15 @@ def test_overlap_must_be_smaller_than_target(clean_env: pytest.MonkeyPatch) -> N
 
 @pytest.mark.parametrize(
     ("target", "overlap", "ok"),
-    [("1200", "200", True), ("1400", "200", False), ("1500", "0", True), ("1600", "0", False)],
+    # The longest chunk is target + 1.5 x overlap + one separator character.
+    [
+        ("1199", "200", True),
+        ("1200", "200", False),
+        ("1400", "200", False),
+        ("1499", "0", True),
+        ("1500", "0", False),
+        ("1600", "0", False),
+    ],
 )
 def test_chunk_size_plus_overlap_must_stay_under_the_embedding_safe_ceiling(
     clean_env: pytest.MonkeyPatch, target: str, overlap: str, ok: bool
@@ -133,3 +141,42 @@ def test_secrets_are_masked_in_repr(clean_env: pytest.MonkeyPatch) -> None:
 def test_max_upload_bytes(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("MAX_UPLOAD_MB", "2")
     assert make().max_upload_bytes == 2 * 1024 * 1024
+
+
+def test_database_password_is_not_in_the_repr(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("DATABASE_URL", "postgresql+psycopg://user:hunter2-pass@db:5432/x")
+    assert "hunter2-pass" not in repr(make())
+
+
+def test_reranking_cannot_be_switched_on_until_it_exists(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("RERANK_ENABLED", "true")
+    with pytest.raises(ValidationError, match="RERANK_ENABLED=true is not supported"):
+        make()
+
+
+def test_top_k_cannot_exceed_the_candidate_pool(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("RETRIEVAL_CANDIDATES", "5")
+    clean_env.setenv("RETRIEVAL_TOP_K", "6")
+    with pytest.raises(ValidationError, match="RETRIEVAL_TOP_K"):
+        make()
+
+
+def test_hardening_defaults(clean_env: pytest.MonkeyPatch) -> None:
+    settings = make()
+    assert settings.lexical_override_margin == 0.15
+    assert settings.signup_enabled is True
+    assert settings.max_files_per_request == 20
+    assert settings.max_document_chars == 5_000_000
+    assert settings.embedding_texts_per_minute == 90
+    assert (settings.db_pool_size, settings.db_max_overflow, settings.db_pool_timeout_seconds) == (
+        10,
+        10,
+        30.0,
+    )
+
+
+@pytest.mark.parametrize("minutes", ["0", "10081"])
+def test_token_lifetime_is_bounded(clean_env: pytest.MonkeyPatch, minutes: str) -> None:
+    clean_env.setenv("JWT_EXPIRE_MINUTES", minutes)
+    with pytest.raises(ValidationError, match="jwt_expire_minutes"):
+        make()

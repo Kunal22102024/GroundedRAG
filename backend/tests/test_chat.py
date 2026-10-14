@@ -182,8 +182,9 @@ def test_an_awkwardly_phrased_exact_token_question_is_not_refused(
     fake_llm: FakeChatModel,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A threshold nothing can reach: only the override can let a question through.
+    # A threshold nothing can reach and no floor below it: only the override can let it through.
     monkeypatch.setattr(get_settings(), "relevance_threshold", 0.99)
+    monkeypatch.setattr(get_settings(), "lexical_override_margin", 1.0)
     fake_llm.reply("It means the upstream service could not be reached [1].")
     events = ask(client, admin, "so um whatever, ERR_404_NET?? keeps popping up, any idea lol")
 
@@ -201,8 +202,24 @@ def test_an_unknown_token_is_still_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(get_settings(), "relevance_threshold", 0.99)
+    monkeypatch.setattr(get_settings(), "lexical_override_margin", 1.0)
     events = ask(client, admin, "what does ERR_999_XYZ mean?")
     assert answer_text(events) == REFUSAL_MESSAGE and len(fake_llm.calls) == 0
+
+
+def test_the_override_cannot_rescue_a_question_far_below_the_threshold(
+    client: TestClient,
+    admin: Headers,
+    library: dict,
+    fake_llm: FakeChatModel,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact token is in the best keyword hit, but the question is nowhere near the threshold."""
+    monkeypatch.setattr(get_settings(), "relevance_threshold", 0.99)  # default margin 0.15
+    events = ask(client, admin, "so um whatever, ERR_404_NET?? keeps popping up, any idea lol")
+    done = of(events, "done")[0]
+    assert done["refused"] and done["guard"]["reason"] == "below_threshold"
+    assert len(fake_llm.calls) == 0
 
 
 # --- Access control: both channels ----------------------------------------------------------------------
@@ -230,6 +247,7 @@ def test_the_keyword_channel_cannot_leak_a_restricted_exact_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(get_settings(), "relevance_threshold", 0.99)  # only the override could pass
+    monkeypatch.setattr(get_settings(), "lexical_override_margin", 1.0)
     events = ask(client, user, "SALARY_X9")
     assert answer_text(events) == REFUSAL_MESSAGE and len(fake_llm.calls) == 0
 

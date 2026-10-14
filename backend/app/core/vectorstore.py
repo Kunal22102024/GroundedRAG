@@ -19,6 +19,7 @@ version. It is enforced statically by ``tests/test_pinned_versions.py`` instead.
 from __future__ import annotations
 
 import contextlib
+import logging
 import random
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -34,6 +35,8 @@ from chromadb.config import Settings as ChromaSettings
 from app.config import get_settings
 
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 
 class VectorStoreError(Exception):
@@ -54,18 +57,40 @@ class DenseHit:
     metadata: dict[str, Any]
 
 
+_CONNECT_TIMEOUT_SECONDS = 5.0
+_REQUEST_TIMEOUT_SECONDS = 60.0
+
+
+def _apply_timeouts(client: ClientAPI) -> None:
+    """Give the client's HTTP session a timeout.
+
+    chromadb builds its ``httpx`` session with ``timeout=None`` and offers no setting for it, so a
+    Chroma server that accepts a connection and then stalls would block the one ingestion worker,
+    and every chat question, forever. The session is replaced on the (stable, public) ``timeout``
+    attribute; if a future chromadb moves the session, the client still works, without the limit.
+    """
+    session = getattr(getattr(client, "_server", None), "_session", None)
+    current = getattr(session, "timeout", None)
+    if current is None:
+        logger.warning("could not set a ChromaDB request timeout: client layout changed")
+        return
+    session.timeout = type(current)(_REQUEST_TIMEOUT_SECONDS, connect=_CONNECT_TIMEOUT_SECONDS)
+
+
 @lru_cache
 def get_client() -> ClientAPI:
     """Return the process-wide Chroma HTTP client (server mode, internal network)."""
     settings = get_settings()
     try:
-        return chromadb.HttpClient(
+        client = chromadb.HttpClient(
             host=settings.chroma_host,
             port=settings.chroma_port,
             settings=ChromaSettings(anonymized_telemetry=False),
         )
     except Exception as exc:  # the client raises a variety of transport errors
         raise VectorStoreError(f"cannot connect to ChromaDB: {type(exc).__name__}") from exc
+    _apply_timeouts(client)
+    return client
 
 
 def heartbeat() -> int:
@@ -164,6 +189,12 @@ def _call(operation: str, func: Callable[[], T]) -> T:
 
 # --- Writes ---------------------------------------------------------------------------------
 
+# Upserts, deletes, repairs and the collection rebuild all change the collection. A rebuild copies
+# the collection and swaps the copy in, so a write that lands during the copy is lost and a delete
+# is undone; every writer therefore takes this lock (re-entrant: a repair may call a rebuild).
+# It is never held while waiting for the embedding API, only around Chroma calls.
+_write_lock = threading.RLock()
+
 
 def chunk_metadata(
     *,
@@ -223,25 +254,27 @@ def upsert(
     if not ids:
         return
 
-    collection = get_collection()
-    batch = max(1, int(_call("batch size lookup", lambda: get_client().get_max_batch_size())))
-    for start in range(0, len(ids), batch):
-        end = start + batch
-        _call(
-            "upsert",
-            lambda s=start, e=end: collection.upsert(
-                ids=list(ids[s:e]),
-                embeddings=[list(v) for v in embeddings[s:e]],
-                documents=list(documents[s:e]),
-                metadatas=list(metadatas[s:e]),
-            ),
-        )
+    with _write_lock:
+        collection = get_collection()
+        batch = max(1, int(_call("batch size lookup", lambda: get_client().get_max_batch_size())))
+        for start in range(0, len(ids), batch):
+            end = start + batch
+            _call(
+                "upsert",
+                lambda s=start, e=end: collection.upsert(
+                    ids=list(ids[s:e]),
+                    embeddings=[list(v) for v in embeddings[s:e]],
+                    documents=list(documents[s:e]),
+                    metadatas=list(metadatas[s:e]),
+                ),
+            )
 
 
 def delete_document(document_id: str) -> None:
     """Remove every vector of one document. Safe to call when it has none."""
-    collection = get_collection()
-    _call("delete", lambda: collection.delete(where={"document_id": document_id}))
+    with _write_lock:
+        collection = get_collection()
+        _call("delete", lambda: collection.delete(where={"document_id": document_id}))
 
 
 # --- Index health ---------------------------------------------------------------------------------
@@ -281,12 +314,15 @@ def find_unreachable(
     """Stored vectors that their own embedding does not retrieve.
 
     Every stored vector is used as a query (batched): it must come back as the nearest hit, or an
-    identical twin at distance ~0 must. ``ids=None`` checks the whole collection.
+    identical twin at distance ~0 must. ``ids=None`` checks the whole collection. A requested id
+    that is not stored at all (a write that silently stored nothing) is reported too: it is just
+    as unsearchable as one the index cannot reach.
     """
     target = collection if collection is not None else get_collection()
     broken: list[str] = []
     for batch in _stored_id_batches(target, ids, _VERIFY_BATCH):
         got = _call("get", lambda b=batch: target.get(ids=b, include=["embeddings"]))
+        broken.extend(sorted(set(batch) - set(got["ids"])))
         if not len(got["ids"]):
             continue
         found = _call(
@@ -309,8 +345,15 @@ def rebuild_collection(page_size: int = 500) -> int:
     """Copy every stored vector into a fresh collection and swap it in. Returns the vector count.
 
     Needs no embedding calls: the vectors, texts and metadata are read back from Chroma. There is a
-    brief moment between dropping the old collection and renaming the new one when searches fail.
+    brief moment between dropping the old collection and renaming the new one when searches fail;
+    if the process dies in that moment, ``recover_interrupted_rebuild`` finishes the swap at the
+    next start. Other writers wait for the whole operation (``_write_lock``).
     """
+    with _write_lock:
+        return _rebuild_locked(page_size)
+
+
+def _rebuild_locked(page_size: int) -> int:
     name = get_settings().collection_name
     temporary = f"{name}__rebuild"
     client = get_client()
@@ -362,6 +405,42 @@ def rebuild_collection(page_size: int = 500) -> int:
     return copied
 
 
+def recover_interrupted_rebuild() -> str | None:
+    """Finish or discard a rebuild that a crash cut short. Returns what it did, or ``None``.
+
+    A rebuild builds ``<name>__rebuild``, verifies it, deletes ``<name>`` and renames the copy. Two
+    leftovers are possible, and the second one used to strand every vector:
+
+    * the copy exists beside a normal collection (died while copying): the copy is incomplete and
+      is discarded;
+    * the copy exists and the real collection is missing or smaller (died between the delete and
+      the rename, after the copy had been verified, or a restart then created an empty collection
+      under the real name): the copy is the only complete one and takes its place.
+
+    Must run before anything calls ``get_collection``, which would create an empty collection.
+    """
+    name = get_settings().collection_name
+    temporary = f"{name}__rebuild"
+    client = get_client()
+    with _write_lock:
+        existing = _call("list", lambda: {getattr(c, "name", c) for c in client.list_collections()})
+        if temporary not in existing:
+            return None
+        copy = _call("open", lambda: client.get_collection(temporary, embedding_function=None))
+        if name in existing:
+            main = _call("open", lambda: client.get_collection(name, embedding_function=None))
+            if int(copy.count()) <= int(main.count()):
+                _call("discard", lambda: client.delete_collection(temporary))
+                reset_collection_cache()
+                logger.warning("discarded an incomplete collection rebuild")
+                return "discarded"
+            _call("swap", lambda: client.delete_collection(name))
+        _call("swap", lambda: copy.modify(name=name))
+        reset_collection_cache()
+        logger.warning("completed a collection rebuild that was interrupted")
+        return "completed"
+
+
 def repair_unreachable(ids: Sequence[str]) -> int:
     """Make the given stored-but-unreachable vectors searchable again. Returns how many.
 
@@ -370,30 +449,38 @@ def repair_unreachable(ids: Sequence[str]) -> int:
     """
     if not ids:
         return 0
-    collection = get_collection()
-    for start in range(0, len(ids), _VERIFY_BATCH):
-        batch = list(ids[start : start + _VERIFY_BATCH])
-        rows = _call(
-            "get",
-            lambda b=batch: collection.get(ids=b, include=["embeddings", "documents", "metadatas"]),
-        )
-        if not len(rows["ids"]):
-            continue
-        _call("delete", lambda b=list(rows["ids"]): collection.delete(ids=b))
-        _call(
-            "upsert",
-            lambda r=rows: collection.upsert(
-                ids=list(r["ids"]),
-                embeddings=[list(e) for e in r["embeddings"]],
-                documents=list(r["documents"]),
-                metadatas=list(r["metadatas"]),
-            ),
-        )
-    if find_unreachable(ids):
-        rebuild_collection()
+    with _write_lock:
+        collection = get_collection()
+        stored: set[str] = set()
+        for start in range(0, len(ids), _VERIFY_BATCH):
+            batch = list(ids[start : start + _VERIFY_BATCH])
+            rows = _call(
+                "get",
+                lambda b=batch: collection.get(
+                    ids=b, include=["embeddings", "documents", "metadatas"]
+                ),
+            )
+            if not len(rows["ids"]):
+                continue
+            stored.update(rows["ids"])
+            _call("delete", lambda b=list(rows["ids"]): collection.delete(ids=b))
+            _call(
+                "upsert",
+                lambda r=rows: collection.upsert(
+                    ids=list(r["ids"]),
+                    embeddings=[list(e) for e in r["embeddings"]],
+                    documents=list(r["documents"]),
+                    metadatas=list(r["metadatas"]),
+                ),
+            )
+        absent = set(ids) - stored
+        if absent:  # nothing was stored under these ids, so there is nothing to re-insert
+            raise VectorStoreError(f"{len(absent)} vectors are missing from the index")
         if find_unreachable(ids):
-            raise VectorStoreError(f"{len(ids)} vectors could not be made searchable")
-    return len(ids)
+            rebuild_collection()
+            if find_unreachable(ids):
+                raise VectorStoreError(f"{len(ids)} vectors could not be made searchable")
+        return len(ids)
 
 
 def ensure_reachable(ids: Sequence[str]) -> int:
