@@ -7,11 +7,20 @@ export async function downloadOriginal(documentId: string, name: string): Promis
   const link = document.createElement("a");
   link.href = url;
   link.download = name;
+  document.body.appendChild(link); // Firefox ignores a click on an anchor that is not in the page
   link.click();
-  URL.revokeObjectURL(url);
+  link.remove();
+  // Revoking at once can cancel the download in Firefox and Safari; give the browser time to start it.
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
 export const isPdf = (name: string): boolean => name.toLowerCase().endsWith(".pdf");
+
+/** "Policy.PDF" -> "pdf" ("" when there is none). */
+export function fileExtension(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
 
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

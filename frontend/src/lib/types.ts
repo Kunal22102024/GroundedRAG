@@ -48,6 +48,8 @@ export interface Citation {
   page_end: number;
   section_title: string;
   text: string;
+  /** Set when the cited document was deleted or the reader may no longer see it. */
+  unavailable?: boolean;
 }
 
 export interface Message {
