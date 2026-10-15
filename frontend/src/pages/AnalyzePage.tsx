@@ -2,18 +2,20 @@ import { useCallback, useEffect, useState, type ComponentType } from "react";
 import { useSearchParams } from "react-router-dom";
 import CompareTab from "../components/analyze/CompareTab";
 import ExtractTab from "../components/analyze/ExtractTab";
+import GraphTab from "../components/analyze/GraphTab";
 import SummariesTab from "../components/analyze/SummariesTab";
 import SourceDrawer from "../components/source/SourceDrawer";
-import { ColumnsIcon, ListIcon, TableIcon } from "../components/ui/icons";
+import { ColumnsIcon, GraphIcon, ListIcon, TableIcon } from "../components/ui/icons";
 import { useIndexedDocuments } from "../hooks/useIndexedDocuments";
 import type { Citation } from "../lib/types";
 
-type TabId = "compare" | "extract" | "summaries";
+type TabId = "compare" | "extract" | "summaries" | "graph";
 
 const TABS: { id: TabId; label: string; blurb: string; Icon: ComponentType<{ size?: number }> }[] = [
   { id: "compare", label: "Compare", blurb: "Ask one question across 2 to 4 documents and read each document's answer side by side, with the points where they disagree.", Icon: ColumnsIcon },
   { id: "extract", label: "Extract", blurb: "Pull dates, parties, amounts, requirements or your own fields out of a document into a table you can download.", Icon: TableIcon },
   { id: "summaries", label: "Summaries", blurb: "An executive summary, chapter summaries, FAQ, glossary and key changes of a document, each with citations.", Icon: ListIcon },
+  { id: "graph", label: "Graph", blurb: "The people, policies, courses and concepts your documents talk about, and how they relate, including across documents. Every entity links back to the passages it comes from.", Icon: GraphIcon },
 ];
 
 const isTab = (value: string | null): value is TabId => TABS.some((t) => t.id === value);
@@ -51,7 +53,7 @@ export default function AnalyzePage() {
         <div className="mx-auto max-w-7xl space-y-6 px-4 py-6">
           <div className="space-y-3">
             <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Analyze</h1>
-            <div role="tablist" aria-label="Analysis" className="flex w-full gap-1 rounded-xl bg-slate-100 p-1 sm:w-fit">
+            <div role="tablist" aria-label="Analysis" className="flex w-full gap-1 overflow-x-auto rounded-xl bg-slate-100 p-1 sm:w-fit">
               {TABS.map(({ id, label, Icon }) => (
                 <button
                   key={id}
@@ -60,7 +62,7 @@ export default function AnalyzePage() {
                   aria-selected={tab === id}
                   aria-controls={`panel-${id}`}
                   onClick={() => update({ tab: id })}
-                  className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all sm:flex-none ${
+                  className={`flex min-w-fit flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-all sm:flex-none sm:px-4 ${
                     tab === id ? "bg-white text-indigo-700 shadow-sm" : "text-slate-600 hover:text-slate-900"
                   }`}
                 >
@@ -71,7 +73,7 @@ export default function AnalyzePage() {
             <p className="max-w-3xl text-sm text-slate-500">{active.blurb}</p>
           </div>
 
-          {/* All three stay mounted, so a comparison or an extraction in progress survives a look at another tab. */}
+          {/* All four stay mounted, so a comparison or an extraction in progress survives a look at another tab. */}
           <div role="tabpanel" id="panel-compare" aria-labelledby="tab-compare" hidden={tab !== "compare"}>
             <CompareTab onCite={setDrawer} />
           </div>
@@ -80,6 +82,9 @@ export default function AnalyzePage() {
           </div>
           <div role="tabpanel" id="panel-summaries" aria-labelledby="tab-summaries" hidden={tab !== "summaries"}>
             <SummariesTab documentId={documentId} onDocumentChange={(id) => update({ doc: id })} onCite={setDrawer} />
+          </div>
+          <div role="tabpanel" id="panel-graph" aria-labelledby="tab-graph" hidden={tab !== "graph"}>
+            <GraphTab documentId={documentId} onCite={setDrawer} />
           </div>
         </div>
       </div>

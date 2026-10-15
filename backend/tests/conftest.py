@@ -56,6 +56,9 @@ os.environ["FOLLOWUP_SUGGESTIONS"] = "false"
 # The saved-answer cache would answer a repeated question without calling the scripted model, which
 # changes call counts in every chat test; tests/test_semantic_cache.py switches it on.
 os.environ["SEMANTIC_CACHE"] = "false"
+# Building a graph after every upload would make model calls in every test that indexes a document;
+# tests/test_graph_api.py builds graphs on request (and switches the automatic build on for one test).
+os.environ["AUTO_KNOWLEDGE_GRAPH"] = "false"
 # A collection name no real deployment uses, unique per run, so tests never touch real vectors.
 os.environ["CHROMA_COLLECTION"] = f"test_{uuid.uuid4().hex[:8]}"
 

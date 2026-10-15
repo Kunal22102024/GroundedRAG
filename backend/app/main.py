@@ -21,6 +21,7 @@ from app.api import (
     chat,
     conversations,
     documents,
+    graph,
     health,
     metrics,
     suggestions,
@@ -85,6 +86,7 @@ def create_app() -> FastAPI:
     api_router.include_router(chat.router)
     api_router.include_router(conversations.router)
     api_router.include_router(analysis.router)
+    api_router.include_router(graph.router)
     api_router.include_router(suggestions.router)
     api_router.include_router(metrics.router)
     api_router.include_router(users.router)

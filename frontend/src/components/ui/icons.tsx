@@ -185,6 +185,14 @@ export const ClockIcon = (p: IconProps) => (
     <path d="M12 7v5l3 2" />
   </Icon>
 );
+export const GraphIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="6" cy="6" r="2.5" />
+    <circle cx="18" cy="8" r="2.5" />
+    <circle cx="12" cy="18" r="2.5" />
+    <path d="m8.3 7 7.4.6M7.2 8.2l3.6 7.6M16.8 10.2l-3.5 5.9" />
+  </Icon>
+);
 export const BoltIcon = (p: IconProps) => (
   <Icon {...p}>
     <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />

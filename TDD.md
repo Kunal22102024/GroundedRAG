@@ -239,8 +239,11 @@ queued ──► processing ──► indexed
 | `conversations` | id, user_id, title, created_at, updated_at |
 | `messages` | id, conversation_id, role, content, citations (JSON), conflicts (JSON, nullable), suggestions (JSON, nullable, §18), guard_score, timings (JSON), flagged, created_at |
 | `feedback` | id, message_id, user_id, rating (up/down), comment, created_at |
-| `query_events` | id, created_at, user_id (FK, `SET NULL`), kind (`chat`, `summary`, `extract`, `compare`, `suggest`), outcome (`answered`, `refused`, `failed`), source (`typed`, `suggestion`, `followup`), error_code, guard_reason, best/mean_similarity, retrieved, cited, cited_documents, cited_document_ids, citations_removed, uncited, retried, partial, rewritten, conflicts, suggestions, input/output/total_tokens, model, total_ms, timings (JSON), question, document_ids, conversation_id, message_id (no FK) (§17) |
-| `document_insights` | id, document_id (FK, cascade delete), kind (`executive`, `chapters`, `faq`, `glossary`, `key_changes`, `extraction`, `questions`), params_key, status (`pending`, `ready`, `failed`), content (JSON), error_message, model, created_at, updated_at; unique `(document_id, kind, params_key)` (§16) |
+| `query_events` | id, created_at, user_id (FK, `SET NULL`), kind (`chat`, `summary`, `extract`, `compare`, `suggest`, `graph`), outcome (`answered`, `refused`, `failed`), source (`typed`, `suggestion`, `followup`), error_code, guard_reason, best/mean_similarity, retrieved, cited, cited_documents, cited_document_ids, citations_removed, uncited, retried, partial, rewritten, conflicts, suggestions, input/output/total_tokens, model, total_ms, timings (JSON), question, document_ids, conversation_id, message_id (no FK) (§17) |
+| `document_insights` | id, document_id (FK, cascade delete), kind (`executive`, `chapters`, `faq`, `glossary`, `key_changes`, `extraction`, `questions`, `graph`), params_key, status (`pending`, `ready`, `failed`), content (JSON), error_message, model, created_at, updated_at; unique `(document_id, kind, params_key)` (§16). The `graph` row is only the build status and its figures (entities, relations, batches, coverage) |
+| `kg_entities` | id, document_id (FK, cascade delete), name, key (normalised name, indexed), type (`person`, `organization`, `role`, `concept`, `course`, `policy`, `process`, `product`, `location`, `event`, `other`), description, created_at; unique `(document_id, key)` (§20) |
+| `kg_mentions` | entity_id (FK `kg_entities`, cascade), chunk_id (FK `chunks`, cascade); primary key `(entity_id, chunk_id)`: the link from the graph back to the text |
+| `kg_relations` | id, document_id (FK, cascade), source_id and target_id (FK `kg_entities`, cascade, never equal), label (lower_snake_case), chunk_id (FK `chunks`, cascade: the evidence), quote; unique `(source_id, target_id, label, chunk_id)` |
 
 Schema conventions (implemented in `db/models.py`, migration `0001_initial_schema`):
 
@@ -412,6 +415,9 @@ All routes are under `/api` and require a JWT bearer token except signup, login,
 | `GET /documents/{id}/insights` | The saved summaries and extractions of a document (status, content, error), citations resolved against what the reader may still see. 404 for a document above the caller's level (§16) |
 | `POST /analysis/summary`, `POST /analysis/extract`, `POST /analysis/compare` | Server-Sent Events: document summaries, structured extraction, multi-document comparison (§16) |
 | `GET /suggestions?document_ids=` | Questions to offer before the first question: from the chosen documents (written once, `pending` while being written) and questions often asked (§18) |
+| `GET /graph?document_ids=&types=&q=` | The knowledge graph of the chosen documents (none: every one the caller may read): `{documents: [{id, name, status, entities, relations, coverage, error}], nodes, edges, total_nodes, truncated}`. Entities with the same normalised name in different documents are one node. 404 for a document above the caller's level or when `KNOWLEDGE_GRAPH=false` (§20) |
+| `GET /graph/entity?key=&document_ids=` | One entity: where it is mentioned (passages shaped like chat citations, so they open in the source drawer) and its relations with their evidence passages. 404 when no readable document holds it (§20) |
+| `POST /documents/{id}/graph` | Queue (re)building a document's graph. 202 `{status: "pending"}`; 404 above the caller's level, 409 while not indexed; a build already under way is not started twice (§20) |
 | `GET /users`, `PATCH /users/{id}`, `DELETE /users/{id}` | Account administration, **admins only** (§8): list with document and conversation counts, set the role, remove an account. 409 for the last administrator and for deleting yourself; 404 for an unknown id |
 | `GET /metrics/summary?days=&kind=`, `GET /metrics/events?outcome=&kind=&limit=&before=` | Evaluation dashboard, **admins only** (403 otherwise): aggregated figures, and failed / refused / flagged queries with their question (§17) |
 | `POST /messages/{id}/feedback` | Thumbs up/down |
@@ -419,14 +425,14 @@ All routes are under `/api` and require a JWT bearer token except signup, login,
 
 **`POST /chat`** takes `{question (1..2000 chars), conversation_id?, filters?: {department?, document_type?, date_from?, date_to?, document_ids?}}` and streams Server-Sent Events (`Cache-Control: no-cache`, `X-Accel-Buffering: no`). A conversation that is not the caller's is a 404 before the stream starts; everything that goes wrong afterwards is an `error` event, never a dropped connection.
 
-* `status`: `{stage}` is `searching`, `rewriting`, `generating`, `rate_limited` (with `retry_in` seconds), `retrying` (with `reset: true`: discard the text received so far) or `checking_sources` (the conflict check of §16, after the answer is complete).
+* `status`: `{stage}` is `searching`, `rewriting`, `cache_hit` (a saved answer follows in one `token` event, §19), `generating`, `rate_limited` (with `retry_in` seconds), `retrying` (with `reset: true`: discard the text received so far) or `checking_sources` (the conflict check of §16, after the answer is complete).
 * `token`: `{text}`: answer text that is safe to show; invalid citation markers were already removed.
 * `citations`: `{citations: [{n, chunk_id, document_id, document_name, page_number, page_end, section_title, text}]}`: only the sources the answer cites, `n` matching the `[n]` markers; empty for a refusal.
 * `conflicts`: `{conflicts: [{topic, claims: [{n, document_id, document_name, claim}]}]}`, sent after `citations` and only when the answer cites two or more different documents that contradict each other (§16); `n` is a citation number of this answer.
 * `suggestions`: `{suggestions: [{type, question, document_id}]}` with `type` `follow_up`, `sub_question` or `related`, sent before `done` for an answered (not refused) turn when `FOLLOWUP_SUGGESTIONS` is on (§18). The `status` stage `suggesting` precedes it when no conflict check runs.
 
 The request may carry `source`: `typed` (default), `suggestion` or `followup`, recorded for the dashboard.
-* `done`: `{conversation_id, message_id, answer (authoritative final text), refused, guard: {passed, reason, score, threshold}, timings, usage, flags}`. `guard.reason` is `relevant`, `lexical_override`, `below_threshold` or `no_candidates`. `timings` (ms): `rewrite_ms` (follow-ups only), `embed_ms`, `dense_ms`, `keyword_ms`, `fusion_ms`, `hydrate_ms`, `ttft_ms`, `generate_ms`, `total_ms` (the last three absent when the LLM was not called). `usage`: `input_tokens`, `output_tokens`, `total_tokens`, `reasoning_tokens`. `flags`: `partial` (cut off by `MAX_TOKENS`), `citations_removed`, `uncited`, `retried`, `rewritten`.
+* `done`: `{conversation_id, message_id, answer (authoritative final text), refused, guard: {passed, reason, score, threshold}, timings, usage, flags}`. `guard.reason` is `relevant`, `lexical_override`, `below_threshold` or `no_candidates`. `timings` (ms): `rewrite_ms` (follow-ups only), `embed_ms`, `dense_ms`, `keyword_ms`, `fusion_ms`, `hydrate_ms`, `ttft_ms`, `generate_ms`, `total_ms` (the last three absent when the LLM was not called). `usage`: `input_tokens`, `output_tokens`, `total_tokens`, `reasoning_tokens`. `flags`: `partial` (cut off by `MAX_TOKENS`), `citations_removed`, `uncited`, `retried`, `rewritten`. `cached`: true when the answer was served from the saved-answer cache (§19), in which case `usage` is empty and `timings` carries `cache: "hit"`, `cache_similarity` and `saved_tokens`. With the knowledge graph on, `timings` also has `graph_ms` and `graph_added` (passages the graph added, §20.5).
 * `error`: `{code, message, retry_after?}` with `code` one of `rate_limited`, `quota_exhausted`, `auth`, `not_configured`, `blocked` (safety), `empty`, `unavailable`, `index_unavailable`, `failed`, `internal`. Nothing is stored for a failed turn.
 
 ---
@@ -491,6 +497,17 @@ Both document chunks (for embedding) and retrieved context plus questions (for g
 | `COMPARE_MAX_DOCUMENTS` / `EXTRACTION_MAX_FIELDS` | `4` / `20` | Documents in one comparison (2 to 8); fields in one extraction (1 to 50) |
 | `FOLLOWUP_SUGGESTIONS` | `true` | One extra call after every answered chat turn for follow-up, sub- and related questions (§18) |
 | `SUGGESTIONS_PER_DOCUMENT` / `POPULAR_MIN_USERS` | `6` / `2` | Questions written per document; distinct users who must have asked a question before it is suggested to others (at least 2) |
+| `SEMANTIC_CACHE` | `true` | Reuse a clean, cited answer for a near-identical question in the same scope (§19); kept in memory |
+| `SEMANTIC_CACHE_THRESHOLD` | `0.95` | Minimum cosine similarity of the two standalone question vectors (0.85 to 1) |
+| `SEMANTIC_CACHE_TTL_SECONDS` / `SEMANTIC_CACHE_MAX_ENTRIES` | `86400` / `1000` | Age and size limits of the saved answers |
+| `KNOWLEDGE_GRAPH` | `true` | The knowledge graph (§20): building, the Graph tab and its routes |
+| `AUTO_KNOWLEDGE_GRAPH` | `true` | Build a document's graph right after it is indexed (about one model call per `KG_BATCH_CHARS`); `false`: only on request |
+| `KG_BATCH_CHARS` / `KG_MAX_BATCHES` | `30000` / `25` | Text read per model call; calls per document (a longer one is read at evenly spaced parts, `coverage` says how much) |
+| `KG_MAX_ENTITIES_PER_BATCH` / `KG_MAX_RELATIONS_PER_BATCH` / `KG_MAX_OUTPUT_TOKENS` | `40` / `60` / `8192` | What one call is asked for, and may return |
+| `KG_MAX_ENTITIES` / `KG_VIEW_MAX_NODES` | `400` / `150` | Entities kept per document (the most mentioned); nodes drawn at once |
+| `GRAPH_RETRIEVAL` | `true` | Widen answers through the graph (§20.5); needs `KNOWLEDGE_GRAPH` |
+| `GRAPH_HOPS` / `GRAPH_EXPANSION_MAX_CHUNKS` | `2` / `3` | Steps along relations (1 to 3) and passages added at most (1 to 10) |
+| `KG_MAX_ENTITY_CHUNKS` | `40` | An entity mentioned in more chunks than this is not followed |
 | `METRICS_RETENTION_DAYS` | `90` | Dashboard measurements (with question text) older than this are deleted at startup (§17) |
 | `LLM_INPUT_USD_PER_MTOK` / `LLM_OUTPUT_USD_PER_MTOK` | `0` / `0` | Model price for the dashboard's cost estimate; 0 shows tokens only |
 | `RETRIEVAL_CANDIDATES` / `RETRIEVAL_TOP_K` | `30` / `5` | Per-channel candidates; chunks sent to the LLM |
@@ -750,7 +767,80 @@ Relevance, abstention and groundedness read chat turns. Totals, latency and cost
 
 ---
 
+## 19. Semantic Answer Cache
+
+A repeated or near-identical question is answered from a saved turn: no search, no model call. `core/answer_cache.py` (pure) holds the entries; `services/cache_service.py` keeps them honest; `services/chat_service.py` uses them.
+
+### 19.1 What is stored and when it is served
+
+- **Stored:** the whole outcome of one *clean* turn: answer, citations (with their passage text), conflicts, follow-up suggestions, guard result, the cited chunk and document ids, and what the turn cost in tokens. Never stored: a refusal (the guard's or the model's), a flagged answer (cut short, a citation removed, no citation), and an answer whose conflict check or follow-up call failed (it would miss those for good).
+- **Key:** the question's embedding. For a follow-up it is the **rewritten** standalone question. A follow-up whose rewrite changed nothing ("and the second one?" may still lean on the conversation) is neither looked up nor stored.
+- **Hit:** the best entry of the same scope with dot product (cosine, vectors are normalised) at least `SEMANTIC_CACHE_THRESHOLD` (0.95; paraphrases of one question score above it, neighbouring questions such as "sick leave" and "annual leave" can reach about 0.9). The question is embedded once: `retrieval.retrieve` takes the vector, so a miss does not pay for it twice.
+- **Served:** `status` stage `cache_hit`, the whole answer as one `token` event, `citations`, `conflicts` and `suggestions` if any, then `done` with `cached: true`. The turn is stored as an ordinary message and measured as one `query_events` row (`timings.cache = "hit"`, zero tokens), so history and the dashboard stay complete.
+
+### 19.2 Scope
+
+An entry is only ever served inside the scope it was written in: the access levels, department, type, date range and document selection of the `SearchFilter` (sorted, so order does not matter), plus the model, the embedding collection, `RELEVANCE_THRESHOLD`, `RETRIEVAL_TOP_K`, the graph setting (`GRAPH_HOPS`, or off) and `prompts.PROMPT_VERSION`. A user and an administrator never share an entry, so a Restricted passage cannot reach a user through the cache (rule 6).
+
+### 19.3 Staying correct
+
+- **Invalidation:** indexing a document drops every entry whose filter would now include it, and every entry citing it; deleting a document does the same right after it is parked (its text is quoted in the entry's citations, rule 24); finishing a graph build does the same before the graph is reported ready (answers are widened through the graph); rating an answer down evicts the entry that produced or served it. A turn that began searching before an invalidation cannot store its answer after it (a generation counter), because it may have been written from the documents as they were.
+- **Re-validation:** every hit re-checks in Postgres that each cited chunk still exists, its document is `indexed` and it passes the reader's filter; otherwise the entry is evicted and the turn runs normally. Invalidation should make this redundant; it is the check that does not rely on it.
+- **Lifetime:** in memory only, so a restart starts empty (a changed model or setting cannot outlive its deployment) and the single backend worker (rule 4) is what makes that correct. Entries also expire (`SEMANTIC_CACHE_TTL_SECONDS`) and the least recently used go first (`SEMANTIC_CACHE_MAX_ENTRIES`).
+
+### 19.4 Measurement and interface
+
+`summary()` on the dashboard has a `cache` block: hits, hit rate (of answered and refused chat turns), tokens saved (the tokens the first answer cost, copied into `timings.saved_tokens`), and the mean time of a hit and of a miss. The Chat page shows "Saved answer, no new AI call" under a served answer, live and after reloading the conversation (`MessageOut.cached`).
+
+---
+
+## 20. Knowledge Graph (GraphRAG)
+
+Entities (people, organisations, roles, courses, policies, processes, products, places, events, concepts) and the relationships between them are read out of each document with the model, linked to the chunks they come from, drawn in Analyze > Graph, and used to pull related passages into an answer, across documents. No new dependency: the graph is three Postgres tables, the layout is a small force simulation in TypeScript, drawn as SVG.
+
+### 20.1 Extraction (`core/graph.py`)
+
+- **Reading:** the document's chunks are grouped by `analysis.make_batches` (global numbering, `KG_BATCH_CHARS` each, at most `KG_MAX_BATCHES`; a longer document is read at evenly spaced parts and `coverage` records the share read). Each batch is one JSON call (kind `graph`, `KG_MAX_OUTPUT_TOKENS`, one retry on unreadable JSON like every analysis call) over numbered `<source>` blocks framed as untrusted data (rule 10).
+- **Grounding (rule 39):** nothing the model says is kept on trust.
+  - An **entity** is kept only if its name occurs, as whole words, in at least one chunk read (the section heading counts as text). Its **mentions** are every chunk read that contains the name, not what the model listed.
+  - A **relation** is kept only if the source number it names belongs to that batch, both entity names occur in *that* chunk, and it joins two different entities. An entity the relation mentions but the model did not list is created from the chunk. A quote that is not a passage of the chunk is blanked, the relation stays.
+  - Labels are lower_snake_case (at most 64 characters), a type outside the vocabulary becomes `other`, `[n]` markers the model adds to descriptions are removed.
+- **Merging:** entities are identified by `normalize_key` (case, punctuation and a leading "the" ignored). Within a document the most common type wins and the longest description is kept. The same key in two documents is one node when graphs are shown or walked: that is what links documents. Merging is by name only: two different things with one name are one node (a known limitation).
+- Per document at most `KG_MAX_ENTITIES` entities are kept (those with most mentions; their relations go with them).
+
+### 20.2 Building (`services/graph_service.py`)
+
+After a document is indexed (`ingestion.on_indexed`, when `AUTO_KNOWLEDGE_GRAPH`) or on request (`POST /documents/{id}/graph`) a job runs on the insights thread with the executive summary and the suggested questions, one model job at a time, so the quota is shared and ingestion never waits. The status is a `document_insights` row of kind `graph` written `pending` before the model is called; the graph is replaced in **one short transaction** afterwards (old rows cascade away first). No database session is held across a model call (rule 25a). A failure is `failed` with a readable message and can be retried; a restart fails what it interrupted. One `query_events` row (`kind = graph`) records tokens and figures. Documents indexed before the feature existed have no graph until someone asks for it.
+
+**Background jobs and the event loop.** Each job runs its coroutine through `llm.run_background`, which gives it an event loop of its own. The Gemini async client belongs to the loop that opened its connections, so `llm.py` caches the client **per running loop**, drops those of closed loops, and `run_background` closes the loop's clients before the loop ends. (Reusing one client across `asyncio.run` calls made the first call after a loop change fail with "Event loop is closed", which hit the summaries and suggested questions before the graph existed.)
+
+### 20.3 Reading and the Graph tab
+
+`GET /graph` merges the entities of the chosen documents by key into nodes and aggregates relations into edges, ranks nodes by connections then mentions and caps them at `KG_VIEW_MAX_NODES` (`total_nodes` and `truncated` say so); `types` and `q` filter (a name match keeps its neighbours). `GET /graph/entity` returns where an entity is mentioned and its relations with their evidence, as passages shaped like chat citations, so they open in the same source drawer at the cited page. **Access (rule 32):** only documents the caller may read and that are indexed contribute (a document above their level is a 404), and the passages are filtered by their access levels once more, so an entity shared with a Restricted document reveals nothing of it.
+
+The tab (`GraphTab`, `ForceGraph`, `layout.ts`) has: document chips with a status dot, a Build or Rebuild button per document and the cost in plain words, type chips, a name search, the drawing (cooling force layout; zoom with the wheel, drag the background to pan, drag a node to move it; `prefers-reduced-motion` computes the layout at once), a keyboard-operable entity list, and a detail panel with the entity's description, relations (with quotes and "Open the source") and mentions. Clicking a line shows that relation.
+
+### 20.4 Multi-hop retrieval (`core/graph_retrieval.py`)
+
+Plain retrieval scores chunks one by one, so an answer that needs two documents only works if both resemble the question. After the guard has passed, `graph_retrieval.expand` looks up the entities named in the retrieved ("seed") chunks and follows their relations up to `GRAPH_HOPS` steps (a step crosses documents through the shared key). The chunks that state those relations come first, nearest and best supported first; if room is left, chunks mentioning the neighbouring entities follow; at most `GRAPH_EXPANSION_MAX_CHUNKS` are appended **behind** the seeds, numbered as further sources, and cited and verified like any other.
+
+- **The guard never sees them** (rules 7 and 8): the decision is made on the seeds' dense similarity; the added chunks carry none; a refused question is never widened.
+- **Access (rule 6):** a relation is only followed when the chunk that states it passes the caller's `SearchFilter` and belongs to an indexed document, in the query and again when the chunks are loaded. A relation stated in a passage the caller may not read teaches nothing.
+- **Noise control:** an entity mentioned in more than `KG_MAX_ENTITY_CHUNKS` chunks is not followed; a failure in the expansion is logged and costs only the extra context (rule 34).
+- Timings `graph_ms` and `graph_added` are recorded with the turn.
+
+### 20.5 Evaluation
+
+`eval/run_eval.py` reports a `hybrid+graph` row once any graph exists (the hybrid result plus what `expand` adds, for questions the guard lets through) and, for the `multi_hop` questions (the answer sits in a second document, `Registrar_Procedures.md`, that only the shared entity leads to from `Course_Catalogue.md`), how many are answered from both documents. Measured on the real library with `RETRIEVAL_TOP_K=1` (plain search too narrow to find both): hybrid answered 0/3, with the graph 3/3, hit-rate 0.80 to 1.00. At the default `RETRIEVAL_TOP_K=5` both find 3/3 on this small corpus, and the graph added passages to 2 of 27 questions; the guard figures and every reference number of §6.3 are unchanged.
+
+---
+
 ## Changelog
+
+* **1.7.0:**
+  - **Semantic answer cache** (§19): `core/answer_cache.py`, `services/cache_service.py`; `cache_hit` status and `cached` on `done` and on saved messages; a `cache` block on the dashboard; four settings. In memory, so no migration.
+  - **Knowledge graph and GraphRAG** (§20): migration `0005` (`kg_entities`, `kg_mentions`, `kg_relations`, the `graph` kind of `document_insights` and `query_events`); `core/graph.py`, `core/graph_retrieval.py`, `services/graph_service.py`, `api/graph.py` (`GET /graph`, `GET /graph/entity`, `POST /documents/{id}/graph`); the Graph tab of Analyze; an nginx location giving the build route the analysis rate limit; eleven settings. The `multi_hop` evaluation questions and two sample documents.
+  - **Fix:** the Gemini client is cached per event loop and closed with its loop (`llm.run_background`); before, the background jobs (executive summary, suggested questions) shared one client across loops and could fail their first call ("Event loop is closed").
 
 * **1.6.0:** Account administration (§8): `GET /users`, `PATCH /users/{id}`, `DELETE /users/{id}`, the Users screen, the "always one administrator" rule under the shared accounts lock (`auth_service.lock_accounts`, formerly the signup-only lock). The user-management API is no longer out of scope.
 * **1.5.0:**

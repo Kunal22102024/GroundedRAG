@@ -14,10 +14,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from collections.abc import AsyncIterator, Callable, Sequence
+import threading
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from langchain_core.messages import BaseMessage
 
@@ -62,8 +62,7 @@ class Piece:
     usage: dict[str, int]
 
 
-@lru_cache
-def _build(model: str, max_tokens: int) -> Any:
+def _construct(model: str, max_tokens: int) -> Any:
     settings = get_settings()
     api_key = settings.google_api_key.get_secret_value()
     if not api_key:
@@ -83,14 +82,73 @@ def _build(model: str, max_tokens: int) -> Any:
     )
 
 
-Kind = Literal["answer", "rewrite", "analysis"]
+# The async client keeps connections that belong to the event loop that opened them. The server's
+# own loop lives as long as the process, but the background jobs (summaries, suggested questions,
+# the knowledge graph) each run in a loop of their own (``asyncio.run``), and a client carried over
+# from an earlier loop fails its first call with "Event loop is closed". So a client is cached per
+# running loop, and those of closed loops are dropped. ``None`` is "no loop running" (tests).
+_models: dict[asyncio.AbstractEventLoop | None, dict[tuple[str, int], Any]] = {}
+_models_lock = threading.Lock()
+
+
+def _build(model: str, max_tokens: int) -> Any:
+    """The client for ``model`` in the current event loop (built once per loop)."""
+    try:
+        loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    with _models_lock:
+        for finished in [known for known in _models if known is not None and known.is_closed()]:
+            del _models[finished]
+        built = _models.setdefault(loop, {})
+        if (model, max_tokens) not in built:
+            built[(model, max_tokens)] = _construct(model, max_tokens)
+        return built[(model, max_tokens)]
+
+
+async def _close_clients_of_this_loop() -> None:
+    """Close the clients built for the running loop while it can still run their clean-up (left to
+    the garbage collector, a client tries to close itself on the dead loop and asyncio logs it)."""
+    with _models_lock:
+        built = _models.pop(asyncio.get_running_loop(), {})
+    for model in built.values():
+        aio = getattr(getattr(model, "client", None), "aio", None)
+        try:
+            if aio is not None:
+                await aio.aclose()
+        except Exception as exc:  # clean-up only
+            logger.debug("model client not closed cleanly", extra={"error": type(exc).__name__})
+
+
+T = TypeVar("T")
+
+
+def run_background(job: Coroutine[Any, Any, T]) -> T:
+    """Run ``job`` to completion in an event loop of its own, for work on a background thread.
+
+    The loop gets its own model clients (see ``_build``) and they are closed before it ends.
+    """
+
+    async def runner() -> T:
+        try:
+            return await job
+        finally:
+            await _close_clients_of_this_loop()
+
+    return asyncio.run(runner())
+
+
+Kind = Literal["answer", "rewrite", "analysis", "graph"]
 
 
 def get_chat_model(kind: Kind = "answer") -> Any:
-    """The chat model for answering, rewriting follow-ups or analysing (built once per setting)."""
+    """The chat model for answering, rewriting follow-ups, analysing or reading entities out of
+    documents (built once per setting)."""
     settings = get_settings()
     if kind == "rewrite":
         return _build(settings.rewrite_model_id, REWRITE_MAX_TOKENS)
+    if kind == "graph":  # a long list of entities and relations: the largest output budget
+        return _build(settings.llm_model, settings.kg_max_output_tokens)
     if kind == "analysis":  # summaries, tables and comparisons: same model, a larger output budget
         return _build(settings.llm_model, settings.analysis_max_tokens)
     return _build(settings.llm_model, settings.llm_max_tokens)
@@ -98,7 +156,8 @@ def get_chat_model(kind: Kind = "answer") -> Any:
 
 def clear_cache() -> None:
     """Forget built models (tests)."""
-    _build.cache_clear()
+    with _models_lock:
+        _models.clear()
 
 
 def message_text(content: Any) -> str:

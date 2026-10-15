@@ -111,6 +111,65 @@ export interface Message {
   feedback: "up" | "down" | null;
 }
 
+export type GraphStatus = "none" | "pending" | "ready" | "failed";
+
+/** How one document's knowledge graph is doing. */
+export interface GraphDocument {
+  id: string;
+  name: string;
+  status: GraphStatus;
+  entities: number;
+  relations: number;
+  /** Share of the document's chunks the model read (1 = all of them). */
+  coverage: number | null;
+  error: string | null;
+}
+
+/** An entity, merged by name across the documents shown. `id` is its normalised name. */
+export interface GraphNode {
+  id: string;
+  name: string;
+  type: string;
+  description: string;
+  document_ids: string[];
+  mentions: number;
+  degree: number;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  label: string;
+  count: number;
+}
+
+export interface GraphView {
+  documents: GraphDocument[];
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  total_nodes: number;
+  truncated: boolean;
+}
+
+export interface EntityRelation {
+  label: string;
+  /** `out`: this entity is the subject; `in`: it is the object. */
+  direction: "out" | "in";
+  quote: string;
+  other: { id: string; name: string; type: string };
+  evidence: Citation;
+}
+
+export interface EntityDetail {
+  id: string;
+  name: string;
+  type: string;
+  description: string;
+  documents: { id: string; name: string }[];
+  mentions: Citation[];
+  relations: EntityRelation[];
+}
+
 export interface Conversation {
   id: string;
   title: string;

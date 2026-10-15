@@ -24,6 +24,9 @@ EXPECTED_TABLES = {
     "feedback",
     "document_insights",
     "query_events",
+    "kg_entities",
+    "kg_mentions",
+    "kg_relations",
 }
 
 
@@ -98,6 +101,8 @@ def test_foreign_keys_cascade_as_designed(empty_database: str) -> None:
     assert ("messages", "c") in actions
     assert ("feedback", "c") in actions
     assert ("document_insights", "c") in actions
+    for table in ("kg_entities", "kg_mentions", "kg_relations"):  # the graph goes with its document
+        assert (table, "c") in actions
     assert ("conversations", "c") in actions
     assert ("documents", "n") in actions
     assert ("query_events", "n") in actions  # a measurement outlives its user

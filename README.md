@@ -9,14 +9,16 @@ documents do not contain the answer, the app says so instead of guessing.
 > ingestion, hybrid retrieval with the relevance guard, streamed chat with verified citations, the
 > web UI and the evaluation script. A later audit pass fixed correctness, security and test gaps
 > (see "Decisions", *Audit pass*). The **Analyze** page adds multi-document comparison, structured
-> extraction, document summaries and source conflict detection (see "Analysis"). The design is in
-> [PRD.md](PRD.md) and [TDD.md](TDD.md).
+> extraction, document summaries and source conflict detection (see "Analysis"), and a **knowledge
+> graph** of the people, policies, courses and concepts in your documents (see "Knowledge graph").
+> Repeated questions are answered from a **saved-answer cache** (see "Saved answers"). The design is
+> in [PRD.md](PRD.md) and [TDD.md](TDD.md).
 
 | Document | Defines |
 | --- | --- |
 | [PRD.md](PRD.md) | What the product must do and why |
 | [TDD.md](TDD.md) | How it is built: architecture, schemas, thresholds, configuration |
-| [CLAUDE.md](CLAUDE.md) | How to work in this repo: file purposes, flows, routes, the 37 rules |
+| [CLAUDE.md](CLAUDE.md) | How to work in this repo: file purposes, flows, routes, the 40 rules |
 
 ## Architecture
 
@@ -276,6 +278,28 @@ quotes it (for example a key-changes report against it).
 
 Each suggestion must point at a passage that answers it, or it is not shown. Clicking one asks it in the same conversation. It costs one extra model call per answer, run alongside the conflict check (`FOLLOWUP_SUGGESTIONS=false` turns it off). Suggestions are saved with the conversation. Those that come from a deleted document disappear.
 
+## Saved answers
+
+A question that was already answered is answered again without searching or calling the model, when **all** of these hold:
+
+* the new question is near-identical to the old one (cosine similarity of at least `SEMANTIC_CACHE_THRESHOLD`, 0.95; a reworded question usually qualifies, "sick leave" versus "annual leave" does not);
+* it was asked with the same access level, filters and document selection (an administrator's answer is never given to a user, whatever the question);
+* no document it could be answered from has been uploaded, deleted or re-read since, and every passage the old answer cites is still there and still readable by the person asking (this is checked again every time, not only when documents change);
+* the old answer was clean: cited, complete, not a refusal, nobody rated it down.
+
+A saved answer shows "Saved answer, no new AI call" under it and takes milliseconds instead of seconds. The Evaluation tab shows how often it happened and the tokens it saved. The cache lives in memory: a restart empties it, which is also what makes a changed model or setting safe. `SEMANTIC_CACHE=false` turns it off. A follow-up question (a conversation's later turns) is only looked up once it has been rewritten into a standalone question.
+
+## Knowledge graph
+
+**Analyze > Graph** shows the people, organisations, roles, courses, policies, processes, products, places, events and concepts your documents talk about, and how they relate ("Calculus II requires Calculus I", "the Registrar approves the Credit Transfer Policy"). The same entity in two documents is **one node**, so the graph shows how documents connect.
+
+* **Built by the AI model, once per document.** A document's graph is built in the background after it is indexed (about one model call for every 30,000 characters; `AUTO_KNOWLEDGE_GRAPH=false` builds only when you press **Build**). Documents uploaded before this feature have none until you build it. A failed build says why and can be tried again.
+* **Every fact is checked against the text.** An entity must appear in a passage of the document, a relation needs both names in the passage that states it, and a quote must be in that passage; anything else the model says is dropped. Every entity and relation links back to its passages: click one to open it in the source drawer, at the cited page.
+* **Explore:** pick documents (none picked: everything you may read), filter by kind or name, click a circle or a line, drag circles around, scroll to zoom, drag the background to move. The list beside the picture does the same with the keyboard.
+* **Access:** you only see entities, relations and passages from documents you may read. An entity shared with a Restricted document reveals nothing of it. Deleting a document deletes its part of the graph.
+
+**Multi-hop answers (GraphRAG).** Searching scores passages one at a time, so a question that needs two documents only works if both look like the question. With `GRAPH_RETRIEVAL` (on by default), after the search has found its passages and the relevance check has passed, the graph adds up to `GRAPH_EXPANSION_MAX_CHUNKS` (3) passages that are connected to them through shared entities and relations, up to `GRAPH_HOPS` (2) steps away, even in another document. They are given to the model like any other passage, can be cited, and are checked like any other. They never change whether a question is refused, and a relation stated in a passage you may not read is never followed. On the evaluation corpus, with plain search narrowed to one passage, the graph recovered all three multi-hop questions that plain search missed; at the default it changed nothing (search already found both documents).
+
 ## Evaluation dashboard
 
 Administrators get an **Evaluation** tab (`/dashboard`). It shows how the app performs on real use: every chat turn and every summary, extraction or comparison is measured once, including the ones that fail. Pick a period (24 h, 7 or 30 days) and All, Chat or Analysis.
@@ -289,6 +313,7 @@ Administrators get an **Evaluation** tab (`/dashboard`). It shows how the app pe
 | Tokens and cost | Per kind of request and per day. Set `LLM_INPUT_USD_PER_MTOK` / `LLM_OUTPUT_USD_PER_MTOK` to your model's price to see dollars |
 | Failed and problem queries | Failed, refused and flagged queries with the question, user, reason and time, and a link to the conversation |
 | Asked from a suggestion | How often suggestions and follow-ups are used |
+| Saved answers | How many answers came from the cache, the hit rate, the tokens that saved, and the average time of a saved and of a new answer |
 
 The same figures are available at `GET /api/metrics/summary?days=7` and `GET /api/metrics/events?outcome=failed` (admin token). Measurements are kept `METRICS_RETENTION_DAYS` (90). This is live traffic only. `eval/run_eval.py` remains the labelled, offline evaluation of retrieval and the guard (see `eval/README.md`).
 
@@ -356,6 +381,17 @@ All settings are environment variables, read only by `backend/app/config.py`. Bl
 | `COMPARE_MAX_DOCUMENTS` / `EXTRACTION_MAX_FIELDS` | `4` / `20` | Documents in one comparison (2 to 8); fields in one extraction (1 to 50) |
 | `FOLLOWUP_SUGGESTIONS` | `true` | Suggested next questions after every answer (1 extra model call each) |
 | `SUGGESTIONS_PER_DOCUMENT` / `POPULAR_MIN_USERS` | `6` / `2` | Questions written per document; how many different users must have asked a question before it is suggested to others |
+| `SEMANTIC_CACHE` | `true` | Reuse a clean cited answer for a near-identical question (see "Saved answers"); in memory |
+| `SEMANTIC_CACHE_THRESHOLD` | `0.95` | How alike two questions must be (cosine similarity, 0.85 to 1); do not go below 0.93 without running the evaluation |
+| `SEMANTIC_CACHE_TTL_SECONDS` / `SEMANTIC_CACHE_MAX_ENTRIES` | `86400` / `1000` | How long and how many saved answers are kept |
+| `KNOWLEDGE_GRAPH` | `true` | The knowledge graph and the Graph tab; `false` switches off building, the tab and graph retrieval |
+| `AUTO_KNOWLEDGE_GRAPH` | `true` | Build a document's graph right after it is indexed (about 1 model call per 30,000 characters); `false`: only on request |
+| `KG_BATCH_CHARS` / `KG_MAX_BATCHES` | `30000` / `25` | Text read per model call, and calls per document (a longer one is read at evenly spaced parts) |
+| `KG_MAX_ENTITIES_PER_BATCH` / `KG_MAX_RELATIONS_PER_BATCH` / `KG_MAX_OUTPUT_TOKENS` | `40` / `60` / `8192` | What one call is asked for and may return |
+| `KG_MAX_ENTITIES` / `KG_VIEW_MAX_NODES` | `400` / `150` | Entities kept per document; circles drawn at once |
+| `GRAPH_RETRIEVAL` | `true` | Add passages connected through the graph to an answer's context (needs `KNOWLEDGE_GRAPH`) |
+| `GRAPH_HOPS` / `GRAPH_EXPANSION_MAX_CHUNKS` | `2` / `3` | How many steps along relations, and how many passages are added at most |
+| `KG_MAX_ENTITY_CHUNKS` | `40` | An entity mentioned in more passages than this ("the university") is not followed |
 | `METRICS_RETENTION_DAYS` | `90` | How long dashboard measurements (including question text) are kept |
 | `LLM_INPUT_USD_PER_MTOK` / `LLM_OUTPUT_USD_PER_MTOK` | `0` / `0` | Model price per million tokens for the dashboard's cost figures (0 = tokens only) |
 | `REWRITE_MODEL` | empty (= `LLM_MODEL`) | Follow-up question rewriting |
@@ -653,6 +689,19 @@ that fails without the fix)
 * **Document questions are written on first use**, not after every upload, so a library nobody browses costs nothing. A failed attempt is retried after 10 minutes at the earliest.
 * **Tests switch follow-ups off by default** (`tests/conftest.py`), because every existing chat test scripts the model's replies one by one; `tests/test_suggestions.py` switches them on.
 
+**Saved answers, knowledge graph and GraphRAG**
+
+* **The cache is in memory, not in a table.** There is one backend worker (rule 4) and the cache is derived data, so a restart simply starts empty. That avoids a migration and makes it impossible for an entry to outlive a changed model, threshold or prompt. The price: a restart loses it.
+* **Safety over hit rate.** An entry is only served in the scope it was written in, only for a near-identical question (0.95), and only after the cited chunks are re-checked in Postgres. Refusals, flagged answers and answers whose conflict or follow-up call failed are not stored. A follow-up whose rewrite changed nothing is not cached either, because "and the second one?" may lean on the conversation. Changing the answer prompt means bumping `PROMPT_VERSION`.
+* **A cache hit skips the relevance guard.** The guard decided when the answer was first made, in the same scope, on the same documents (any change invalidates), so deciding again would only cost an embedding lookup the cache already did.
+* **Graph facts are extracted by the model and then checked against the text** instead of trusting it, as with citations. Mentions are found in the text by name rather than taken from the model's list, which is slower to write but exact. The extra ~25 calls for a very long manual is the cost of extraction; the Graph tab says so before anyone builds.
+* **Entities are merged by name only.** It is simple, explainable and needs no extra model call; it merges two different things with one name and misses synonyms. Embedding-based merging was left out so a graph costs no embedding quota.
+* **The graph widens an answer only after the guard, and never decides a refusal.** The graph's passages have no similarity score, so using them to lift a question over the threshold would break rules 7 and 8. A relation is followed only if the passage that states it is readable by the asker, so the graph cannot leak what it connects.
+* **No graph library and no database extension.** The graph is three tables and a walk of a few small queries per hop; the picture is plain SVG with a small force layout, because the Content-Security-Policy allows neither a CDN nor a worker built from a blob.
+* **Documents that existed before the graph get one on request.** Building a graph for every old document at startup would spend a free-tier key's quota unasked.
+* **Found and fixed on the way: the Gemini client was shared across event loops.** The background jobs each run in a loop of their own, and a client carried over from an earlier loop failed its first call with "Event loop is closed". The client is now cached per loop and closed with it (`llm.run_background`, rule 40); the executive summary and suggested-questions jobs had the same latent problem.
+* **Tests:** the cache is off in the older tests (`SEMANTIC_CACHE=false`) and the automatic graph build is off (`AUTO_KNOWLEDGE_GRAPH=false`), because both would change those tests' scripted model calls.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
@@ -697,3 +746,11 @@ that fails without the fix)
 | No suggested questions before the first question | Select documents under Filters: their questions are written the first time (a few seconds). "Often asked" appears only once two different people asked the same question. If the model is unavailable, the fixed examples are shown instead. |
 | No follow-up chips under an answer | `FOLLOWUP_SUGGESTIONS=false`, the answer was a refusal, or the extra call failed (Gemini 503); the answer is unaffected. |
 | `429` on Analyze | nginx's rate limit for `/api/analysis/` (20 requests a minute, burst 10): each request is at least one model call. Wait a few seconds. |
+| The Graph tab says "No graph has been built" | The documents were uploaded before the feature existed, or `AUTO_KNOWLEDGE_GRAPH=false`. Press **Build** (about one model call per 30,000 characters of the document). |
+| A graph build is "Failed" | The reason is shown next to it: usually Gemini's `503 ... high demand` or a rate limit. Press **Try again**; nothing is lost and a failed build costs nothing to retry. |
+| The graph misses something the document says | The model reads the document once and reports what it recognises; very long documents are read at evenly spaced parts (the row says "read N% of it"; raise `KG_MAX_BATCHES`). A relation or entity not in the text is dropped by design. |
+| The graph shows two nodes for one thing, or one node for two things | Entities are merged by name only. "Registrar" and "Registrar's Office" are two nodes; two people called "A. Smith" are one. |
+| Backend exits at startup with `relation "kg_entities" does not exist` after updating | The migration (`0005`) runs when the container starts, and the dev override's auto-reload does not run it. Restart the backend: `docker compose restart backend`. |
+| An answer says "Saved answer" but the documents changed | They should not: indexing or deleting a document drops the answers it could change, and every hit re-checks its sources. If it happens, set `SEMANTIC_CACHE=false`, restart, and report it (CLAUDE.md rule 38). A thumbs-down also removes a saved answer. |
+| The same question is not answered from the cache | It was asked with other filters or another access level, the wording differs enough (below `SEMANTIC_CACHE_THRESHOLD`), it was a follow-up the rewrite left unchanged, the earlier answer was a refusal or flagged, or the backend restarted since. |
+| `docker` commands answer `500 Internal Server Error` and nothing starts (Windows) | Docker Desktop's disk image lives on `C:` and the drive is full: its Linux VM stops. Free space, then restart Docker Desktop (`docker desktop restart`, or end its processes and start it again) and `docker compose up -d`; the volumes survive. |

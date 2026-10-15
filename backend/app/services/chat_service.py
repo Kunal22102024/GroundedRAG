@@ -37,6 +37,7 @@ from app.core import (
     answer_cache,
     embeddings,
     generation,
+    graph_retrieval,
     guard,
     llm,
     query_rewrite,
@@ -362,9 +363,22 @@ async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent
         yield SseEvent("token", {"text": answer})
         refused = True
     else:
+        # The guard has passed on the seed passages. Now the knowledge graph may add passages
+        # connected to them (other documents included); the guard never sees those, and a failure
+        # here costs nothing but the extra context.
+        candidates = result.candidates
+        if settings.graph_retrieval_active:
+            try:
+                expansion = await asyncio.to_thread(
+                    graph_retrieval.expand, result.candidates, plan.search_filter
+                )
+                candidates = [*result.candidates, *expansion.candidates]
+                timings.update(graph_ms=expansion.ms, graph_added=len(expansion.candidates))
+            except Exception as exc:
+                logger.warning("graph expansion failed", extra={"error": type(exc).__name__})
         yield SseEvent("status", {"stage": "generating"})
         final: generation.AnswerResult | None = None
-        async for item in generation.generate_answer(question, result.candidates):
+        async for item in generation.generate_answer(question, candidates):
             if isinstance(item, llm.Wait):
                 yield SseEvent("status", {"stage": "rate_limited", "retry_in": round(item.seconds)})
             elif isinstance(item, generation.Restart):
@@ -377,7 +391,7 @@ async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent
         if final is None:  # generate_answer always ends with a result; never fall through silently
             raise llm.LlmError("empty", generation.EMPTY_MESSAGE)
         answer, refused, usage = final.text, final.refused, final.usage
-        citations = [retrieval.citation_dict(n, result.candidates[n - 1]) for n in final.cited]
+        citations = [retrieval.citation_dict(n, candidates[n - 1]) for n in final.cited]
         flags.update(
             partial=final.truncated,
             citations_removed=final.invalid_removed,
@@ -400,7 +414,7 @@ async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent
         # Two extras after a complete answer, run side by side so the wait is the longer of the
         # two: a conflict check when the answer draws on two or more documents (single-document
         # answers never pay for it), and follow-up questions. Either may fail without effect.
-        passages = [analysis.Passage(n, result.candidates[n - 1]) for n in final.cited]
+        passages = [analysis.Passage(n, candidates[n - 1]) for n in final.cited]
         check_conflicts = (
             settings.conflict_detection
             and not refused
@@ -424,7 +438,7 @@ async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent
             nonlocal extras_failed
             step = time.perf_counter()
             try:
-                found, used = await analysis.suggest_followups(question, answer, result.candidates)
+                found, used = await analysis.suggest_followups(question, answer, candidates)
                 suggestions.extend(found)
                 metrics_service.add_usage(extra_usage, used)
             except Exception as exc:  # an extra, like the conflict check

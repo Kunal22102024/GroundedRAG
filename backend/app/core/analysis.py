@@ -186,18 +186,24 @@ async def _run_json(
     model: type[BaseModel],
     on_wait: OnWait | None,
     patient: bool = True,
+    kind: llm.Kind = "analysis",
 ) -> tuple[Any, dict[str, int]]:
     """One model call whose reply must be valid ``model`` JSON; retried once with a reminder."""
     usage: dict[str, int] = {}
     attempt_messages = list(messages)
     for _ in range(2):
-        text, used = await llm.complete(attempt_messages, "analysis", on_wait, _retries(patient))
+        text, used = await llm.complete(attempt_messages, kind, on_wait, _retries(patient))
         _add(usage, used)
         try:
             return parse_json(text, model), usage
         except ValueError:  # includes json.JSONDecodeError and pydantic.ValidationError
             attempt_messages = [*messages, HumanMessage(content=prompts.JSON_RETRY_REMINDER)]
     raise llm.LlmError("failed", UNREADABLE_MESSAGE)
+
+
+# For sibling modules (core/graph.py) that run their own JSON tasks the same way.
+run_json = _run_json
+add_usage = _add
 
 
 async def _cited_text(

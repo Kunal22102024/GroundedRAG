@@ -81,6 +81,23 @@ class InsightKind(StrEnum):
     KEY_CHANGES = "key_changes"
     EXTRACTION = "extraction"
     QUESTIONS = "questions"  # suggested questions the document answers
+    GRAPH = "graph"  # build status of the document's knowledge graph (the graph is in kg_* tables)
+
+
+class EntityType(StrEnum):
+    """What a knowledge-graph entity is (``kg_entities.type``). Anything else is ``other``."""
+
+    PERSON = "person"
+    ORGANIZATION = "organization"
+    ROLE = "role"
+    CONCEPT = "concept"
+    COURSE = "course"
+    POLICY = "policy"
+    PROCESS = "process"
+    PRODUCT = "product"
+    LOCATION = "location"
+    EVENT = "event"
+    OTHER = "other"
 
 
 class InsightStatus(StrEnum):
@@ -99,6 +116,7 @@ class EventKind(StrEnum):
     EXTRACT = "extract"
     COMPARE = "compare"
     SUGGEST = "suggest"
+    GRAPH = "graph"  # building a document's knowledge graph
 
 
 class EventOutcome(StrEnum):

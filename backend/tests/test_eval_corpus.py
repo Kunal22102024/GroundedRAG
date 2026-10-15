@@ -32,7 +32,8 @@ EXTERNAL = {
     "sans_Email_Management_Policy_feb2026.pdf",
     "369.pdf",
 }
-KINDS = {"normal", "exact_token", "near_miss", "off_topic"}
+KINDS = {"normal", "exact_token", "multi_hop", "near_miss", "off_topic"}
+ANSWERABLE_KINDS = {"normal", "exact_token", "multi_hop"}
 
 
 def questions() -> list[dict]:
@@ -52,7 +53,18 @@ def test_every_question_is_well_formed() -> None:
         else:
             assert q["expected_document"] is None and q["expected_page"] is None, q
             assert q["kind"] in {"near_miss", "off_topic"}, q
-        assert (q["kind"] in {"normal", "exact_token"}) == q["answerable"], q
+        assert (q["kind"] in ANSWERABLE_KINDS) == q["answerable"], q
+
+
+def test_a_multi_hop_question_needs_a_second_document_to_lead_to_the_answer() -> None:
+    """The graph is measured by questions whose answer sits in a document other than the one the
+    question resembles: it names that other document in ``requires`` and both are committed."""
+    committed = {p.name for p in (EVAL / "sample_docs").iterdir() if p.is_file()}
+    multi_hop = [q for q in questions() if q["kind"] == "multi_hop"]
+    assert len(multi_hop) >= 3
+    for q in multi_hop:
+        assert q["requires"] and q["expected_document"] not in q["requires"], q
+        assert {q["expected_document"], *q["requires"]} <= committed, q
 
 
 def test_every_document_a_question_needs_is_committed_or_a_documented_download() -> None:

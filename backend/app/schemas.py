@@ -405,6 +405,89 @@ class SuggestionsOut(BaseModel):
     pending: list[uuid.UUID]
 
 
+class GraphDocumentOut(BaseModel):
+    """How one document's knowledge graph is doing."""
+
+    id: uuid.UUID
+    name: str
+    status: Literal["none", "pending", "ready", "failed"]
+    entities: int = 0
+    relations: int = 0
+    # Share of the document's chunks the model read (1.0 = all of them).
+    coverage: float | None = None
+    error: str | None = None
+
+
+class GraphNodeOut(BaseModel):
+    """An entity, merged by name across the documents shown."""
+
+    id: str
+    name: str
+    type: str
+    description: str
+    document_ids: list[str]
+    mentions: int
+    degree: int
+
+
+class GraphEdgeOut(BaseModel):
+    """Relations between two entities with one label (``count`` of them)."""
+
+    source: str
+    target: str
+    label: str
+    count: int
+
+
+class GraphViewOut(BaseModel):
+    """The knowledge graph of the chosen documents."""
+
+    documents: list[GraphDocumentOut]
+    nodes: list[GraphNodeOut]
+    edges: list[GraphEdgeOut]
+    total_nodes: int
+    truncated: bool
+
+
+class EntityNeighbourOut(BaseModel):
+    id: str
+    name: str
+    type: str
+
+
+class EntityRelationOut(BaseModel):
+    """A relation of an entity, in the direction it was stated, with the passage that states it."""
+
+    label: str
+    direction: Literal["out", "in"]
+    quote: str
+    other: EntityNeighbourOut
+    evidence: dict[str, object]
+
+
+class EntityDocumentOut(BaseModel):
+    id: uuid.UUID
+    name: str
+
+
+class EntityDetailOut(BaseModel):
+    """One entity: where it is mentioned and how it relates to others (passages open in the drawer)."""
+
+    id: str
+    name: str
+    type: str
+    description: str
+    documents: list[EntityDocumentOut]
+    mentions: list[dict[str, object]]
+    relations: list[EntityRelationOut]
+
+
+class GraphBuildOut(BaseModel):
+    """A graph build was queued."""
+
+    status: Literal["pending"]
+
+
 class InsightOut(BaseModel):
     """A saved analysis of a document."""
 

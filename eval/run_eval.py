@@ -13,6 +13,11 @@ query cache serves the repeat) and reports:
 * hit-rate@5 and MRR of the expected document and page, over the answerable questions, for
   dense-only and keyword-only search (the two channels read directly) and for the hybrid result
   that production returns (``retrieval.retrieve``: RRF fusion, then the top ``RETRIEVAL_TOP_K``);
+* once a knowledge graph has been built (``POST /api/documents/{id}/graph``, or automatically after
+  upload): ``hybrid+graph``, the hybrid result plus the passages the graph adds behind it
+  (``graph_retrieval.expand``, exactly as a chat turn does it, only for questions the guard lets
+  through), and for the ``multi_hop`` questions (the answer sits in a second document that only an
+  entity shared with the first one leads to) how much of that the graph recovers;
 * the guard at ``RELEVANCE_THRESHOLD``, decided by the production ``guard.evaluate`` on the
   production retrieval result: the share of off-topic questions it stops before the LLM, and the
   share of answerable ones it wrongly stops;
@@ -39,13 +44,13 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.config import get_settings
-from app.core import bm25, embeddings, fusion, guard, retrieval, vectorstore
+from app.core import bm25, embeddings, fusion, graph_retrieval, guard, retrieval, vectorstore
 from app.core.filters import build_filter
 from app.db.database import get_sessionmaker
-from app.db.models import Chunk, Document
+from app.db.models import Chunk, Document, KgEntity
 from app.services import index_service
 
 QUESTIONS = Path(__file__).with_name("questions.jsonl")
@@ -62,6 +67,7 @@ class Row:
     guard_passed: bool
     ranks: dict[str, int | None]
     stages: dict[str, float]
+    graph_added: int = 0
 
 
 class _Admin:
@@ -75,11 +81,13 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[min(len(ordered) - 1, round(pct / 100 * (len(ordered) - 1)))]
 
 
-def _rank(ordered: list[str], expected: tuple[str, int] | None, matches) -> int | None:
-    """1-based position of the first result for the expected document and page, within TOP_K."""
+def _rank(
+    ordered: list[str], expected: tuple[str, int] | None, matches, limit: int = TOP_K
+) -> int | None:
+    """1-based position of the first result for the expected document and page, within ``limit``."""
     if expected is None:
         return None
-    return next((i for i, chunk_id in enumerate(ordered[:TOP_K], 1) if matches(chunk_id)), None)
+    return next((i for i, chunk_id in enumerate(ordered[:limit], 1) if matches(chunk_id)), None)
 
 
 def main() -> int:
@@ -106,6 +114,7 @@ def main() -> int:
     with get_sessionmaker()() as db:
         index_service.load_bm25(db)
         indexed = set(db.scalars(select(Document.name).where(Document.status == "indexed")).all())
+        graph_built = bool(db.scalar(select(func.count()).select_from(KgEntity)))
         located = {
             row.id: (row.name, row.page_number, row.page_end)
             for row in db.execute(
@@ -168,6 +177,18 @@ def main() -> int:
             "keyword": _rank([h.chunk_id for h in keyword], expected, matches),
             "hybrid": _rank([c.chunk_id for c in result.candidates], expected, matches),
         }
+        # The graph only widens what the guard has let through, and never changes the guard.
+        expansion = (
+            graph_retrieval.expand(result.candidates, search_filter)
+            if graph_built and decision.passed
+            else graph_retrieval.Expansion()
+        )
+        widened = [c.chunk_id for c in result.candidates] + [
+            c.chunk_id for c in expansion.candidates
+        ]
+        ranks["hybrid+graph"] = _rank(
+            widened, expected, matches, TOP_K + settings.graph_expansion_max_chunks
+        )
         rows.append(
             Row(
                 q["kind"],
@@ -183,27 +204,47 @@ def main() -> int:
                     "keyword_ms": keyword_ms,
                     "fusion_ms": fusion_ms,
                 },
+                len(expansion.candidates),
             )
         )
 
     if args.verbose:
         for r in rows:
             mark = "pass " if r.guard_passed else "REFUSE"
+            extra = f" graph@{r.ranks['hybrid+graph']}" if graph_built else ""
             print(
-                f"{r.kind:12s} {r.best_similarity:.3f} {mark} hybrid@{r.ranks['hybrid']} | "
+                f"{r.kind:12s} {r.best_similarity:.3f} {mark} hybrid@{r.ranks['hybrid']}{extra} | "
                 f"{r.question}"
             )
         print()
 
     answerable = [r for r in rows if r.answerable]
     print(f"Retrieval over {len(answerable)} answerable questions (top {TOP_K})")
-    print(f"{'channel':10s} {'hit-rate@5':>11s} {'MRR':>7s}")
+    print(f"{'channel':12s} {'hit-rate':>9s} {'MRR':>7s}")
     hit_rates: dict[str, float] = {}
-    for channel in ("dense", "keyword", "hybrid"):
+    channels = ("dense", "keyword", "hybrid") + (("hybrid+graph",) if graph_built else ())
+    for channel in channels:
         hits = [r.ranks[channel] for r in answerable]
         hit_rates[channel] = sum(1 for h in hits if h) / len(hits)
         mrr = statistics.mean(1 / h if h else 0.0 for h in hits)
-        print(f"{channel:10s} {hit_rates[channel]:11.2f} {mrr:7.2f}")
+        print(f"{channel:12s} {hit_rates[channel]:9.2f} {mrr:7.2f}")
+    if not graph_built:
+        print("(no knowledge graph has been built yet: no hybrid+graph row)")
+    else:
+        widened_rows = [r for r in rows if r.graph_added]
+        print(
+            f"graph added passages to {len(widened_rows)}/{len(rows)} questions "
+            f"(mean {statistics.mean(r.graph_added for r in widened_rows) if widened_rows else 0:.1f} "
+            "when it added any)"
+        )
+        multi_hop = [r for r in answerable if r.kind == "multi_hop"]
+        if multi_hop:
+            plain = sum(1 for r in multi_hop if r.ranks["hybrid"])
+            with_graph = sum(1 for r in multi_hop if r.ranks["hybrid+graph"])
+            print(
+                f"multi-hop questions answered from both documents: hybrid {plain}/{len(multi_hop)}, "
+                f"with the graph {with_graph}/{len(multi_hop)}"
+            )
 
     off_topic = [r for r in rows if r.kind == "off_topic"]
     near_miss = [r for r in rows if r.kind == "near_miss"]

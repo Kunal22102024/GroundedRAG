@@ -212,6 +212,32 @@ CONFLICT_TASK = (
 )
 
 
+# --- Knowledge graph -------------------------------------------------------------------------------
+# Entities and relations are not cited with [n] markers: each carries the number of the source it
+# comes from as a field, and core/graph.py keeps it only if the entity's name (or both names of a
+# relation) really occur in that source.
+
+GRAPH_TASK = (
+    "Build a knowledge graph of the sources above.\n\n"
+    "1. ENTITIES: the people, organizations, roles, courses, policies, processes, products, "
+    "places, events and key concepts the sources talk about, at most {max_entities}, the most "
+    "important first. Give each its name exactly as it is written in the sources (the short form "
+    "when there is one), a type (one of: person, organization, role, concept, course, policy, "
+    "process, product, location, event, other), a description of one sentence taken from the "
+    "sources, and the numbers of the sources it appears in.\n"
+    "2. RELATIONS: relationships that a source states directly between two entities, at most "
+    "{max_relations}. 'subject' and 'object' are entity names exactly as in your entities list. "
+    "'label' is a short verb phrase in lower_snake_case, for example requires, prerequisite_of, "
+    "part_of, applies_to, responsible_for, reports_to, teaches, defined_as, replaces, references, "
+    "approves, governs. 'source' is the number of the source that states it. 'quote' is a short "
+    "quote copied exactly from that source (at most 25 words), or an empty string.\n\n"
+    "Use only what the sources say: no outside knowledge, no guessing, no relationship that is "
+    "only implied. Do not add [n] markers; the source numbers are fields. Reply with JSON only: "
+    '{{"entities": [{{"name": "Annual Leave", "type": "policy", "description": "One sentence.", '
+    '"sources": [1, 2]}}], "relations": [{{"subject": "HR Department", "object": "Annual Leave", '
+    '"label": "governs", "source": 1, "quote": "exact words from the source"}}]}}'
+)
+
 # --- Suggestions -----------------------------------------------------------------------------------
 # A suggested question is only offered if the model names the source that answers it, and that
 # number is checked: a question the documents cannot answer is never suggested.

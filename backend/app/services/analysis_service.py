@@ -221,7 +221,10 @@ def list_insights(db: Session, user: User, document_id: uuid.UUID) -> list[dict[
     document = document_service.get_document(db, user, document_id)
     rows = db.scalars(
         select(DocumentInsight)
-        .where(DocumentInsight.document_id == document.id)
+        .where(
+            DocumentInsight.document_id == document.id,
+            DocumentInsight.kind != InsightKind.GRAPH.value,  # that is graph_service's status row
+        )
         .order_by(DocumentInsight.kind, DocumentInsight.updated_at.desc())
     ).all()
     return [
@@ -504,6 +507,21 @@ def shutdown() -> None:
         _executor = None
 
 
+# The lifecycle every background job on the insights thread shares (graph_service builds on it):
+# a row written pending, one model thread at a time, one measurement per run.
+begin_insight = _begin
+finish_insight = _finish
+load_sources = _sources
+fresh_pending = _fresh_pending
+new_event = _event
+failure_code = _failure_code
+
+
+def submit_background(job: Callable[..., None], *args: Any) -> None:
+    """Run ``job(*args)`` on the insights thread (after the jobs already queued)."""
+    _insight_executor().submit(job, *args)
+
+
 def submit_auto_summary(document_id: uuid.UUID) -> None:
     """Queue the executive summary of a freshly indexed document (called by ingestion)."""
     if not get_settings().auto_executive_summary:
@@ -526,7 +544,7 @@ def _run_auto(document_id: uuid.UUID) -> None:
             if document is None or document.status != DocumentStatus.INDEXED.value:
                 return  # deleted or re-queued meanwhile
             sources = _sources(db, document)
-        content, usage = asyncio.run(analysis.summarize(kind, sources))
+        content, usage = llm.run_background(analysis.summarize(kind, sources))
         metrics_service.add_usage(event, usage)
         _finish(document_id, kind, "", content=content)
         logger.info("executive summary generated", extra={"document_id": str(document_id), **usage})
@@ -570,7 +588,7 @@ def _run_questions(document_id: uuid.UUID) -> None:
             if document is None or document.status != DocumentStatus.INDEXED.value:
                 return
             sources = _sources(db, document)
-        content, usage = asyncio.run(
+        content, usage = llm.run_background(
             analysis.suggest_questions(sources, get_settings().suggestions_per_document)
         )
         metrics_service.add_usage(event, usage)

@@ -56,7 +56,8 @@ groundedrag/
 │   ├── pyproject.toml            # pytest + ruff configuration
 │   ├── alembic.ini
 │   ├── alembic/                  # env.py, script.py.mako, versions/ (0001 schema, 0002 nullable creation_date,
-│   │                             # 0003 document_insights + messages.conflicts, 0004 query_events + messages.suggestions)
+│   │                             # 0003 document_insights + messages.conflicts, 0004 query_events + messages.suggestions,
+│   │                             # 0005 knowledge graph: kg_entities, kg_mentions, kg_relations, the `graph` kinds)
 │   ├── app/
 │   │   ├── main.py               # app factory, startup/shutdown, router mounting
 │   │   ├── config.py             # Settings loaded from env (single source of config)
@@ -73,6 +74,7 @@ groundedrag/
 │   │   │   ├── conversations.py      # conversations CRUD and POST /messages/{id}/feedback
 │   │   │   ├── analysis.py           # summaries, extraction, comparison (SSE) + a document's saved insights
 │   │   │   ├── suggestions.py        # GET /suggestions: questions from documents and often asked
+│   │   │   ├── graph.py              # GET /graph, GET /graph/entity, POST /documents/{id}/graph: the knowledge graph
 │   │   │   ├── metrics.py            # evaluation dashboard (admins only)
 │   │   │   ├── users.py              # account administration: list, promote/demote, delete (admins only)
 │   │   │   └── health.py
@@ -80,6 +82,8 @@ groundedrag/
 │   │   ├── services/             # business workflows; orchestrate core + db
 │   │   │   ├── analysis_service.py  # access, saved results, streaming drivers, background executive summary,
 │   │   │   │                        # suggested questions per document
+│   │   │   ├── graph_service.py     # build a document's knowledge graph (insights thread), read it back for a reader
+│   │   │   ├── cache_service.py     # drop saved answers when a document is indexed, deleted or re-graphed; evict a rated-down one
 │   │   │   ├── metrics_service.py   # query_events: record one per request, dashboard figures, often-asked questions
 │   │   │   ├── user_service.py      # list/promote/demote/delete accounts; always one admin, under the accounts lock
 │   │   │   ├── health_service.py # readiness probes (Postgres, Chroma, embeddings) so api/ never touches them
@@ -101,12 +105,15 @@ groundedrag/
 │   │   │   ├── filters.py
 │   │   │   ├── fusion.py
 │   │   │   ├── retrieval.py
+│   │   │   ├── graph_retrieval.py    # GraphRAG: passages linked to the retrieved ones through the knowledge graph
+│   │   │   ├── answer_cache.py       # semantic answer cache: scoped, in memory, invalidated by document changes
 │   │   │   ├── (rerank.py: planned, does not exist yet; RERANK_ENABLED is rejected while true)
 │   │   │   ├── query_rewrite.py
 │   │   │   ├── prompts.py
 │   │   │   ├── generation.py
 │   │   │   ├── guard.py
 │   │   │   ├── analysis.py       # summaries, extraction, conflict detection: pure, cited, validated
+│   │   │   ├── graph.py          # entity and relation extraction from chunks: pure, every item checked against its chunk
 │   │   │   └── gemini_errors.py  # shared Gemini error classification (rate limit, key, transient)
 │   │   │
 │   │   └── db/
@@ -145,13 +152,17 @@ groundedrag/
 │       ├── test_guard.py        # relevance gate and the lexical override with its floor
 │       ├── test_citations.py    # citation filter, regeneration, finish reasons, blank answers
 │       ├── test_query_rewrite.py  # follow-up rewriting, bounded and treated as untrusted
-│       ├── test_llm.py          # model client construction and error handling
+│       ├── test_llm.py          # model client construction, one client per event loop, background jobs close theirs
 │       ├── test_chat.py         # chat end to end (the integration test: upload -> index -> ask -> cited answer)
 │       ├── test_analysis_core.py  # JSON parsing, batching, global numbering, grounding rules (summaries, extraction, conflicts)
 │       ├── test_analysis_api.py   # the endpoints, saved results, access, deletion, auto summary, conflicts in chat
 │       ├── test_users_api.py      # admin-only, role changes on live tokens, last-admin rule (+ race), delete cascades
 │       ├── test_metrics.py        # one event per turn/run incl. failures, figure definitions, admin-only, retention
 │       ├── test_suggestions.py    # document questions, often-asked privacy rules, follow-ups after an answer
+│       ├── test_semantic_cache.py # the cache alone (threshold, scope, TTL, LRU, invalidation, generation), then chat: hits, scopes, invalidation, thumbs-down
+│       ├── test_graph_core.py     # extraction: grounding of entities and relations, merging, batches, bad JSON
+│       ├── test_graph_api.py      # build, read, filters, shared entities, access (Restricted), delete cascade, failure and retry
+│       ├── test_graph_retrieval.py  # GraphRAG: pulls in linked passages, never past the filter, never after a refusal, hops
 │       └── test_eval_corpus.py  # eval/questions.jsonl agrees with eval/sample_docs/ (needs eval/ mounted)
 │
 ├── frontend/
@@ -166,7 +177,8 @@ groundedrag/
 │       ├── api/client.ts         # fetch wrapper (token, 401 -> logout, readable errors); `streamSse` (the one SSE reader,
 │       │                         # finishes only on done/error) and `streamChat` on top of it
 │       ├── hooks/                # useAuth.tsx (auth context, clears cached data), useAnalysisRun.ts (one streamed
-│       │                         # analysis at a time), useIndexedDocuments.ts, useSuggestions.ts
+│       │                         # analysis at a time), useIndexedDocuments.ts, useSuggestions.ts, useKnowledgeGraph.ts
+│       │                         # (the graph, one entity, building a graph)
 │       ├── pages/                # LoginPage (login and signup, by `mode`), LibraryPage, ChatPage, AnalyzePage,
 │       │                         # DashboardPage and UsersPage (admins)
 │       ├── components/
@@ -175,7 +187,9 @@ groundedrag/
 │       │   │                     # Skeleton, StatusPill, AccessBadge, FileTypeBadge, Modal), Toast.tsx
 │       │   ├── chat/             # Answer (text with citation chips, streaming caret), CitationChip, ConflictPanel,
 │       │   │                     # SuggestionChips (follow-ups), FilterBar
-│       │   ├── analyze/          # CompareTab, ExtractTab, SummariesTab, DocumentPicker (tabs of AnalyzePage)
+│       │   ├── analyze/          # CompareTab, ExtractTab, SummariesTab, GraphTab, DocumentPicker (tabs of AnalyzePage)
+│       │   ├── graph/            # ForceGraph.tsx (SVG graph: zoom, pan, drag, keyboard), layout.ts (the force layout, pure),
+│       │   │                     # entityTypes.ts (colours and names of entity types)
 │       │   ├── dashboard/        # charts.tsx: Sparkline, BarList, Histogram, StackedBars (SVG/CSS)
 │       │   └── source/           # SourceDrawer (cited passage + original PDF at the page)
 │       ├── lib/                  # types.ts, files.ts (download, save, sizes, page labels), ui.ts (shared classes),
@@ -187,8 +201,8 @@ groundedrag/
 │
 ├── eval/
 │   ├── questions.jsonl           # question, expected_document, expected_page, answerable, kind, requires?
-│   ├── sample_docs/              # five small generated documents (the three SANS PDFs are a documented download)
-│   ├── run_eval.py               # hit-rate@5, MRR, guard on the production retrieval, latency (p50/p95)
+│   ├── sample_docs/              # seven small generated documents (the three SANS PDFs are a documented download)
+│   ├── run_eval.py               # hit-rate@5, MRR, guard on the production retrieval, hybrid+graph and multi-hop, latency (p50/p95)
 │   └── README.md                 # corpus, how to run it, question kinds, reference result
 │
 └── data/                         # gitignored; runtime data when not using named volumes
@@ -220,6 +234,7 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | `chat.py` | `POST /chat` — streams Server-Sent Events |
 | `conversations.py` | List, read (citations the reader can no longer see come back `unavailable`), rename, delete conversations; thumbs up/down on an assistant message (`POST /messages/{id}/feedback`) |
 | `suggestions.py` | `GET /suggestions?document_ids=`: questions the chosen documents answer (written once in the background, `pending` meanwhile) and questions often asked by several users |
+| `graph.py` | `GET /graph?document_ids=&types=&q=` (nodes and edges, entities merged by name across documents), `GET /graph/entity?key=` (mentions as citation-shaped passages, relations with evidence), `POST /documents/{id}/graph` (queue a build: 202; 404 above the caller's level, 409 not indexed). 404 everywhere when `KNOWLEDGE_GRAPH=false` |
 | `metrics.py` | `GET /metrics/summary`, `GET /metrics/events`: the evaluation dashboard, **admins only** (`AdminUser`) |
 | `users.py` | `GET /users`, `PATCH /users/{id}` (`{role}`), `DELETE /users/{id}`: account administration, **admins only**; 409 for the last administrator and for deleting yourself |
 | `analysis.py` | `GET /documents/{id}/insights` (saved results) and the SSE endpoints `POST /analysis/summary`, `/analysis/extract`, `/analysis/compare`. Everything that can fail before the stream starts (unknown or unreadable document 404, not indexed 409, bad fields or document count 422) is an HTTP error; everything after is an `error` event |
@@ -234,7 +249,9 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | `auth_service.py` | bcrypt hashing (work factor `BCRYPT_ROUNDS`), HS256 JWT issue/verify (algorithm pinned, claims `sub`/`iat`/`exp` only), `register_user`, `authenticate`. Signup takes a Postgres advisory lock so concurrent first signups cannot create two admins; unknown-email logins still run a bcrypt check so timing does not reveal which emails exist, and both release the database connection before hashing. Typed errors (`EmailAlreadyRegistered`, `SignupDisabled`, `InvalidCredentials`, `InvalidToken`) are translated to HTTP in `api/` and `deps.py` |
 | `document_service.py` | Validate uploads (extension, declared type, magic bytes, size, creation-date plausibility; per-file accept/reject), store under `<uuid><ext>`, create `queued` rows, enqueue ingestion; a failure after some files were stored removes them. Role-aware listing (a document above your level is a 404, never a 403). Delete: park as `failed` first (immediately unsearchable), then BM25 → Chroma → blank the passages copied into saved messages (`messages.citations`) → rows → file; a busy document answers 409; a failed step leaves it retryable |
 | `ingestion.py` | Background job (one worker by default): parse → size check (`MAX_DOCUMENT_CHARS`) → chunk → resolve metadata → **chunk rows to Postgres first** → embed → upsert to Chroma → BM25 (heading + content) → `indexed`. Any failure removes partial data from all three stores and sets a user-safe message. Per-document lock shared with delete. Logs ids, counts, timings and, for unexpected errors, where it failed (never the exception message: it can quote document text) |
-| `chat_service.py` | Full chat turn: rewrite → filter → retrieve → guard → generate → verify citations → (conflict check when the answer cites 2+ documents) → persist → stream events |
+| `chat_service.py` | Full chat turn: rewrite → filter → **saved-answer lookup** → retrieve → guard → **graph expansion** → generate → verify citations → (conflict check when the answer cites 2+ documents) → persist → store in the cache → stream events. A cache hit (`_serve_cached`) skips everything between the lookup and persisting and re-validates its cited chunks in Postgres first |
+| `cache_service.py` | Reads a document's filterable metadata and tells `core/answer_cache` to drop what a change can make wrong: `on_document_indexed` (an `ingestion.on_indexed` hook), `invalidate_document` (delete flow, finished graph build), `evict_message` (a thumbs-down). Never raises; when the metadata cannot be read it clears everything |
+| `graph_service.py` | The knowledge graph. **Building:** `submit_graph` (after indexing, when `AUTO_KNOWLEDGE_GRAPH`) and `request_build` (on demand) queue `_run_graph` on the insights thread (one model job at a time, shared with the executive summary and suggested questions); status is a `document_insights` row of kind `graph` (`pending` before the model call), the graph is written in one short transaction after it (old rows cascade away first), one `query_events` row per run. **Reading:** `build_view` (nodes merged by `key` across documents, ranked by connections, capped at `KG_VIEW_MAX_NODES`) and `entity_detail` (mentions and relations as citation-shaped passages); only readable **and** indexed documents contribute and every passage is filtered by the caller's access levels again |
 | `conversation_service.py` | Conversations scoped to their owner; `readable_citations` marks citations whose document is gone or above the reader's level `unavailable` (no passage, no name), and `readable_conflicts` drops conflict claims whose source the reader can no longer see; ratings are one atomic upsert |
 | `metrics_service.py` | `query_events`: `new_event`/`add_usage`/`add_retrieval`/`record` (one row per chat turn or analysis run, failures included; `record` never raises), `prune` (retention, at startup), `summary` and `list_events` (dashboard, SQL aggregates), `popular_questions` (a question is suggested to others only when `POPULAR_MIN_USERS`+ users asked it and every cited document is readable by the reader) |
 | `analysis_service.py` | Summaries, extraction, comparison, the background executive summary and each document's suggested questions (`document_suggestions`, written once on the insights thread). Every stream is wrapped by `_measured` (one event). Access: only documents the user may read **and** that are `indexed`. Saved results live in `document_insights` (written `pending` before the model call; `ready`/`failed` after; a recent `pending` row is waited for, not paid for twice; `recover_interrupted` fails the rest at startup). No database session is held across a model call. The automatic executive summary runs on its own single-thread executor, registered through `ingestion.on_indexed` in `index_service.run_startup` (a hook, so `ingestion` never imports this module) and never fails or delays indexing. Compare narrows the search filter to one document per column and makes no model call for a column the guard stops |
@@ -246,13 +263,16 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | `parsers.py` | PDF (page-aware, pdfplumber), DOCX, MD, HTML, TXT → list of `(page, section, text)` | PDF: physical page numbers; sections from the outline (titles may wrap over lines) or font size/boldness; two-column pages read column by column (tables are not split); running headers/footers/banners and bare page labels removed, never more than 30% of the text; hyphenation repaired. Scanned/blank PDFs raise `ScannedPdfError` ("scanned PDF, OCR not supported"). Error messages are user-safe and never contain text. **Every text parser must run in time linear in the input** (no unbounded regex quantifiers rescanning from each opener, no string growth per line: hostile files stalled the whole server before); `tests/test_parsers.py` asserts wall-time ceilings. DOCX reads text inside content controls (`w:sdt`) |
 | `chunking.py` | `Chunker` interface + structure-aware implementation (~800 chars, ~100 overlap) | Packs by sentence; never crosses a section; overlap is whole trailing sentences, same page and section only; a chunk is at most target + 1.5×overlap + 1 separator (enforced against `CHUNK_HARD_MAX_CHARS` = 1500, far under the 2,048-token embedding limit); records `page_number`..`page_end`; sentence splitting and long-text cutting are linear; semantic chunker is a future implementation of the same interface |
 | `metadata.py` | Resolve department, type, creation date, access level | Order: explicit upload values → folder/filename → file properties → upload date; produces `creation_date_int`. A month- or year-only file name ("April2025") is refined to the exact day by a *consistent* file date. Implausible dates (before 1990, far future) are ignored when read from a file name or file, and refused (422) when passed at upload; labels read from inside a file are clamped to the 100-character columns |
-| `llm.py` | Builds the `ChatGoogleGenerativeAI` instance from settings | The **only** place that constructs the LLM client |
+| `llm.py` | Builds the `ChatGoogleGenerativeAI` instance from settings | The **only** place that constructs the LLM client. The client is cached **per running event loop** (one carried into another loop fails its first call with "Event loop is closed"); background jobs run through `run_background`, which gives the job a loop of its own and closes that loop's clients before it ends |
 | `embeddings.py` | Wraps `GoogleGenerativeAIEmbeddings`: document vs query task types, batching, retries/backoff, L2 normalization, query LRU cache | The **only** place that calls the embedding API. Walks the exception chain (LangChain wraps the SDK error) to classify 429/quota/auth/input/transient; honours the server's "retry in N s" hint with a cooldown shared by all threads; never retries a bad key or a daily quota. Rejects inputs over 2,000 characters instead of letting the API truncate them. Document batches are spaced to `EMBEDDING_TEXTS_PER_MINUTE` (questions are never held back); `probe()` never sleeps through a cooldown |
 | `vectorstore.py` | Chroma client: create/get collection (cosine), upsert, dense query, delete by `document_id` | The **only** place that imports `chromadb`; passes embeddings explicitly. Create collections with `configuration={"hnsw": {"space": "cosine"}}` and `embedding_function=None` (the client's default is Chroma's built-in embedder; verified against 1.5.9). **Never trust a Chroma write**: Chroma can store a vector its index never returns (seen live: 15 of 155 after delete and re-upload). `ensure_reachable(ids)` queries each new vector with its own embedding and repairs misses (re-insert, then `rebuild_collection`); `find_unreachable`/`repair_unreachable` back startup verification and `python -m app.maintenance verify-index`; an id that was never stored counts as unreachable. Call `ensure_reachable` after any code path that writes vectors (ingestion **and** `reembed`). All writers (upsert, delete, repair, rebuild) hold `_write_lock`; the HTTP session has timeouts (chromadb's default is none); `recover_interrupted_rebuild` runs before the collection is first opened |
 | `bm25.py` | In-memory BM25 index (`bm25s`), identifier-aware tokenizer, add/remove/rebuild, filtered top-N | Rebuilt from Postgres at startup; filter parity with Chroma via a predicate over the same metadata fields; immutable snapshots swapped atomically so searches never block on ingestion. Indexes `keyword_text(section_title, content)`: the heading is searchable by keyword but is not embedded |
 | `filters.py` | `build_filter(user, request_filters)` returning one neutral filter object plus Chroma `where` and SQL translations | **The only place filters are built**; always injects the access-level constraint |
 | `fusion.py` | `rrf(rankings, k)` | Pure function; RRF scores are for ordering only |
-| `retrieval.py` | Orchestrates embed query → dense + BM25 (parallel) → fusion → optional rerank; returns candidates with dense similarity and timings | |
+| `retrieval.py` | Orchestrates embed query → dense + BM25 (parallel) → fusion → optional rerank; returns candidates with dense similarity and timings | Takes the question's vector when the caller already embedded it (the cache does). `load_chunks` and `candidate_from_row` are how other channels (the graph) turn chunk ids into candidates under the same indexed-and-filter check |
+| `graph.py` | Entity and relation extraction: batches of numbered `<source>` blocks → JSON → grounded entities (with mentions) and relations | Pure. **Nothing is kept on trust:** an entity must occur, as whole words, in a chunk read (its mentions are every such chunk, not what the model listed); a relation needs a real source number of its batch, both names in *that* chunk, two different entities; a quote that is not in the chunk is blanked; labels and types are normalised. Merged by `normalize_key` (case, punctuation, a leading "the" ignored). Prompt in `prompts.py` (`GRAPH_TASK`), limits in `config.py` (`KG_*`) |
+| `graph_retrieval.py` | `expand(seeds, filter)`: chunks reached from the retrieved ones through shared entities and relations (`GRAPH_HOPS` steps, across documents), evidence chunks first, appended behind the seeds | Runs **after** the guard and on the seeds only; added chunks have no similarity, so the guard and the relevance figures never see them. A relation is followed only when its evidence chunk passes the caller's `SearchFilter` and its document is indexed (in the query and again in `load_chunks`). Entities mentioned in more than `KG_MAX_ENTITY_CHUNKS` chunks are skipped |
+| `answer_cache.py` | The semantic answer cache: entries keyed by the question vector and a **scope** (filter, model, collection, threshold, top-k, graph, prompt version), cosine ≥ `SEMANTIC_CACHE_THRESHOLD`, TTL and LRU | Pure and in memory (one worker, rule 4). `invalidate_document` drops entries the document is in the filter of or that cite it; `generation` stops a turn that began before an invalidation from storing its answer. Only clean answered turns are stored |
 | `rerank.py` | Optional FlashRank cross-encoder (**does not exist yet**) | Behind `RERANK_ENABLED`, which must stay `false` (a `true` value fails settings validation) |
 | `query_rewrite.py` | Turns a follow-up into a standalone question using prior turns | Skipped on the first turn; thinking disabled, small token limit. The conversation is untrusted data (earlier answers quote documents); a rewrite far longer than the follow-up falls back to the original question |
 | `prompts.py` | System prompt and context-block formatting | Treats context as untrusted data; numbered sources `[1]`, `[2]` |
@@ -265,7 +285,7 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | File | Purpose |
 | --- | --- |
 | `database.py` | SQLAlchemy engine and session factory |
-| `models.py` | `users`, `documents`, `chunks`, `conversations`, `messages` (incl. `conflicts`), `feedback`, `document_insights` (columns defined in `TDD.md` §4.3). Enum-like columns are `VARCHAR` + named `CHECK` (not PG enums); cascades are `ON DELETE` in the database; constraint names come from `NAMING_CONVENTION` in `database.py`. Every change needs a new migration, and `tests/test_migrations.py` fails if models and migrations disagree |
+| `models.py` | `users`, `documents`, `chunks`, `conversations`, `messages` (incl. `conflicts`), `feedback`, `document_insights`, `query_events`, `kg_entities`, `kg_mentions`, `kg_relations` (the graph; all cascade from the document and its chunks) (columns defined in `TDD.md` §4.3). Enum-like columns are `VARCHAR` + named `CHECK` (not PG enums); cascades are `ON DELETE` in the database; constraint names come from `NAMING_CONVENTION` in `database.py`. Every change needs a new migration, and `tests/test_migrations.py` fails if models and migrations disagree |
 
 ---
 
@@ -278,6 +298,7 @@ Handlers validate input, call one service function, and return a schema. **No bu
 3. `ingestion` sets `processing`, then: `parsers` → `chunking` → `metadata` → insert `chunks` rows in Postgres.
 4. `embeddings.embed_documents` (task `RETRIEVAL_DOCUMENT`, batched, normalized) → `vectorstore.upsert` (flat metadata, explicit vectors).
 5. `bm25` index is updated; document becomes `indexed` with `chunk_count`.
+   Then the after-indexing hooks run (they only queue work): the cache drops saved answers the new document can change, the executive summary and the knowledge graph are queued on the insights thread.
 6. Any failure: partial chunks removed from Chroma and Postgres, status `failed` with `error_message`. Scanned PDFs fail with "scanned PDF, OCR not supported".
 
 ### 4.2 Chat flow (question → cited answer)
@@ -285,18 +306,21 @@ Handlers validate input, call one service function, and return a schema. **No bu
 1. `POST /api/chat` → `chat_service` (streams SSE).
 2. If the conversation has prior turns → `query_rewrite` makes a standalone question.
 3. `filters.build_filter` combines user filters with the role's access levels.
-4. `embeddings.embed_query` (task `RETRIEVAL_QUERY`) → in parallel: `vectorstore` dense top 30 and `bm25` top 30, both filtered.
+3a. **Saved answer (`SEMANTIC_CACHE`).** `embeddings.embed_query` on the (rewritten) question, then `answer_cache.lookup` in the scope of this filter. On a hit whose cited chunks are all still indexed and readable (checked in Postgres): emit `cache_hit`, the stored answer, citations, conflicts and suggestions, persist it as a normal message, record one `query_events` row, done: no search, no model call. A follow-up whose rewrite changed nothing skips the cache.
+4. `embeddings.embed_query` (task `RETRIEVAL_QUERY`; already done in 3a, the vector is passed on) → in parallel: `vectorstore` dense top 30 and `bm25` top 30, both filtered.
 5. `fusion.rrf` merges; optional `rerank`; keep top K (default 5).
 6. `guard`: if best cosine (or reranker) score is below `RELEVANCE_THRESHOLD` and the lexical override does not apply → emit `REFUSAL_MESSAGE`, **do not call the LLM**.
+6a. **Graph expansion (`GRAPH_RETRIEVAL`, after the guard has passed).** `graph_retrieval.expand` follows the entities of the retrieved passages along their relations (up to `GRAPH_HOPS`, across documents) and appends up to `GRAPH_EXPANSION_MAX_CHUNKS` linked passages behind them, under the same access filter. A failure costs only the extra context.
 7. Otherwise `prompts` + `generation` stream tokens; citations are mapped to chunks and verified; one retry on invalid citations, then invalid markers are stripped and the message is flagged.
 8. If `CONFLICT_DETECTION` is on and the cited chunks come from **two or more different documents**, `analysis.detect_conflicts` checks whether they contradict each other (one extra model call; never for a single-document answer or a refusal; a failure is logged and ignored, never costs the answer).
    In parallel with it (`asyncio.gather`), if `FOLLOWUP_SUGGESTIONS` is on and the turn was answered, `analysis.suggest_followups` proposes follow-up, sub- and related questions, each naming a retrieved passage (one extra call; a failure is ignored).
 9. Persist the message (answer, citations, conflicts, suggestions, guard score, timings); emit `citations`, `conflicts` and `suggestions` (only if any) and `done`.
 10. Record one `query_events` row (`metrics_service.record`); a failed turn is recorded by `run_chat` with its error code.
+11. A clean answered turn (not refused, not flagged, no extra that failed, at least one citation) is stored in the answer cache, unless a document was indexed or deleted since the turn began searching.
 
 ### 4.3 Delete flow
 
-`DELETE /api/documents/{id}` → permission check (admin or owner) → park the document as `failed` (immediately unsearchable) → remove it from BM25 → delete Chroma vectors by `document_id` → blank its passages in saved `messages.citations` → delete the saved analyses that quote it (`document_insights` citing it or comparing against it) → delete Postgres rows (chunks and its own insights cascade) → delete the file. If a step fails, the document stays parked and the delete can be repeated; it must never be left half-searchable. (`documents.py`: 404 for a document above the caller's level, 403 only after it is visible, 409 while it is being indexed.)
+`DELETE /api/documents/{id}` → permission check (admin or owner) → park the document as `failed` (immediately unsearchable) → drop the saved answers that cite it or that it could change (`cache_service.invalidate_document`) → remove it from BM25 → delete Chroma vectors by `document_id` → blank its passages in saved `messages.citations` → delete the saved analyses that quote it (`document_insights` citing it or comparing against it) → delete Postgres rows (chunks, its own insights and its part of the knowledge graph cascade) → delete the file. If a step fails, the document stays parked and the delete can be repeated; it must never be left half-searchable. (`documents.py`: 404 for a document above the caller's level, 403 only after it is visible, 409 while it is being indexed.)
 
 ---
 
@@ -322,6 +346,9 @@ All routes live under `/api`. "Auth" means a valid JWT bearer token.
 | `POST /analysis/summary` | user | `api/analysis.py` | SSE: executive, chapters, FAQ, glossary or key-changes summary (saved; `refresh` regenerates) |
 | `POST /analysis/extract` | user | `api/analysis.py` | SSE: fields (presets or custom) extracted into cited values |
 | `POST /analysis/compare` | user | `api/analysis.py` | SSE: one cited answer per document (2 to `COMPARE_MAX_DOCUMENTS`), then conflicts |
+| `GET /graph` | user | `api/graph.py` | The knowledge graph of the chosen documents (or all readable ones): nodes, edges, per-document build status |
+| `GET /graph/entity` | user | `api/graph.py` | One entity: mentions (citation-shaped passages) and relations with their evidence |
+| `POST /documents/{id}/graph` | user | `api/graph.py` | Queue building or rebuilding a document's graph (202) |
 | `GET /conversations` | user | `api/conversations.py` | Own conversations |
 | `GET /conversations/{id}` | user (owner) | `api/conversations.py` | Messages |
 | `PATCH /conversations/{id}` | user (owner) | `api/conversations.py` | Rename |
@@ -340,7 +367,7 @@ All routes live under `/api`. "Auth" means a valid JWT bearer token.
 | `/` | redirect to `/chat` | protected |
 | `/chat`, `/chat/:conversationId` | `ChatPage` | protected |
 | `/library` | `LibraryPage` | protected |
-| `/analyze` (`?tab=compare\|extract\|summaries&doc=<id>`) | `AnalyzePage` | protected |
+| `/analyze` (`?tab=compare\|extract\|summaries\|graph&doc=<id>`) | `AnalyzePage` | protected |
 | `/dashboard` | `DashboardPage` (evaluation) | admins (others are redirected to `/chat`) |
 | `/users` | `UsersPage` | admins (others are redirected to `/chat`) |
 | `*` | `NotFoundPage` | public |
@@ -362,10 +389,11 @@ What exists (the implementation is consolidated; there are no separate `sse.ts`,
 | `pages/` | `LoginPage` | Sign in and sign up (by `mode`) |
 | | `LibraryPage` | Upload dropzone (keyboard-operable), document table (polls while any document is `queued`/`processing`), status badges, delete confirmation dialog |
 | | `ChatPage` | Conversation sidebar, message list, filter bar, input, source drawer, the thumbs up/down and refusal notice, the "Sources disagree" panel (live and from saved `message.conflicts`). A per-question id makes a stream that is no longer current inert (switching conversations, Stop), and the input stays busy until the stored conversation is reloaded |
-| | `AnalyzePage` | Tabs Compare / Extract / Summaries (tab and document in the address); all three stay mounted so work in progress survives a tab change; one `SourceDrawer` for every citation |
+| | `AnalyzePage` | Tabs Compare / Extract / Summaries / Graph (tab and document in the address; the tab row scrolls inside itself on a phone); all four stay mounted so work in progress survives a tab change; one `SourceDrawer` for every citation |
 | `components/` | `ErrorBoundary` | A render error shows a way out instead of a blank page |
 | `components/chat/` | `Answer`, `CitationChip`, `ConflictPanel`, `FilterBar` | Text with clickable citation chips (also inside bold text; unavailable sources are shown as such), lists; one chip; each document's conflicting claim with its citation; pre-retrieval filters |
 | `components/analyze/` | `CompareTab`, `ExtractTab`, `SummariesTab`, `DocumentPicker` | Side-by-side columns that stream per document ("Not covered in this document" when the guard stops one; columns left unfinished by an error say so); field presets, custom fields, table / JSON view, JSON and CSV export (`lib/analysis.ts`: CSV cells that look like formulas are neutralised); five summary cards with saved status, Regenerate, Copy as Markdown |
+| `components/analyze/GraphTab` + `components/graph/` | `GraphTab`, `ForceGraph`, `layout.ts`, `entityTypes.ts` | Document chips with a status dot and a Build / Rebuild button per document (the cost is stated; nothing is built unasked in the tab), type chips, name search, the SVG graph (a cooling force layout in plain TypeScript, so no library and no worker under the CSP; wheel zoom, drag to pan, drag a node, `prefers-reduced-motion` settles it at once), a keyboard-operable entity list, and a detail panel: description, relations with quotes and "Open the source", mentions; every passage opens in the source drawer. The hook is `hooks/useKnowledgeGraph.ts` (polls while a build is pending) |
 | `components/source/` | `SourceDrawer` | Opens on citation click: highlighted chunk, document name, page, section, embedded original (`#page=N` for PDFs; other types show chunk + download link); Escape closes it |
 
 ---
@@ -438,6 +466,12 @@ What exists (the implementation is consolidated; there are no separate `sse.ts`,
 
 37. **There is always at least one administrator, and one sign-in page serves everyone** (no separate admin portal: the role, re-read from Postgres on every request, decides). Anything that creates, promotes, demotes or removes accounts runs under `auth_service.lock_accounts` (the signup advisory lock), so concurrent requests cannot leave zero administrators; `tests/test_users_api.py` widens the race on purpose and fails without the lock. An administrator cannot delete their own account. Admin-only routes use `AdminUser`; admin-only screens must also redirect non-admins.
 
+### 7.10 Saved answers, the knowledge graph and background jobs
+
+38. **A saved answer is served only inside its scope and only while its sources stand.** The scope is the full `SearchFilter` (access levels included) plus the model, collection, threshold, top-k, graph setting and `PROMPT_VERSION`, so two roles never share an entry. Every hit re-checks in Postgres that each cited chunk still exists, is indexed and passes the reader's filter. Indexing a document, deleting one (right after it is parked, before anything is scrubbed), finishing a graph build and a thumbs-down all invalidate (`cache_service`); a turn that began before an invalidation cannot store its answer (`AnswerCache.generation`). Only clean answered turns are stored (never a refusal, a flagged answer or one whose extras failed). Anything that can change what an answer says needs a test in `test_semantic_cache.py` showing the stale answer is not served.
+39. **Knowledge-graph facts are grounded like answers, and the graph never widens access.** An entity is kept only if its name occurs as whole words in a chunk read, and its mentions are the chunks that contain it, not what the model claimed; a relation needs both names in the chunk it cites, a real source number and two different entities; a quote that is not in the chunk is blanked (`core/graph.py`, `tests/test_graph_core.py`). Reading the graph (`graph_service`) and walking it (`graph_retrieval`) use only indexed documents the caller may read and filter every passage by their access levels; a relation stated in an unreadable passage is not followed. Expansion runs **after** the guard, on the seeds only, adds chunks without a similarity score, and is never used to rescue a refusal (rules 7 and 8). A change that could bypass any of this needs a test in `test_graph_api.py` / `test_graph_retrieval.py`.
+40. **Background model jobs run through `llm.run_background`.** The Gemini async client belongs to the event loop that opened its connections; `llm.py` caches it per running loop and `run_background` closes a job's clients before its loop ends. Never call `asyncio.run` on a model coroutine from a background thread, and never keep a client of your own.
+
 ---
 
 ## 8. Coding Standards
@@ -459,7 +493,8 @@ What exists (the implementation is consolidated; there are no separate `sse.ts`,
 * **Unit tests:** parsers, chunking (page numbers preserved, no mid-sentence cuts, overlap, token ceiling), filter building, RRF, guard (including lexical override), citation verification, access-level filtering.
 * **Integration test:** `tests/test_chat.py` uploads a small sample document → waits for `indexed` → queries → asserts a valid citation. Mock the LLM and embeddings in tests (no network calls, no API key needed).
 * **Coverage that must not erode:** every route except the public ones refuses a missing or bad token (`test_conversations_api.py` reads the route list from the OpenAPI schema, so a new route is covered automatically); conversations and feedback are scoped to their owner; text parsers have wall-time ceilings on hostile input.
-* **Evaluation (`eval/run_eval.py`):** hit-rate@5 and MRR for dense-only, keyword-only and hybrid (hybrid + rerank once reranking exists); the guard decided by the production `retrieval.retrieve` + `guard.evaluate`; per-stage latency p50/p95. The set includes exact-token questions and 12 unanswerable ones (`eval/README.md`); `test_eval_corpus.py` keeps questions and corpus in step. The exit status fails on off-topic leakage, a wrongly stopped answerable question, or a low hybrid hit-rate.
+* **Evaluation (`eval/run_eval.py`):** hit-rate@5 and MRR for dense-only, keyword-only and hybrid (hybrid + rerank once reranking exists), plus `hybrid+graph` and the multi-hop count once a knowledge graph has been built; the guard decided by the production `retrieval.retrieve` + `guard.evaluate`; per-stage latency p50/p95. The set includes exact-token questions, 12 unanswerable ones and 3 multi-hop ones (`eval/README.md`; a question whose documents are not indexed is skipped); `test_eval_corpus.py` keeps questions and corpus in step. A change to graph extraction or expansion is compared with `RETRIEVAL_TOP_K=1` (plain search too narrow to find both documents) as well as the default.
+* **The saved-answer cache and the graph are off or neutral in the old tests:** `conftest.py` sets `SEMANTIC_CACHE=false` (a repeated question would skip the scripted model) and `AUTO_KNOWLEDGE_GRAPH=false` (an upload would queue model calls); `test_semantic_cache.py` switches the cache on, `test_graph_api.py` builds graphs on request. Graph builds use the same scripted model as answers, so a test that counts answer calls must look only at prompts that contain a `QUESTION` block (see `answer_prompts` in `test_graph_retrieval.py`). The exit status fails on off-topic leakage, a wrongly stopped answerable question, or a low hybrid hit-rate.
 * A change is not done until `pytest` passes and, if it touches retrieval, embeddings, the guard, or prompts, the eval script has been run and compared with the previous result.
 
 ---
@@ -494,6 +529,10 @@ What exists (the implementation is consolidated; there are no separate `sse.ts`,
 | Add a table or column | `db/models.py` + a new Alembic migration (never edit old migrations) |
 | Add or change a summary kind, extraction preset or conflict prompt | `core/prompts.py`, `core/analysis.py` (output model, `PRESETS`), `constants.InsightKind` (+ a migration if the `CHECK` changes), `schemas.py`, the frontend `SummariesTab` / `ExtractTab` and `lib/analysis.ts` |
 | Analysis limits (tokens, batch size, fields, documents), automatic summary, conflict check | `.env` / `config.py` (`ANALYSIS_*`, `AUTO_EXECUTIVE_SUMMARY`, `CONFLICT_DETECTION`, `COMPARE_MAX_DOCUMENTS`, `EXTRACTION_MAX_FIELDS`) |
+| Saved-answer cache: on/off, similarity threshold, lifetime, size | `.env` / `config.py` (`SEMANTIC_CACHE*`). Change the answer prompt, citation rules or context format: bump `prompts.PROMPT_VERSION` so old saved answers are never served |
+| Knowledge graph: on/off, build after upload, how much is read per call, entities kept | `.env` / `config.py` (`KNOWLEDGE_GRAPH`, `AUTO_KNOWLEDGE_GRAPH`, `KG_*`) |
+| Graph retrieval: on/off, hops, passages added, entities too common to follow | `.env` / `config.py` (`GRAPH_RETRIEVAL`, `GRAPH_HOPS`, `GRAPH_EXPANSION_MAX_CHUNKS`, `KG_MAX_ENTITY_CHUNKS`); re-run the eval (also with `RETRIEVAL_TOP_K=1`) |
+| Add an entity type or change the graph prompt | `constants.EntityType` (+ a migration, the `CHECK` lists the types), `core/prompts.py` (`GRAPH_TASK`), `core/graph.py`, frontend `components/graph/entityTypes.ts` |
 
 ---
 
@@ -539,7 +578,10 @@ docker compose exec backend alembic upgrade head
 ## 13. Known Limitations
 
 * Scanned PDFs (no extractable text) are rejected; OCR is not supported.
-* Single backend worker (in-memory BM25 index).
+* Single backend worker (in-memory BM25 index, and the in-memory saved-answer cache).
+* The saved-answer cache is lost on restart and is only as good as its invalidation (a re-check on every hit is the backstop). A question must be near-identical (cosine ≥ 0.95 on the standalone question); a follow-up whose rewrite changed nothing is not cached. Answers that carry a conflict panel or follow-ups are cached with them, so those can be stale for a time after the model would have said something else; a thumbs-down evicts.
+* The knowledge graph costs about one model call per 30,000 characters per document (a 1,500-chunk manual is about 25 calls: it is read at evenly spaced parts beyond `KG_MAX_BATCHES`, and `coverage` says how much). Documents indexed before the feature existed have no graph until someone presses Build; on a free-tier key the builds queue behind the other background jobs and a Gemini 503 fails one (it is saved as `failed` and can be retried). Entities are merged **by name only**: two different things called the same are one node, and a synonym ("the Registrar", "Registrar's Office") is another. The model can still miss relations; what it does report is checked against the text, but a stated relation can be a misreading of that text.
+* Graph retrieval adds at most `GRAPH_EXPANSION_MAX_CHUNKS` passages and can add noise to an answer whose seeds were already complete; on the small evaluation corpus it changed nothing at the default `RETRIEVAL_TOP_K` and recovered all three multi-hop questions when plain search was narrowed to one passage.
 * Document text and questions are sent to Google's Gemini API; use a paid-tier key and review current terms before uploading confidential documents.
 * `gemini-2.5-flash` is closed to new API keys (404 "no longer available to new users"), so the default is `gemini-3.8-flash`; keep the model ID in configuration and re-run the eval before migrating.
 * Free-tier Gemini keys have per-minute and per-day limits (embeddings and chat). Chat retries a rate limit briefly, then shows a friendly error.

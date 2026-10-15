@@ -25,6 +25,7 @@ from app.constants import (
     ACCESS_LEVELS,
     AccessLevel,
     DocumentStatus,
+    EntityType,
     EventKind,
     EventOutcome,
     FeedbackRating,
@@ -262,6 +263,68 @@ class DocumentInsight(Base):
     updated_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()
     )
+
+
+class KgEntity(Base):
+    """A person, policy, course, concept... found in one document (the knowledge graph).
+
+    ``key`` is the normalised name; entities with the same key in different documents are one node
+    when the graph of several documents is shown or walked, which is what links the documents.
+    Every row cascades from its document, so deleting a document removes its part of the graph.
+    """
+
+    __tablename__ = "kg_entities"
+    __table_args__ = (
+        UniqueConstraint("document_id", "key"),
+        CheckConstraint(_in("type", EntityType), name="type_valid"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(sa.String(200))
+    key: Mapped[str] = mapped_column(sa.String(200), index=True)
+    type: Mapped[str] = mapped_column(sa.String(16), default="other", server_default="other")
+    description: Mapped[str] = mapped_column(sa.Text, default="", server_default="")
+    created_at: Mapped[datetime] = _created_at()
+
+
+class KgMention(Base):
+    """An entity appears in a chunk: the link from the graph back to the source text."""
+
+    __tablename__ = "kg_mentions"
+
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("kg_entities.id", ondelete="CASCADE"), primary_key=True
+    )
+    chunk_id: Mapped[str] = mapped_column(
+        ForeignKey("chunks.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+
+
+class KgRelation(Base):
+    """A relationship two entities of one document are stated to have, with its evidence chunk."""
+
+    __tablename__ = "kg_relations"
+    __table_args__ = (
+        UniqueConstraint("source_id", "target_id", "label", "chunk_id"),
+        CheckConstraint("source_id <> target_id", name="not_self"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("kg_entities.id", ondelete="CASCADE"), index=True
+    )
+    target_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("kg_entities.id", ondelete="CASCADE"), index=True
+    )
+    label: Mapped[str] = mapped_column(sa.String(64))
+    chunk_id: Mapped[str] = mapped_column(ForeignKey("chunks.id", ondelete="CASCADE"), index=True)
+    quote: Mapped[str] = mapped_column(sa.Text, default="", server_default="")
 
 
 class QueryEvent(Base):

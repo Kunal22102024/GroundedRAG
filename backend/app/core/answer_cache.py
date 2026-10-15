@@ -88,6 +88,8 @@ def scope_key(search_filter: SearchFilter) -> str:
         "collection": settings.collection_name,
         "threshold": settings.relevance_threshold,
         "top_k": settings.retrieval_top_k,
+        # Answers written with and without the graph's extra passages are different answers.
+        "graph_hops": settings.graph_hops if settings.graph_retrieval_active else 0,
         "prompt": prompts.PROMPT_VERSION,
     }
     return hashlib.sha256(json.dumps(description, sort_keys=True).encode()).hexdigest()

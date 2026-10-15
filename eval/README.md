@@ -10,7 +10,7 @@ LLM calls: the only cost is one embedding request per question.
 
 | File | Where it comes from |
 | --- | --- |
-| `sample_docs/` | Five small generated documents, **committed**: `HR_Leave_Policy_2025-03-01.docx`, `Gateway_Runbook.md`, `Network_Spec.html`, `Operations_Notes.txt`, `Quarterly_Report_2026-01-15.pdf` (12 pages, one region per page). |
+| `sample_docs/` | Seven small generated documents, **committed**: `HR_Leave_Policy_2025-03-01.docx`, `Gateway_Runbook.md`, `Network_Spec.html`, `Operations_Notes.txt`, `Quarterly_Report_2026-01-15.pdf` (12 pages, one region per page), and the pair `Course_Catalogue.md` + `Registrar_Procedures.md` for the multi-hop questions. |
 | three public PDFs | **Not committed** (third-party copyright). Download them and put them next to your own files in `sample_docs/` at the repository root (that folder is git-ignored): `369.pdf`, `SANS_Password_Construction_Standard_April2025.pdf`, `sans_Email_Management_Policy_feb2026.pdf`, all from the SANS security policy templates (<https://www.sans.org/information-security-policy/>). |
 
 A question whose documents are not indexed is skipped and listed at the end of the run, so a partial
@@ -40,6 +40,7 @@ through the guard, or the hybrid hit-rate@5 is below `--min-hit-rate` (default 0
 | --- | --- | --- |
 | `normal` | yes | The expected document and page are in the top 5, and the guard lets it through. |
 | `exact_token` | yes | An error code, id or time (`ERR_404_NET`, `EM-09`, `01:30`, `E2`) is found even when the dense score is modest. |
+| `multi_hop` | yes | The answer is in a second document that the question hardly resembles (`Registrar_Procedures.md`), reachable only through an entity the two documents share (the Registrar, the prerequisite waiver). With a knowledge graph built, the `hybrid+graph` row shows whether the graph brings it in. Needs both documents of `requires` indexed; otherwise skipped. |
 | `near_miss` | no | The topic is in the documents but the fact is not. The guard is **expected** to let it through: the model's own refusal handles it. Reported, not judged. |
 | `off_topic` | no | Nothing in the documents is relevant. The guard must stop it before the LLM. |
 
@@ -69,3 +70,29 @@ Best dense similarity by kind
 The gap between the weakest answerable question (0.638) and the strongest off-topic one (0.544) is
 what the 0.60 threshold sits in. It is about 0.1 wide: if a change narrows it, recalibrate before
 shipping. Embedding p50 is about 0.5 s per question; search and fusion are a few milliseconds.
+
+## Knowledge graph (multi-hop) result
+
+Once any document has a knowledge graph, `run_eval.py` adds a `hybrid+graph` row (the hybrid result
+plus the passages `graph_retrieval.expand` appends, for questions the guard lets through) and counts
+the `multi_hop` questions answered from both documents. It reads the graph; it never builds one. To
+reproduce: upload `Course_Catalogue.md` and `Registrar_Procedures.md`, wait for their graphs (the
+Analyze > Graph tab shows "Ready"), run the evaluation, then delete the two documents.
+
+Measured on the real library plus those two documents (27 questions, 9 documents with their graphs):
+
+```
+RETRIEVAL_TOP_K=1   (plain search too narrow to find both documents)
+hybrid         hit-rate 0.80   MRR 0.80      multi-hop answered from both documents: 0/3
+hybrid+graph   hit-rate 1.00   MRR 0.90                                              3/3
+graph added passages to 3/27 questions (3.0 each)
+
+RETRIEVAL_TOP_K=5   (the default)
+hybrid         hit-rate 1.00   MRR 0.89      multi-hop: 3/3
+hybrid+graph   hit-rate 1.00   MRR 0.89                 3/3
+graph added passages to 2/27 questions (1.0 each)
+```
+
+At the default the corpus is small enough that plain search already finds both documents, so the
+graph changes nothing; narrowing the search shows what it brings. The guard figures and every number
+in "Reference result" above are unchanged (the graph runs after the guard).

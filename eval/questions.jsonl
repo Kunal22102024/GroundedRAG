@@ -22,3 +22,6 @@
 {"question": "What is the capital of Australia?", "expected_document": null, "expected_page": null, "answerable": false, "kind": "off_topic"}
 {"question": "Recommend a good pasta recipe for dinner.", "expected_document": null, "expected_page": null, "answerable": false, "kind": "off_topic"}
 {"question": "How do I change a flat tire on a bicycle?", "expected_document": null, "expected_page": null, "answerable": false, "kind": "off_topic"}
+{"question": "I have not passed CS320, so how long do I have to file my request to take CS450 Advanced Databases?", "expected_document": "Registrar_Procedures.md", "expected_page": 1, "answerable": true, "kind": "multi_hop", "requires": ["Course_Catalogue.md"]}
+{"question": "Whose signature is needed to waive the Data Structures prerequisite for Advanced Databases?", "expected_document": "Registrar_Procedures.md", "expected_page": 1, "answerable": true, "kind": "multi_hop", "requires": ["Course_Catalogue.md"]}
+{"question": "If I skip the CS320 prerequisite of CS450, who decides and by when must I ask?", "expected_document": "Registrar_Procedures.md", "expected_page": 1, "answerable": true, "kind": "multi_hop", "requires": ["Course_Catalogue.md"]}

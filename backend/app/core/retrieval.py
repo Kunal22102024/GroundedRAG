@@ -157,6 +157,37 @@ def _load(db: Session, ids: list[str], search_filter: SearchFilter) -> dict[str,
     return {row.id: row for row in rows}
 
 
+def load_chunks(db: Session, ids: list[str], search_filter: SearchFilter) -> dict[str, Any]:
+    """Rows for chunk ids that may be shown: indexed documents only, the filter applied (rule 6).
+    For other retrieval channels (the knowledge graph) that find chunks by other means."""
+    return _load(db, ids, search_filter)
+
+
+def candidate_from_row(
+    row: Any,
+    *,
+    similarity: float | None = None,
+    keyword_score: float | None = None,
+    rrf_score: float = 0.0,
+) -> Candidate:
+    """A ``Candidate`` from a row of ``load_chunks``."""
+    return Candidate(
+        chunk_id=row.id,
+        document_id=str(row.document_id),
+        document_name=row.name,
+        text=row.content,
+        page_number=row.page_number,
+        page_end=row.page_end,
+        section_title=row.section_title,
+        department=row.department,
+        document_type=row.document_type,
+        access_level=row.access_level,
+        similarity=similarity,
+        keyword_score=keyword_score,
+        rrf_score=rrf_score,
+    )
+
+
 def retrieve(
     question: str, search_filter: SearchFilter, vector: list[float] | None = None
 ) -> RetrievalResult:
@@ -208,17 +239,8 @@ def retrieve(
         if row is None:
             continue
         candidates.append(
-            Candidate(
-                chunk_id=chunk_id,
-                document_id=str(row.document_id),
-                document_name=row.name,
-                text=row.content,
-                page_number=row.page_number,
-                page_end=row.page_end,
-                section_title=row.section_title,
-                department=row.department,
-                document_type=row.document_type,
-                access_level=row.access_level,
+            candidate_from_row(
+                row,
                 similarity=similarity.get(chunk_id),
                 keyword_score=keyword_score.get(chunk_id),
                 rrf_score=score,

@@ -74,6 +74,34 @@ class Settings(BaseSettings):
     # A past question is suggested to other people only once this many different users asked it.
     popular_min_users: int = Field(default=2, ge=2)
 
+    # --- Knowledge graph ----------------------------------------------------------------------
+    # Entities (people, policies, courses, concepts...) and the relationships between them are
+    # extracted from each document with the model, linked to the chunks they come from, shown in
+    # Analyze > Graph, and (GRAPH_RETRIEVAL) used to pull related passages into an answer.
+    knowledge_graph: bool = True
+    # Build the graph of every document right after it is indexed: about one model call per
+    # KG_BATCH_CHARS of text. False: only when someone asks for it in the Graph tab.
+    auto_knowledge_graph: bool = True
+    # Text read per model call, at most this many calls per document (a longer document is read
+    # at evenly spaced parts), and what one call may return.
+    kg_batch_chars: int = Field(default=30_000, ge=5_000, le=200_000)
+    kg_max_batches: int = Field(default=25, ge=1, le=200)
+    kg_max_entities_per_batch: int = Field(default=40, ge=5, le=200)
+    kg_max_relations_per_batch: int = Field(default=60, ge=5, le=300)
+    kg_max_output_tokens: int = Field(default=8192, ge=1024, le=32768)
+    # Entities kept per document (those mentioned in most chunks), and nodes drawn at once.
+    kg_max_entities: int = Field(default=400, ge=10, le=5_000)
+    kg_view_max_nodes: int = Field(default=150, ge=10, le=1_000)
+    # GraphRAG: after the guard has passed, passages connected to the retrieved ones through shared
+    # entities and their relations (up to GRAPH_HOPS steps, across documents) are added to what the
+    # model is given, at most GRAPH_EXPANSION_MAX_CHUNKS of them. The guard never sees them.
+    graph_retrieval: bool = True
+    graph_hops: int = Field(default=2, ge=1, le=3)
+    graph_expansion_max_chunks: int = Field(default=3, ge=1, le=10)
+    # An entity mentioned in more chunks than this ("the university") connects everything to
+    # everything and is not followed.
+    kg_max_entity_chunks: int = Field(default=40, ge=1)
+
     # --- Semantic answer cache --------------------------------------------------------------
     # A clean, cited answer is reused for a near-identical question asked under the same access
     # level, filters and document selection (no retrieval, no model call). Kept in memory only.
@@ -177,6 +205,11 @@ class Settings(BaseSettings):
         if self.retrieval_top_k > self.retrieval_candidates:
             raise ValueError("RETRIEVAL_TOP_K must not exceed RETRIEVAL_CANDIDATES")
         return self
+
+    @property
+    def graph_retrieval_active(self) -> bool:
+        """Whether answers are widened through the graph (it needs the graph feature itself)."""
+        return self.knowledge_graph and self.graph_retrieval
 
     @property
     def rewrite_model_id(self) -> str:
