@@ -9,6 +9,7 @@ safe to show; nothing here logs questions, answers or document text (rule 21).
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 import uuid
@@ -17,22 +18,33 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import select
+import numpy as np
+from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.constants import (
     CONVERSATION_TITLE_MAX_CHARS,
     REFUSAL_MESSAGE,
     REWRITE_HISTORY_MESSAGES,
+    DocumentStatus,
     EventKind,
     EventOutcome,
     MessageRole,
     QuestionSource,
 )
-from app.core import analysis, embeddings, generation, guard, llm, query_rewrite, retrieval
+from app.core import (
+    analysis,
+    answer_cache,
+    embeddings,
+    generation,
+    guard,
+    llm,
+    query_rewrite,
+    retrieval,
+)
 from app.core.filters import FilterRequest, SearchFilter, build_filter
 from app.db.database import get_sessionmaker
-from app.db.models import Conversation, Message
+from app.db.models import Chunk, Conversation, Document, Message
 from app.services import metrics_service
 
 logger = logging.getLogger(__name__)
@@ -170,6 +182,104 @@ def _ms(since: float) -> float:
     return round((time.perf_counter() - since) * 1000, 1)
 
 
+def _cache_entry_valid(entry: answer_cache.CacheEntry, search_filter: SearchFilter) -> bool:
+    """A cached answer is served only if every passage it cites is still there: its document is
+    indexed and the passage passes this reader's filter. Invalidation should already have dropped
+    such an entry; this is the check that does not rely on it (rules 6 and 24)."""
+    wanted = set(entry.cited_chunk_ids)
+    if not wanted:
+        return False
+    with get_sessionmaker()() as db:
+        found = db.scalar(
+            select(func.count(func.distinct(Chunk.id)))
+            .join(Document, Document.id == Chunk.document_id)
+            .where(
+                Chunk.id.in_(wanted),
+                Document.status == DocumentStatus.INDEXED.value,
+                *search_filter.sql_conditions(Chunk),
+            )
+        )
+    return found == len(wanted)
+
+
+async def _serve_cached(
+    plan: ChatPlan,
+    event: dict[str, Any],
+    hit: answer_cache.CacheHit,
+    rewritten: bool,
+    started: float,
+) -> AsyncIterator[SseEvent]:
+    """Answer from a saved turn: no search, no model call. The answer is stored as a normal
+    message and measured like any other turn, so history and the dashboard stay complete."""
+    entry = hit.entry
+    timings: dict[str, Any] = event["timings"]
+    citations = copy.deepcopy(entry.citations)
+    conflicts = copy.deepcopy(entry.conflicts)
+    suggestions = copy.deepcopy(entry.suggestions)
+
+    yield SseEvent("status", {"stage": "cache_hit"})
+    yield SseEvent("token", {"text": entry.answer})
+
+    timings.update(
+        cache="hit", cache_similarity=round(hit.similarity, 4), saved_tokens=entry.saved_tokens
+    )
+    timings["total_ms"] = _ms(started)
+    event.update(
+        guard_reason=entry.guard.get("reason"),
+        best_similarity=entry.guard.get("score"),
+        cited=len(citations),
+        cited_documents=len(entry.cited_document_ids),
+        cited_document_ids=sorted(entry.cited_document_ids),
+        conflicts=len(conflicts),
+        suggestions=len(suggestions),
+        total_ms=timings["total_ms"],
+    )
+    message_id = await asyncio.to_thread(
+        _persist,
+        plan,
+        entry.answer,
+        citations,
+        entry.guard.get("score"),
+        {**timings, "usage": {}},
+        False,
+        conflicts,
+        suggestions,
+    )
+    answer_cache.get_cache().register_message(hit.entry_id, str(message_id))
+    event["message_id"] = message_id
+    await asyncio.to_thread(metrics_service.record, event)
+    logger.info(
+        "chat turn served from cache",
+        extra={"similarity": round(hit.similarity, 4), "total_ms": timings["total_ms"]},
+    )
+
+    yield SseEvent("citations", {"citations": citations})
+    if conflicts:
+        yield SseEvent("conflicts", {"conflicts": conflicts})
+    if suggestions:
+        yield SseEvent("suggestions", {"suggestions": public_suggestions(suggestions)})
+    yield SseEvent(
+        "done",
+        {
+            "conversation_id": str(plan.conversation_id),
+            "message_id": str(message_id),
+            "answer": entry.answer,
+            "refused": False,
+            "guard": entry.guard,
+            "timings": timings,
+            "usage": {},
+            "flags": {
+                "partial": False,
+                "citations_removed": 0,
+                "uncited": False,
+                "retried": False,
+                "rewritten": rewritten,
+            },
+            "cached": True,
+        },
+    )
+
+
 async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent]:
     """The turn itself. ``event`` (the dashboard measurement) is filled in as stages complete,
     so a turn that fails half-way still reports what it got to (``run_chat`` records it)."""
@@ -185,8 +295,36 @@ async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent
         question = await query_rewrite.rewrite_question(plan.question, plan.history)
         timings["rewrite_ms"] = _ms(step)
 
-    event["rewritten"] = question != plan.question
-    result = await asyncio.to_thread(retrieval.retrieve, question, plan.search_filter)
+    rewritten = question != plan.question
+    event["rewritten"] = rewritten
+
+    # Saved answers (core/answer_cache.py). Not for a follow-up whose rewrite changed nothing: it
+    # may still lean on the conversation ("and the second one?"), so its words alone say too little.
+    cache = answer_cache.get_cache()
+    use_cache = (
+        settings.semantic_cache
+        and not plan.search_filter.matches_nothing
+        and (rewritten or not plan.history)
+    )
+    vector: list[float] | None = None
+    scope = ""
+    generation_seen = 0
+    if use_cache:
+        generation_seen = cache.generation  # read before searching: see AnswerCache.store
+        step = time.perf_counter()
+        vector = await asyncio.to_thread(embeddings.embed_query, question, interactive=True)
+        timings["embed_ms"] = _ms(step)
+        scope = answer_cache.scope_key(plan.search_filter)
+        hit = cache.lookup(scope, vector)
+        if hit is not None:
+            if await asyncio.to_thread(_cache_entry_valid, hit.entry, plan.search_filter):
+                async for item in _serve_cached(plan, event, hit, rewritten, started):
+                    yield item
+                return
+            cache.evict(hit.entry_id)  # a passage it cites is gone or no longer readable
+            generation_seen = cache.generation
+
+    result = await asyncio.to_thread(retrieval.retrieve, question, plan.search_filter, vector)
     timings.update(result.timings)
     metrics_service.add_retrieval(event, [c.similarity for c in result.candidates])
 
@@ -216,6 +354,7 @@ async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent
     citations: list[dict[str, Any]] = []
     conflicts: list[dict[str, Any]] = []
     suggestions: list[dict[str, Any]] = []
+    extras_failed = False  # an extra that failed would be missing from a saved answer for good
 
     if not decision.passed:
         # Below the threshold: the LLM is never called (CLAUDE.md rule 8).
@@ -270,22 +409,26 @@ async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent
         offer_followups = settings.followup_suggestions and not refused
 
         async def conflict_check() -> None:
+            nonlocal extras_failed
             step = time.perf_counter()
             try:
                 found, used = await analysis.detect_conflicts(question, passages)
                 conflicts.extend(found)
                 metrics_service.add_usage(extra_usage, used)
             except Exception as exc:  # the answer is complete; the check is an extra
+                extras_failed = True
                 logger.warning("conflict check failed", extra={"error": type(exc).__name__})
             timings["conflict_ms"] = _ms(step)
 
         async def followups() -> None:
+            nonlocal extras_failed
             step = time.perf_counter()
             try:
                 found, used = await analysis.suggest_followups(question, answer, result.candidates)
                 suggestions.extend(found)
                 metrics_service.add_usage(extra_usage, used)
             except Exception as exc:  # an extra, like the conflict check
+                extras_failed = True
                 logger.warning("follow-up suggestions failed", extra={"error": type(exc).__name__})
             timings["followup_ms"] = _ms(step)
 
@@ -326,6 +469,34 @@ async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent
         total_ms=timings["total_ms"],
     )
     await asyncio.to_thread(metrics_service.record, event)
+    if (
+        use_cache
+        and vector is not None
+        and decision.passed
+        and not refused
+        and not flagged
+        and not extras_failed
+        and citations
+    ):
+        entry_id = cache.store(
+            answer_cache.CacheEntry(
+                scope=scope,
+                vector=np.asarray(vector, dtype=np.float32),
+                search_filter=plan.search_filter,
+                answer=answer,
+                citations=copy.deepcopy(citations),
+                conflicts=copy.deepcopy(conflicts),
+                suggestions=copy.deepcopy(suggestions),
+                guard=guard_info,
+                cited_chunk_ids=tuple(c["chunk_id"] for c in citations),
+                cited_document_ids=frozenset(c["document_id"] for c in citations),
+                saved_tokens=int(usage.get("total_tokens") or 0)
+                + int(extra_usage.get("total_tokens") or 0),
+            ),
+            generation_seen,
+        )
+        if entry_id is not None:
+            cache.register_message(entry_id, str(message_id))
     logger.info(
         "chat turn complete",
         extra={
@@ -356,6 +527,7 @@ async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent
             "timings": timings,
             "usage": usage,
             "flags": flags,
+            "cached": False,
         },
     )
 

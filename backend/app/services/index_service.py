@@ -26,7 +26,7 @@ from app.constants import DocumentStatus
 from app.core import bm25, vectorstore
 from app.db.database import get_sessionmaker
 from app.db.models import Chunk, Document
-from app.services import analysis_service, ingestion, metrics_service
+from app.services import analysis_service, cache_service, ingestion, metrics_service
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,8 @@ def run_startup() -> StartupReport:
             )
 
     ingestion.start_workers()
+    # Registered first: a new document must stop stale saved answers before anything else runs.
+    ingestion.on_indexed(cache_service.on_document_indexed)
     ingestion.on_indexed(analysis_service.submit_auto_summary)  # executive summary after upload
     for document_id in queued:
         ingestion.submit(document_id)

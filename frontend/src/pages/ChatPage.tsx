@@ -10,6 +10,7 @@ import SourceDrawer from "../components/source/SourceDrawer";
 import {
   AlertCircleIcon,
   AlertTriangleIcon,
+  BoltIcon,
   BookOpenIcon,
   ChatIcon,
   CheckIcon,
@@ -61,6 +62,7 @@ interface StreamState {
 const STATUS_TEXT: Record<string, string> = {
   searching: "Searching your documents",
   rewriting: "Understanding your follow-up",
+  cache_hit: "Found a saved answer",
   generating: "Writing the answer",
   checking_sources: "Checking the sources against each other",
   suggesting: "Finding follow-up questions",
@@ -202,6 +204,18 @@ function MessageActions({ message }: { message: Message }) {
   );
 }
 
+/** Shown under an answer that was served from the saved-answer cache. */
+function SavedAnswerNote() {
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2 py-0.5 text-xs text-indigo-700"
+      title="A near-identical question was answered before, and the documents have not changed since. No new AI call was made."
+    >
+      <BoltIcon size={12} /> Saved answer, no new AI call
+    </span>
+  );
+}
+
 function UserBubble({ text }: { text: string }) {
   return (
     <div className="flex animate-fade-up justify-end">
@@ -243,8 +257,9 @@ function AssistantBubble({
           {!refusal && message.suggestions && <SuggestionChips suggestions={message.suggestions} onAsk={onAsk} disabled={busy} />}
         </div>
         {!refusal && (
-          <div className="mt-1 pl-1">
+          <div className="mt-1 flex items-center gap-2 pl-1">
             <MessageActions message={message} />
+            {message.cached && <SavedAnswerNote />}
           </div>
         )}
       </div>
@@ -605,6 +620,7 @@ export default function ChatPage() {
                     ) : null}
                     {stream.conflicts.length > 0 && <ConflictPanel conflicts={stream.conflicts} citations={stream.citations} onCite={setDrawer} />}
                     {stream.suggestions.length > 0 && !busy && <SuggestionChips suggestions={stream.suggestions} onAsk={askFollowUp} />}
+                    {stream.done?.cached && <SavedAnswerNote />}
                     {stream.status === "stopped" && <p className="text-sm text-slate-500">Stopped. This answer was not saved.</p>}
                     {busy && !(stream.status === "generating" && stream.text) && <TypingIndicator label={STATUS_TEXT[stream.status] ?? "Working"} />}
                   </div>

@@ -330,6 +330,12 @@ export default function DashboardPage() {
                     ],
                   }))}
                 />
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4" aria-label="Saved-answer cache">
+                  <Stat label="Saved answers served" value={m.cache.enabled || m.cache.hits ? num(m.cache.hits) : "Off"} />
+                  <Stat label="Hit rate (chat)" value={pct(m.cache.hit_rate)} />
+                  <Stat label="Tokens saved" value={num(m.cache.tokens_saved)} />
+                  <Stat label="Avg. time: saved / new" value={`${ms(m.cache.hit_avg_ms)} / ${ms(m.cache.miss_avg_ms)}`} />
+                </div>
               </Section>
             </div>
           </>

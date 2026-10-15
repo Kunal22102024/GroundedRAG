@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.constants import DocumentStatus, MessageRole, allowed_access_levels
 from app.db.models import Chunk, Conversation, Document, Feedback, Message, User
+from app.services import cache_service
 
 
 class NotFound(Exception):
@@ -187,3 +188,5 @@ def rate(db: Session, user: User, message_id: uuid.UUID, rating: str, comment: s
         )
     )
     db.commit()
+    if rating == "down":  # a bad answer must not be served again from the saved-answer cache
+        cache_service.evict_message(message_id)

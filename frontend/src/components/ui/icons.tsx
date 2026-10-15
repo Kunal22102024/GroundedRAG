@@ -185,6 +185,11 @@ export const ClockIcon = (p: IconProps) => (
     <path d="M12 7v5l3 2" />
   </Icon>
 );
+export const BoltIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
+  </Icon>
+);
 export const DatabaseIcon = (p: IconProps) => (
   <Icon {...p}>
     <ellipse cx="12" cy="5" rx="8" ry="3" />

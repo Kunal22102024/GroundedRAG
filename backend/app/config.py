@@ -74,6 +74,17 @@ class Settings(BaseSettings):
     # A past question is suggested to other people only once this many different users asked it.
     popular_min_users: int = Field(default=2, ge=2)
 
+    # --- Semantic answer cache --------------------------------------------------------------
+    # A clean, cited answer is reused for a near-identical question asked under the same access
+    # level, filters and document selection (no retrieval, no model call). Kept in memory only.
+    semantic_cache: bool = True
+    # Minimum cosine similarity between the two standalone question vectors. Paraphrases of one
+    # question score above about 0.95; neighbouring questions ("sick leave" / "annual leave") can
+    # reach 0.9, so do not lower it without running the evaluation.
+    semantic_cache_threshold: float = Field(default=0.95, ge=0.85, le=1.0)
+    semantic_cache_ttl_seconds: int = Field(default=86_400, ge=60)
+    semantic_cache_max_entries: int = Field(default=1_000, ge=1, le=100_000)
+
     # --- Evaluation dashboard ------------------------------------------------------------
     # Measurements (query_events) older than this are deleted at startup.
     metrics_retention_days: int = Field(default=90, ge=1)

@@ -157,16 +157,23 @@ def _load(db: Session, ids: list[str], search_filter: SearchFilter) -> dict[str,
     return {row.id: row for row in rows}
 
 
-def retrieve(question: str, search_filter: SearchFilter) -> RetrievalResult:
-    """Find the chunks to answer ``question`` from. Blocking; call it from a worker thread."""
+def retrieve(
+    question: str, search_filter: SearchFilter, vector: list[float] | None = None
+) -> RetrievalResult:
+    """Find the chunks to answer ``question`` from. Blocking; call it from a worker thread.
+
+    ``vector`` is the question's embedding when the caller already has it (the answer cache
+    embeds the question first), so it is not embedded twice.
+    """
     settings = get_settings()
     timings: dict[str, float] = {}
     if search_filter.matches_nothing:
         return RetrievalResult([], None, None, timings)
 
-    started = time.perf_counter()
-    vector = embeddings.embed_query(question, interactive=True)
-    timings["embed_ms"] = _ms(started)
+    if vector is None:
+        started = time.perf_counter()
+        vector = embeddings.embed_query(question, interactive=True)
+        timings["embed_ms"] = _ms(started)
 
     n = settings.retrieval_candidates
     dense_future = _pool.submit(_timed, _dense, vector, n, search_filter)

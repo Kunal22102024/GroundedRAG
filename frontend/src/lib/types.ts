@@ -105,6 +105,8 @@ export interface Message {
   suggestions: FollowUp[] | null;
   guard_score: number | null;
   flagged: boolean;
+  /** Served from the saved-answer cache: no search and no new AI call. */
+  cached?: boolean;
   created_at: string;
   feedback: "up" | "down" | null;
 }
@@ -136,6 +138,8 @@ export interface DonePayload {
   timings: Record<string, number | null>;
   usage: Record<string, number>;
   flags: { partial: boolean; citations_removed: number; uncited: boolean; retried: boolean; rewritten: boolean };
+  /** True when the answer came from the saved-answer cache. */
+  cached?: boolean;
 }
 
 export interface ChatHandlers {
@@ -265,6 +269,14 @@ export interface MetricsSummary {
     answers_with_followups: number;
     usage_rate: number | null;
     followup_click_rate: number | null;
+  };
+  cache: {
+    enabled: boolean;
+    hits: number;
+    hit_rate: number | null;
+    tokens_saved: number;
+    hit_avg_ms: number | null;
+    miss_avg_ms: number | null;
   };
   daily: DailyMetrics[];
 }

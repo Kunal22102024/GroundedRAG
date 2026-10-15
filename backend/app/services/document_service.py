@@ -38,7 +38,7 @@ from app.constants import (
 )
 from app.core import bm25, metadata, vectorstore
 from app.db.models import Document, DocumentInsight, Message, User
-from app.services import ingestion
+from app.services import cache_service, ingestion
 
 logger = logging.getLogger(__name__)
 
@@ -479,6 +479,9 @@ def _delete_locked(db: Session, document: Document) -> None:
         .values(status=DocumentStatus.FAILED.value, error_message=_DELETE_FAILED_MESSAGE)
     )
     db.commit()
+    # Saved answers quote this document's passages and may rest on it: stop serving them now
+    # (before the chunk rows go, which the invalidation reads the document's metadata from).
+    cache_service.invalidate_document(document_id)
 
     try:
         # 2-4. Derived indexes, the passages copied into saved conversations, then the

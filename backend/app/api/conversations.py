@@ -58,6 +58,7 @@ def get_conversation(
                 suggestions=suggestions[m.id],
                 guard_score=m.guard_score,
                 flagged=m.flagged,
+                cached=bool(m.timings and m.timings.get("cache") == "hit"),
                 created_at=m.created_at,
                 feedback=ratings.get(m.id),  # type: ignore[arg-type]
             )

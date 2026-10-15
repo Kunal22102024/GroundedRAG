@@ -259,6 +259,8 @@ class MessageOut(BaseModel):
     suggestions: list[dict[str, object]] | None = None
     guard_score: float | None = None
     flagged: bool = False
+    # True when this answer was served from the saved-answer cache (no search, no model call).
+    cached: bool = False
     created_at: datetime
     feedback: Literal["up", "down"] | None = None
 

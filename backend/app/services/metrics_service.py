@@ -295,6 +295,18 @@ def summary(db: Session, days: int, kind: str = "all") -> dict[str, Any]:
         ).where(chat)
     ).one()
 
+    # Answers served from the saved-answer cache carry timings.cache = "hit" and, in
+    # timings.saved_tokens, what answering them cost the first time.
+    hit = func.coalesce(e.timings["cache"].astext == "hit", False)
+    cache_row = db.execute(
+        select(
+            count(hit),
+            func.sum(e.timings["saved_tokens"].astext.cast(Float)).filter(hit),
+            func.avg(e.total_ms).filter(hit),
+            func.avg(e.total_ms).filter(~hit, answered),
+        ).where(chat, e.outcome != EventOutcome.FAILED.value)
+    ).one()
+
     return {
         "days": days,
         "kind": kind,
@@ -358,6 +370,14 @@ def summary(db: Session, days: int, kind: str = "all") -> dict[str, Any]:
             "answers_with_followups": int(suggestion[3] or 0),
             "usage_rate": _ratio((suggestion[1] or 0) + (suggestion[2] or 0), suggestion[0]),
             "followup_click_rate": _ratio(suggestion[2], suggestion[3]),
+        },
+        "cache": {
+            "enabled": settings.semantic_cache,
+            "hits": int(cache_row[0] or 0),
+            "hit_rate": _ratio(cache_row[0], relevance[6]),
+            "tokens_saved": int(cache_row[1] or 0),
+            "hit_avg_ms": _round(cache_row[2]),
+            "miss_avg_ms": _round(cache_row[3]),
         },
         "daily": daily,
     }

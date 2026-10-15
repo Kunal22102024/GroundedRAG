@@ -16,6 +16,11 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from app.constants import REFUSAL_MESSAGE, REWRITE_HISTORY_ANSWER_CHARS
 from app.core.retrieval import Candidate
 
+# Part of the saved-answer cache key (core/answer_cache.py): raise it whenever the answer prompt,
+# its citation rules or the context format change, so answers written under the old wording are
+# never served.
+PROMPT_VERSION = "1"
+
 SYSTEM_PROMPT = f"""You are a precise assistant for an enterprise document search tool. \
 Answer the user's question using ONLY the numbered sources in the CONTEXT block of the user message.
 

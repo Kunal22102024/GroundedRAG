@@ -53,6 +53,9 @@ os.environ["EMBEDDING_TEXTS_PER_MINUTE"] = "0"  # the limiter has its own tests
 # Follow-up suggestions add a model call after every answer, which would change every chat test's
 # scripted replies and call counts; tests/test_suggestions.py switches them on.
 os.environ["FOLLOWUP_SUGGESTIONS"] = "false"
+# The saved-answer cache would answer a repeated question without calling the scripted model, which
+# changes call counts in every chat test; tests/test_semantic_cache.py switches it on.
+os.environ["SEMANTIC_CACHE"] = "false"
 # A collection name no real deployment uses, unique per run, so tests never touch real vectors.
 os.environ["CHROMA_COLLECTION"] = f"test_{uuid.uuid4().hex[:8]}"
 
@@ -207,10 +210,11 @@ def _isolated_derived_state() -> Iterator[None]:
     """Every test starts with an empty BM25 index, no cached embedding or readiness state, and
     no after-indexing hooks: a test that runs the real startup registers the automatic summary,
     which would otherwise make model calls in every later test that indexes a document."""
-    from app.core import bm25, embeddings
+    from app.core import answer_cache, bm25, embeddings
     from app.services import analysis_service, health_service, ingestion
 
     bm25.reset_index()
+    answer_cache.get_cache().clear()
     embeddings.clear_caches()
     health_service.reset_embedding_cache()
     health_service.reset_index_cache()
@@ -218,6 +222,7 @@ def _isolated_derived_state() -> Iterator[None]:
     ingestion._indexed_hooks.clear()
     yield
     bm25.reset_index()
+    answer_cache.get_cache().clear()
     ingestion._indexed_hooks[:] = hooks
     analysis_service.shutdown()
 
