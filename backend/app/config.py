@@ -51,6 +51,36 @@ class Settings(BaseSettings):
     interactive_max_retries: int = Field(default=2, ge=0, le=6)
     interactive_max_wait_seconds: float = Field(default=30.0, ge=0)
 
+    # --- Analysis: summaries, extraction, comparison, conflicts ---------------------------
+    # Output budget of one analysis call (a summary or a table of fields is longer than an answer).
+    analysis_max_tokens: int = Field(default=4096, ge=256, le=16384)
+    # Summaries, extraction and comparison are long-running requests with a progress display, so
+    # they wait out a busy or briefly unavailable model for longer than a chat turn does.
+    analysis_max_retries: int = Field(default=4, ge=0, le=10)
+    # A document with more text than this is analysed in batches and the notes are combined (map-reduce).
+    analysis_max_source_chars: int = Field(default=120_000, ge=5_000)
+    # Executive summary of every document right after it is indexed (one model call per upload).
+    auto_executive_summary: bool = True
+    # After an answer that cites two or more documents, check whether they contradict each other.
+    conflict_detection: bool = True
+    compare_max_documents: int = Field(default=4, ge=2, le=8)
+    extraction_max_fields: int = Field(default=20, ge=1, le=50)
+
+    # --- Suggestions ------------------------------------------------------------------------
+    # After every answered chat turn, one extra call proposes follow-up, sub- and related questions.
+    followup_suggestions: bool = True
+    # Suggested questions written for a document the first time it is selected (one call, saved).
+    suggestions_per_document: int = Field(default=6, ge=1, le=12)
+    # A past question is suggested to other people only once this many different users asked it.
+    popular_min_users: int = Field(default=2, ge=2)
+
+    # --- Evaluation dashboard ------------------------------------------------------------
+    # Measurements (query_events) older than this are deleted at startup.
+    metrics_retention_days: int = Field(default=90, ge=1)
+    # Price of the LLM in US dollars per million tokens, for the cost estimate (0: tokens only).
+    llm_input_usd_per_mtok: float = Field(default=0.0, ge=0.0)
+    llm_output_usd_per_mtok: float = Field(default=0.0, ge=0.0)
+
     # --- Retrieval and grounding -------------------------------------------
     retrieval_candidates: int = Field(default=30, ge=1)
     retrieval_top_k: int = Field(default=5, ge=1)

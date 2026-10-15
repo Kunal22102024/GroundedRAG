@@ -1,4 +1,4 @@
-import type { ChatFilters, ChatHandlers, Citation, DonePayload, UploadResult } from "../lib/types";
+import type { ChatFilters, ChatHandlers, Citation, Conflict, DonePayload, FollowUp, QuestionSource, UploadResult } from "../lib/types";
 
 const TOKEN_KEY = "grounded_token";
 
@@ -164,16 +164,18 @@ export function parseSseBlock(block: string): { name: string; data: string } | n
 }
 
 /**
- * POST /chat and read the Server-Sent Events stream (fetch, because EventSource cannot send a
- * token or a POST body). Resolves only after a `done` or `error` event; a stream that simply ends
- * before one is an error, so the caller is never left waiting on an answer that will not come.
+ * POST `path` (under /api) and read the Server-Sent Events stream (fetch, because EventSource cannot
+ * send a token or a POST body). `onEvent` gets every event in order. Resolves only after a `done` or
+ * `error` event; a stream that simply ends before one is an error, so the caller is never left
+ * waiting on a result that will not come.
  */
-export async function streamChat(
-  body: { question: string; conversation_id?: string; filters?: ChatFilters },
-  handlers: ChatHandlers,
+export async function streamSse(
+  path: string,
+  body: unknown,
+  onEvent: (name: string, data: Record<string, unknown>) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const response = await fetch("/api/chat", {
+  const response = await fetch(`/api${path}`, {
     method: "POST",
     headers: { ...authHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -186,18 +188,6 @@ export async function streamChat(
   let buffer = "";
   let finished = false;
 
-  const dispatch = (name: string, data: Record<string, unknown>) => {
-    if (name === "status") handlers.onStatus(String(data.stage), data);
-    else if (name === "token") handlers.onToken(String(data.text));
-    else if (name === "citations") handlers.onCitations(data.citations as Citation[]);
-    else if (name === "done") {
-      finished = true;
-      handlers.onDone(data as unknown as DonePayload);
-    } else if (name === "error") {
-      finished = true;
-      handlers.onError(String(data.message), String(data.code));
-    }
-  };
   const handleBlock = (block: string) => {
     const event = parseSseBlock(block);
     if (!event) return;
@@ -207,7 +197,8 @@ export async function streamChat(
     } catch {
       throw new ApiError(0, "The server sent an answer that could not be read. Please try again.");
     }
-    dispatch(event.name, data);
+    if (event.name === "done" || event.name === "error") finished = true;
+    onEvent(event.name, data);
   };
   const drain = () => {
     let end = buffer.indexOf("\n\n");
@@ -235,4 +226,26 @@ export async function streamChat(
     void reader.cancel().catch(() => undefined);
   }
   if (!finished) throw new ApiError(0, "The connection closed before the answer finished. Please try again.");
+}
+
+/** POST /chat: the question, and the answer as it streams in. */
+export function streamChat(
+  body: { question: string; conversation_id?: string; filters?: ChatFilters; source?: QuestionSource },
+  handlers: ChatHandlers,
+  signal: AbortSignal,
+): Promise<void> {
+  return streamSse(
+    "/chat",
+    body,
+    (name, data) => {
+      if (name === "status") handlers.onStatus(String(data.stage), data);
+      else if (name === "token") handlers.onToken(String(data.text));
+      else if (name === "citations") handlers.onCitations(data.citations as Citation[]);
+      else if (name === "conflicts") handlers.onConflicts(data.conflicts as Conflict[]);
+      else if (name === "suggestions") handlers.onSuggestions(data.suggestions as FollowUp[]);
+      else if (name === "done") handlers.onDone(data as unknown as DonePayload);
+      else if (name === "error") handlers.onError(String(data.message), String(data.code));
+    },
+    signal,
+  );
 }

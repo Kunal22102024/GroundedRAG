@@ -1,5 +1,6 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type DragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { Link } from "react-router-dom";
 import { ApiError, api, uploadDocuments } from "../api/client";
 import {
   AlertTriangleIcon,
@@ -10,6 +11,7 @@ import {
   DownloadIcon,
   FileTextIcon,
   SearchIcon,
+  SparklesIcon,
   TrashIcon,
   UploadIcon,
   XIcon,
@@ -475,7 +477,9 @@ export default function LibraryPage() {
       if (status) params.set("status", status);
       return api<DocumentList>(`/documents?${params}`);
     },
-    refetchInterval: (query) => (query.state.data?.items.some((d) => d.status === "queued" || d.status === "processing") ? 2000 : false),
+    // While something is still indexing, or an indexed document's summary is still being written.
+    refetchInterval: (query) =>
+      query.state.data?.items.some((d) => d.status === "queued" || d.status === "processing" || (d.status === "indexed" && d.executive_summary === "pending")) ? 2000 : false,
   });
 
   const download = (doc: DocumentItem) => {
@@ -613,6 +617,21 @@ export default function LibraryPage() {
                     </td>
                     <td className="px-4 py-3">
                       <StatusPill status={doc.status} title={doc.error_message ?? undefined} />
+                      {doc.status === "indexed" && doc.executive_summary === "pending" && (
+                        <p className="mt-1 flex items-center gap-1 text-[11px] text-slate-500">
+                          <Spinner size={11} className="text-indigo-500" /> Writing summary…
+                        </p>
+                      )}
+                      {doc.status === "indexed" && doc.executive_summary === "failed" && (
+                        <Link to={`/analyze?tab=summaries&doc=${doc.id}`} className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-amber-700 hover:underline">
+                          <AlertTriangleIcon size={11} /> Retry summary
+                        </Link>
+                      )}
+                      {doc.status === "indexed" && doc.executive_summary === "ready" && (
+                        <Link to={`/analyze?tab=summaries&doc=${doc.id}`} className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-indigo-600 hover:underline">
+                          <SparklesIcon size={11} /> Summary ready
+                        </Link>
+                      )}
                     </td>
                     <td className="hidden px-4 py-3 tabular-nums text-slate-600 sm:table-cell">{doc.status === "indexed" ? doc.chunk_count : "—"}</td>
                     <td className="hidden px-4 py-3 lg:table-cell">
@@ -628,6 +647,16 @@ export default function LibraryPage() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1 opacity-70 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                        {doc.status === "indexed" && (
+                          <Link
+                            to={`/analyze?tab=summaries&doc=${doc.id}`}
+                            aria-label={`Analyze ${doc.name}`}
+                            title="Analyze: summaries, extraction, comparison"
+                            className={`${iconBtn} hover:bg-indigo-50 hover:text-indigo-600`}
+                          >
+                            <SparklesIcon size={16} />
+                          </Link>
+                        )}
                         <button onClick={() => download(doc)} aria-label={`Download ${doc.name}`} title="Download" className={iconBtn}>
                           <DownloadIcon size={16} />
                         </button>

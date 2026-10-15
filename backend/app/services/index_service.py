@@ -26,7 +26,7 @@ from app.constants import DocumentStatus
 from app.core import bm25, vectorstore
 from app.db.database import get_sessionmaker
 from app.db.models import Chunk, Document
-from app.services import ingestion
+from app.services import analysis_service, ingestion, metrics_service
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +110,8 @@ def run_startup() -> StartupReport:
 
     with get_sessionmaker()() as db:
         queued = ingestion.recover_interrupted(db)
+        analysis_service.recover_interrupted(db)  # summaries a restart cut off
+        metrics_service.prune(db)  # dashboard measurements past METRICS_RETENTION_DAYS
         indexed = indexed_chunk_count(db)
         vectors = vectorstore.count()
 
@@ -148,6 +150,7 @@ def run_startup() -> StartupReport:
             )
 
     ingestion.start_workers()
+    ingestion.on_indexed(analysis_service.submit_auto_summary)  # executive summary after upload
     for document_id in queued:
         ingestion.submit(document_id)
 

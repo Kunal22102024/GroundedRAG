@@ -50,6 +50,9 @@ os.environ["LOG_LEVEL"] = "INFO"
 os.environ["BCRYPT_ROUNDS"] = "4"  # minimum cost; real hashing speed is not under test
 os.environ["EMBEDDING_MAX_RETRIES"] = "3"
 os.environ["EMBEDDING_TEXTS_PER_MINUTE"] = "0"  # the limiter has its own tests
+# Follow-up suggestions add a model call after every answer, which would change every chat test's
+# scripted replies and call counts; tests/test_suggestions.py switches them on.
+os.environ["FOLLOWUP_SUGGESTIONS"] = "false"
 # A collection name no real deployment uses, unique per run, so tests never touch real vectors.
 os.environ["CHROMA_COLLECTION"] = f"test_{uuid.uuid4().hex[:8]}"
 
@@ -201,16 +204,22 @@ def _no_startup() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _isolated_derived_state() -> Iterator[None]:
-    """Every test starts with an empty BM25 index and no cached embedding or readiness state."""
+    """Every test starts with an empty BM25 index, no cached embedding or readiness state, and
+    no after-indexing hooks: a test that runs the real startup registers the automatic summary,
+    which would otherwise make model calls in every later test that indexes a document."""
     from app.core import bm25, embeddings
-    from app.services import health_service
+    from app.services import analysis_service, health_service, ingestion
 
     bm25.reset_index()
     embeddings.clear_caches()
     health_service.reset_embedding_cache()
     health_service.reset_index_cache()
+    hooks = list(ingestion._indexed_hooks)
+    ingestion._indexed_hooks.clear()
     yield
     bm25.reset_index()
+    ingestion._indexed_hooks[:] = hooks
+    analysis_service.shutdown()
 
 
 @pytest.fixture

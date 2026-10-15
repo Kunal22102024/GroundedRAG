@@ -8,13 +8,15 @@ documents do not contain the answer, the app says so instead of guessing.
 > **Build status:** all six phases are complete: deployment, database and authentication, document
 > ingestion, hybrid retrieval with the relevance guard, streamed chat with verified citations, the
 > web UI and the evaluation script. A later audit pass fixed correctness, security and test gaps
-> (see "Decisions", *Audit pass*). The design is in [PRD.md](PRD.md) and [TDD.md](TDD.md).
+> (see "Decisions", *Audit pass*). The **Analyze** page adds multi-document comparison, structured
+> extraction, document summaries and source conflict detection (see "Analysis"). The design is in
+> [PRD.md](PRD.md) and [TDD.md](TDD.md).
 
 | Document | Defines |
 | --- | --- |
 | [PRD.md](PRD.md) | What the product must do and why |
 | [TDD.md](TDD.md) | How it is built: architecture, schemas, thresholds, configuration |
-| [CLAUDE.md](CLAUDE.md) | How to work in this repo: file purposes, flows, routes, the 30 rules |
+| [CLAUDE.md](CLAUDE.md) | How to work in this repo: file purposes, flows, routes, the 37 rules |
 
 ## Architecture
 
@@ -118,9 +120,20 @@ nginx limits how fast sign-in and sign-up can be tried (`429 Too many requests` 
 tell clients apart behind Docker Desktop's network, so treat it as a brake on scripts and put
 real exposure behind a reverse proxy with TLS.
 
-There is no user-management screen yet: to promote someone, update the database directly
-(`docker compose exec postgres psql -U groundedrag -c "UPDATE users SET role='admin' WHERE email='...'"`).
-The change applies immediately, even to tokens issued before it.
+**There is one sign-in page for everyone, not a separate admin portal.** What an account can do depends
+on its role, which the server re-reads on every request; admin-only pages and API routes answer 403
+to anyone else, and the admin tabs (**Evaluation**, **Users**) are only shown to administrators.
+
+**Managing accounts.** An administrator opens **Users** to see every account, promote or demote it
+with the role selector, or delete it. A change applies at once, even to tokens already issued. The
+rules: there is always at least one administrator (the only one cannot be demoted, and an account
+cannot delete itself); demoting yourself asks first because it takes the page away; deleting an
+account removes its conversations, while the documents it uploaded stay in the library. The same is
+available over the API (`GET /api/users`, `PATCH /api/users/{id}` with `{"role": "admin"}`,
+`DELETE /api/users/{id}`).
+
+If no administrator can sign in at all, promote someone directly in the database:
+`docker compose exec postgres psql -U groundedrag -c "UPDATE users SET role='admin' WHERE email='...'"`.
 
 ## Documents
 
@@ -204,6 +217,81 @@ docker compose run --rm --no-deps --entrypoint python backend -m app.maintenance
 docker compose up -d backend
 ```
 
+## Analysis: compare, extract, summarize, find conflicts
+
+The **Analyze** page (and the sparkle button on each Library row) works on whole documents instead of
+one question at a time. Everything it shows follows the same rule as a chat answer: each statement
+cites the passage and page it comes from, and anything the model says that cannot be tied to a real
+passage is dropped rather than shown. Only documents you may read and that are `indexed` can be
+analysed.
+
+| Tab | What it does |
+| --- | --- |
+| **Compare** | Pick 2 to 4 documents and ask one question. Each document answers **on its own, from its own text**, side by side, with its own citations. A document that does not contain the answer says "Not covered in this document" (no model call is made for it). Below the columns, **Sources disagree** lists each point on which the documents contradict each other, both claims next to each other with their citations, or says that none were found. |
+| **Extract** | Pick a document and the fields to pull out: presets (dates, parties, amounts, requirements, deadlines, contacts, definitions) and your own (for example "Governing law"). The result is a table (field, value, page, quoted text) with a JSON view, **Copy**, **JSON** and **CSV** download. A field the document does not mention shows "Not found in the document". |
+| **Summaries** | **Executive summary** (written automatically after a document is indexed), **chapter-by-chapter summary**, **FAQ**, **glossary** and **key changes** (what the document announces as new, or, if you pick an earlier version, how it differs from it). The others are written when you press Generate. Results are saved: reopening costs nothing, **Regenerate** asks the model again, **Copy** gives Markdown with citations as "(document, page)". |
+
+**Conflicts in Chat.** When an answer draws on two or more *different* documents, one extra model call
+checks whether they contradict each other (for example one policy says 25 days, another says 30). If
+so, a **Sources disagree** panel under the answer shows each claim with its citation; it is saved with
+the conversation. Answers from a single document, and refusals, never pay for the check, and if the
+check fails the answer is still delivered. `CONFLICT_DETECTION=false` turns it off (Chat and Compare).
+
+The same features over the API (all Server-Sent Events except the listing; the bearer token is
+required, see [TDD.md §16](TDD.md)):
+
+```bash
+curl -N -X POST localhost:8081/api/analysis/summary -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" -d '{"document_id": "<id>", "kind": "faq"}'
+curl -N -X POST localhost:8081/api/analysis/extract -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" -d '{"document_id": "<id>", "fields": ["dates", "Governing law"]}'
+curl -N -X POST localhost:8081/api/analysis/compare -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" -d '{"question": "How many days of leave?", "document_ids": ["<id>", "<id>"]}'
+curl -s localhost:8081/api/documents/<id>/insights -H "Authorization: Bearer $TOKEN"   # saved results
+```
+
+**What it costs (model calls).** Each upload: 1 (the executive summary; `AUTO_EXECUTIVE_SUMMARY=false`
+to skip). A summary or an extraction: 1 (a very long document is read in batches, one call per
+batch of `ANALYSIS_MAX_SOURCE_CHARS`). A comparison: 1 per document that covers the question, plus 1
+conflict check. A chat answer citing two or more documents: 1 extra. Saved results are free to
+reopen. On a free-tier key, and whenever Gemini answers `503` for a while, an analysis can fail with
+"temporarily unavailable"; it is retried several times first (`ANALYSIS_MAX_RETRIES`), and a failed
+summary is saved as `failed` with a **Try again** button (the Library shows **Retry summary**).
+
+**Deleting a document** also deletes its saved summaries and extractions, and any saved result that
+quotes it (for example a key-changes report against it).
+
+## Suggested questions
+
+**Before the first question**, the chat offers questions instead of fixed examples:
+
+* **From your documents:** questions the documents answer. Select documents under **Filters** and they are written for those documents the first time (one model call per document, ever; chips show "Writing questions…" meanwhile). Without a selection, saved questions of recently added documents are shown.
+* **Often asked:** questions other people asked and got a properly cited answer to. A question is only shown once **two or more different users** asked it (`POPULAR_MIN_USERS`), and only if every document its answer cited is one you may read. So a single person's question, or a question about a Restricted document, is never shown to someone else.
+
+**After every answer**, chips suggest what to ask next:
+
+* **Go deeper:** a follow-up on the answer.
+* **Break it down:** one part of a broad question.
+* **Related:** a neighbouring topic the documents cover.
+
+Each suggestion must point at a passage that answers it, or it is not shown. Clicking one asks it in the same conversation. It costs one extra model call per answer, run alongside the conflict check (`FOLLOWUP_SUGGESTIONS=false` turns it off). Suggestions are saved with the conversation. Those that come from a deleted document disappear.
+
+## Evaluation dashboard
+
+Administrators get an **Evaluation** tab (`/dashboard`). It shows how the app performs on real use: every chat turn and every summary, extraction or comparison is measured once, including the ones that fail. Pick a period (24 h, 7 or 30 days) and All, Chat or Analysis.
+
+| Card or section | What it means |
+| --- | --- |
+| Retrieval relevance | How close the best passage was to each question (cosine similarity), as a histogram against the refusal threshold; the guard's decisions (passed, exact identifier, refused) |
+| Abstention rate | Refused ÷ (answered + refused), split into refusals by the guard (no model call) and by the model |
+| Citation precision, answers with citations | From the citation checks every answer goes through: valid ÷ all markers; answers with a valid citation; answers retried, left uncited or cut short; answers whose sources disagree; 👍/👎 |
+| Latency | p50/p95/max overall and per stage, against the targets in TDD §12 |
+| Tokens and cost | Per kind of request and per day. Set `LLM_INPUT_USD_PER_MTOK` / `LLM_OUTPUT_USD_PER_MTOK` to your model's price to see dollars |
+| Failed and problem queries | Failed, refused and flagged queries with the question, user, reason and time, and a link to the conversation |
+| Asked from a suggestion | How often suggestions and follow-ups are used |
+
+The same figures are available at `GET /api/metrics/summary?days=7` and `GET /api/metrics/events?outcome=failed` (admin token). Measurements are kept `METRICS_RETENTION_DAYS` (90). This is live traffic only. `eval/run_eval.py` remains the labelled, offline evaluation of retrieval and the guard (see `eval/README.md`).
+
 ## Development
 
 ```bash
@@ -260,6 +348,16 @@ All settings are environment variables, read only by `backend/app/config.py`. Bl
 | `LLM_MODEL` | `gemini-3.8-flash` | Answer generation (`gemini-2.5-flash` is closed to new API keys) |
 | `LLM_TIMEOUT_SECONDS` | `60` | A model call is abandoned after this long |
 | `INTERACTIVE_MAX_RETRIES` / `INTERACTIVE_MAX_WAIT_SECONDS` | `2` / `30` | Rate-limit retries while a user waits (LLM and query embedding) |
+| `ANALYSIS_MAX_TOKENS` | `4096` | Output budget of one analysis call (summary, extraction, conflict check) |
+| `ANALYSIS_MAX_RETRIES` | `4` | Retries of a busy or unavailable model (429, 503) before a summary, extraction or comparison gives up; chat and the conflict check use `INTERACTIVE_MAX_RETRIES` |
+| `ANALYSIS_MAX_SOURCE_CHARS` | `120000` | A document with more text is read in batches of this size and combined (one extra call per batch) |
+| `AUTO_EXECUTIVE_SUMMARY` | `true` | Write an executive summary after every upload (1 model call each) |
+| `CONFLICT_DETECTION` | `true` | After an answer citing two or more documents, check them for contradictions (1 extra call; Chat and Compare) |
+| `COMPARE_MAX_DOCUMENTS` / `EXTRACTION_MAX_FIELDS` | `4` / `20` | Documents in one comparison (2 to 8); fields in one extraction (1 to 50) |
+| `FOLLOWUP_SUGGESTIONS` | `true` | Suggested next questions after every answer (1 extra model call each) |
+| `SUGGESTIONS_PER_DOCUMENT` / `POPULAR_MIN_USERS` | `6` / `2` | Questions written per document; how many different users must have asked a question before it is suggested to others |
+| `METRICS_RETENTION_DAYS` | `90` | How long dashboard measurements (including question text) are kept |
+| `LLM_INPUT_USD_PER_MTOK` / `LLM_OUTPUT_USD_PER_MTOK` | `0` / `0` | Model price per million tokens for the dashboard's cost figures (0 = tokens only) |
 | `REWRITE_MODEL` | empty (= `LLM_MODEL`) | Follow-up question rewriting |
 | `LLM_TEMPERATURE` / `LLM_MAX_TOKENS` / `LLM_THINKING_BUDGET` | `0.0` / `1024` / `0` | Generation settings |
 | `RETRIEVAL_CANDIDATES` / `RETRIEVAL_TOP_K` | `30` / `5` | Candidates per channel; chunks sent to the LLM |
@@ -497,6 +595,64 @@ that fails without the fix)
   off-topic stopped 5/5, answerable wrongly stopped 0/12. Off-topic questions score at most 0.544 and the
   weakest answerable one 0.638, so `RELEVANCE_THRESHOLD=0.60` stands.
 
+**Analysis features (comparison, extraction, summaries, conflicts)**
+
+* **Same grounding rule as chat, applied to every output.** Sources are numbered and framed as
+  untrusted data; each summary item, FAQ answer, glossary entry, extracted value and conflict claim
+  must carry a `[n]` that maps to a real source or it is dropped. A reply that cites nothing is retried
+  once and then fails; it is never shown uncited. An extracted quote that is not really in its source
+  is blanked (the value keeps its citation).
+* **Executive summary automatic, the rest on request.** The executive summary costs one model call
+  per upload, so it is written after indexing on its own thread (`AUTO_EXECUTIVE_SUMMARY=false` skips
+  it); chapters, FAQ, glossary and key changes are written when asked. All are saved in
+  `document_insights` and reused until you press Regenerate.
+* **"Key changes" has two meanings.** With no earlier version chosen it reports what the document
+  itself announces as new or changed; with an earlier version chosen it reports the differences
+  between the two documents, citing both. The spec did not say which; both are offered.
+* **Long documents are read in batches with global source numbers** (`ANALYSIS_MAX_SOURCE_CHARS`), so a
+  citation produced from any batch means the same passage everywhere; the notes are then combined in
+  one more call. Most documents fit in one call.
+* **Conflicts are judged from the cited passages only, and only between different documents.** Two
+  parts of one document disagreeing is not a conflict between sources. A conflict needs claims from two
+  documents that name real passages. The check runs in Chat only when an answer cites two or more
+  documents, so single-document answers cost nothing extra, and if it fails the answer is delivered
+  without it (it is an extra, not part of the answer). The cost is that a contradiction in a passage that
+  was not retrieved is not found.
+* **Compare searches each document separately.** The search filter is narrowed to one document per
+  column, so a column can only cite its own text, and the relevance guard decides per document: a
+  document below the threshold is "Not covered" with no model call. Columns run one after another
+  because the quota is shared; a comparison that fails part-way keeps the columns it finished.
+* **Analysis waits longer than chat for a flaky model.** Gemini was seen answering `503` for minutes at
+  a time, so summaries, extraction and comparison answers retry `ANALYSIS_MAX_RETRIES` times (default
+  4, waits of 2, 4, 9, 17 seconds) with the screen saying "the AI service is busy", while the extra
+  conflict check keeps chat's shorter patience so it never holds up a finished answer.
+* **Deleting a document deletes what was generated from it.** Besides the cascade of its own saved
+  results, saved results that quote it (key changes against it) are deleted too, and saved citations and
+  conflicts are re-checked when read, like those of a conversation.
+* **CSV export neutralises formulas.** Values come from documents, so a cell starting with `=`, `+`,
+  `-` or `@` gets a leading apostrophe (it stays text in a spreadsheet). The cost is that such a value
+  reads `'-5 days` in the CSV; the JSON export is unchanged.
+* **The Library's "Summary ready" comes from the list response** (`executive_summary`: none, pending,
+  ready, failed), one query for the page rather than one request per row.
+* **Not evaluated like retrieval.** `eval/run_eval.py` measures retrieval and the guard; the analysis
+  features are covered by tests with a scripted model (grounding rules, access, deletion, saving) and
+  were checked live on a handful of real calls, not measured for answer quality.
+
+**Look and feel**
+
+* **Warm peach theme, defined in one place.** The components use Tailwind's `indigo`, `violet` and `slate` classes; `frontend/src/styles/index.css` redefines those palettes as peach, coral and warm cream-to-cocoa neutrals. Changing the theme means editing that block (plus the logo gradient in `icons.tsx`, `public/favicon.svg` and `theme-color` in `index.html`), not 400-odd class names. Error, warning and success colours (rose, amber, emerald) keep their usual meaning. The darker accent shades were chosen so white button text and chip text stay readable.
+
+**Evaluation dashboard and suggestions**
+
+* **Live measurements, one row per request.** Every chat turn and analysis run, failed ones included, writes one `query_events` row with its outcome, guard decision, similarities, citation checks, tokens and timings. Writing it can never break the request: an error is logged and dropped. The offline `eval/run_eval.py` is not part of the dashboard (it needs the labelled question set and the development stack); it stays a command.
+* **Administrators see question text.** Without the question a failed or refused query cannot be diagnosed, so it is stored with the measurement and shown on the admin-only dashboard. It is kept `METRICS_RETENTION_DAYS` (90) and outlives a deleted conversation. Document text is never stored there.
+* **Groundedness without an LLM judge.** The figures come from the citation verification every answer already passes through (valid and removed markers, retries, uncited and truncated answers), so they are exact and free. Faithfulness grading by a model was not added.
+* **Abstention counts both kinds of refusal**: the guard's (no model call) and the model's own "not in the documents", shown separately.
+* **"Often asked" needs two people.** A question is suggested to others only after at least two different users asked it, got a cleanly cited answer, and only if every document it cited is readable by the person seeing the suggestion. A single user's question is never shown to anyone else.
+* **Suggestions must be answerable.** Document questions and follow-ups each name the passage that answers them; one that does not is dropped. Follow-ups run alongside the conflict check, so the extra wait is the longer of the two, not their sum.
+* **Document questions are written on first use**, not after every upload, so a library nobody browses costs nothing. A failed attempt is retried after 10 minutes at the earliest.
+* **Tests switch follow-ups off by default** (`tests/conftest.py`), because every existing chat test scripts the model's replies one by one; `tests/test_suggestions.py` switches them on.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
@@ -532,3 +688,12 @@ that fails without the fix)
 | The source drawer shows no PDF | Only PDFs are embedded; other types offer a download. The file is fetched with your token, so a logged-out tab shows nothing. If a PDF is blank or the browser reports it was blocked, the Content-Security-Policy may be too strict for that browser's PDF viewer: relax `object-src` in `frontend/nginx-snippets/security-headers.conf` and rebuild the frontend. |
 | A citation chip reads "source no longer available" | The cited document was deleted, or you may no longer read it (for example your role was lowered). The answer text is kept; the passage is not. |
 | A chat answer stops with "The connection closed before the answer finished" | The stream ended without a final event (the backend restarted, or a proxy cut the connection). Ask again. |
+| A summary, extraction or comparison fails with "temporarily unavailable" | Google's `503 ... high demand` again, and the analysis waited out `ANALYSIS_MAX_RETRIES` retries. Press Try again (Summaries), run it again, or switch `LLM_MODEL`. A failed summary is saved as `failed` and costs nothing to retry. |
+| A document shows "Retry summary" in the Library | Its automatic executive summary failed (usually the same 503). The document is fine and searchable; open it in Analyze and press Try again. |
+| Backend exits at startup with `relation "document_insights" does not exist` after updating | The migration (`0003`) runs when the container starts, and the dev override's auto-reload does not run it. Restart the backend: `docker compose restart backend`. |
+| Compare shows no "Sources disagree" although two documents differ | The check only sees the passages each document's answer cited, and a document that "does not cover" the question is not compared. Ask the question the way both documents state it, or check `CONFLICT_DETECTION`. |
+| No "Evaluation" tab | It is shown to administrators only (the first account, or anyone promoted in the database). A `user` gets 403 from `/api/metrics/*`. |
+| The dashboard shows tokens but no cost | Set `LLM_INPUT_USD_PER_MTOK` and `LLM_OUTPUT_USD_PER_MTOK` in `.env` to your model's price and run `docker compose up -d backend`. |
+| No suggested questions before the first question | Select documents under Filters: their questions are written the first time (a few seconds). "Often asked" appears only once two different people asked the same question. If the model is unavailable, the fixed examples are shown instead. |
+| No follow-up chips under an answer | `FOLLOWUP_SUGGESTIONS=false`, the answer was a refusal, or the extra call failed (Gemini 503); the answer is unaffected. |
+| `429` on Analyze | nginx's rate limit for `/api/analysis/` (20 requests a minute, burst 10): each request is at least one model call. Wait a few seconds. |

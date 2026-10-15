@@ -22,6 +22,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
@@ -73,6 +74,18 @@ def shutdown_workers() -> None:
         if _executor is not None:
             _executor.shutdown(wait=False, cancel_futures=True)
             _executor = None
+
+
+_indexed_hooks: list[Callable[[uuid.UUID], None]] = []
+
+
+def on_indexed(hook: Callable[[uuid.UUID], None]) -> None:
+    """Call ``hook(document_id)`` after each document becomes ``indexed`` (idempotent).
+
+    A hook runs on the ingestion thread, so it must only queue work, never do it.
+    """
+    if hook not in _indexed_hooks:
+        _indexed_hooks.append(hook)
 
 
 def submit(document_id: uuid.UUID) -> None:
@@ -270,6 +283,11 @@ def _ingest(document_id: uuid.UUID) -> None:
             **{f"parse_{k}": v for k, v in parsed.stats.items()},
         },
     )
+    for hook in tuple(_indexed_hooks):  # extras (the executive summary) never disturb the upload
+        try:
+            hook(document_id)
+        except Exception as exc:
+            logger.warning("after-indexing hook failed", extra={"error": type(exc).__name__})
 
 
 def _ms(since: float) -> float:

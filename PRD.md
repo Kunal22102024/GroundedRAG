@@ -2,7 +2,7 @@
 
 **Product Name:** GroundedRAG — Enterprise Internal Knowledge Engine
 
-**Document Version:** 1.2
+**Document Version:** 1.5
 
 **Target Release:** Q4 2026
 
@@ -69,8 +69,29 @@ In one line: a "Google Search + ChatGPT" for a company's internal files, giving 
 
 * **Roles:** `admin` and `user`.
 * **Document Access Levels:** `Public`, `Internal`, `Restricted`. Users only retrieve content they are permitted to see; this is enforced on every query.
+* **One sign-in, role-based screens:** everyone signs in on the same page. Administrators also see the Evaluation and Users screens; no one else can reach them.
+* **Account administration:** an administrator can see all accounts, promote or demote them, and delete them (their conversations are deleted, the documents they uploaded stay). There is always at least one administrator.
+
+### 4.5 Document Analysis (the **Analyze** page)
+
+Beyond asking one question at a time, a user can work with whole documents. Every result below follows the same rule as a chat answer: each statement carries a citation that opens the exact passage and page, and nothing is shown that the cited passage does not support. A user can only analyse documents they are allowed to read.
+
+* **Multi-Document Comparison:** Ask one question across 2 to 4 chosen documents and read one answer per document side by side. Each document answers from its own text only, with its own citations. A document that does not contain the answer says "Not covered in this document" instead of guessing.
+* **Source Conflict Detection:** When documents give conflicting answers, the app says so and shows each document's claim next to the other with its citation (for example: one policy says 25 days, another says 30). It runs automatically in a comparison, and in Chat whenever an answer draws on two or more different documents. If the documents agree, nothing extra is shown.
+* **Structured Extraction:** Choose a document and the fields to pull out: ready-made sets (dates, parties, amounts, requirements, deadlines, contacts, definitions) and fields of your own. The result is a table, each value with its page and the quoted text, that can be copied or downloaded as JSON or CSV. A field the document does not mention is shown as not found.
+* **Document Summaries:** An **executive summary** is written automatically when a document finishes indexing. A **chapter-by-chapter summary**, an **FAQ**, a **glossary** and a **key changes** report (what the document announces as new, or how it differs from a chosen earlier version) are written on request. Results are saved and reused, so opening them again costs nothing, and can be regenerated.
 
 ---
+
+### 4.6 Query Suggestions
+
+* **Suggested starting questions:** before the first question, the chat offers questions the selected documents answer (written once per document) and questions other people often asked about documents the user may read (only when at least two different people asked them and got a cited answer).
+* **Next questions after an answer:** follow-up ("go deeper"), sub-question ("break it down") and related questions, each one answerable from a passage of the documents; one click asks it in the same conversation.
+
+### 4.7 Evaluation Dashboard (administrators)
+
+* A live view of how the system performs on real use: retrieval relevance, groundedness and citation accuracy, abstention (refusal) rate, latency, token use and cost, and the list of failed, refused and flagged queries with their question.
+* Every chat turn and analysis run is measured, including failures; the dashboard is visible to administrators only.
 
 ## 5. User Workflow & Experience
 
@@ -115,7 +136,9 @@ In one line: a "Google Search + ChatGPT" for a company's internal files, giving 
 2. **Citation Accuracy:** 100% of generated claims must map to at least one valid retrieved source chunk.
 3. **Filtering:** Applying a metadata filter must strictly exclude any document outside the selected metadata criteria prior to answer generation.
 4. **Access Enforcement:** A user must never receive content from a document above their access level.
-5. **Deletion:** A deleted document's content must never appear in subsequent answers.
+5. **Deletion:** A deleted document's content must never appear in subsequent answers. This includes saved summaries and extractions: they are removed with the document, and so is any saved result that quotes it.
+6. **Analysis Grounding:** Every claim in a summary, FAQ, glossary, key-changes report, comparison answer or conflict, and every extracted value, must map to a retrieved passage of the document it is about; an item whose citation cannot be verified is dropped, never shown.
+7. **Analysis Access:** Summaries, extractions and comparisons are only available for documents the user may read; a document above their level behaves as if it did not exist.
 
 ### Non-Functional Requirements
 
@@ -148,5 +171,8 @@ In one line: a "Google Search + ChatGPT" for a company's internal files, giving 
 
 ## Changelog
 
+* **1.5:** Account administration (section 4.4): administrators manage roles and accounts from the Users screen.
+* **1.4:** Added query suggestions (section 4.6) and the administrators' evaluation dashboard (section 4.7).
+* **1.3:** Added document analysis (section 4.5): multi-document comparison, source conflict detection, structured extraction and document summaries (executive, chapter-wise, FAQ, glossary, key changes), with functional requirements 6 and 7 and the deletion rule extended to saved results.
 * **1.2:** Brought the numbers in line with what was built and measured: the refusal threshold default is **0.60** (the 0.45 below was calibrated for no model and would never refuse with `gemini-embedding-001`; TDD 6.3), IT is a department, and the ingestion and latency requirements carry their measured status. Behavior added by the audit pass that users can see: signup can be closed, saved citations to deleted or no-longer-readable documents show as unavailable, and uploads and sign-in attempts are rate limited.
 * **1.1:** Unified the refusal threshold at 0.45 on a cosine-similarity scale (previously 0.45 here and 0.35 in the TDD on an RRF score). Added access control, document deletion, follow-up questions, and the scanned-PDF out-of-scope note.

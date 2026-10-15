@@ -78,9 +78,10 @@ export function AccessBadge({ level }: { level: AccessLevel }) {
 
 const TYPE_STYLE: Record<string, string> = {
   pdf: "from-rose-500 to-red-600",
-  docx: "from-blue-500 to-indigo-600",
-  md: "from-violet-500 to-purple-600",
-  markdown: "from-violet-500 to-purple-600",
+  // Single-family gradients: indigo and violet are the theme's peach and coral (styles/index.css).
+  docx: "from-sky-500 to-blue-600",
+  md: "from-violet-400 to-violet-700",
+  markdown: "from-violet-400 to-violet-700",
   html: "from-orange-400 to-amber-600",
   htm: "from-orange-400 to-amber-600",
   txt: "from-slate-400 to-slate-600",

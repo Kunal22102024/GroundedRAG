@@ -228,6 +228,60 @@ export const LayersIcon = (p: IconProps) => (
   </Icon>
 );
 
+export const ColumnsIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M12 4v16" />
+  </Icon>
+);
+export const TableIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M3 10h18" />
+    <path d="M3 15h18" />
+    <path d="M9 10v10" />
+  </Icon>
+);
+export const ListIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M9 6h11" />
+    <path d="M9 12h11" />
+    <path d="M9 18h11" />
+    <path d="M4 6h.01" />
+    <path d="M4 12h.01" />
+    <path d="M4 18h.01" />
+  </Icon>
+);
+export const RefreshIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M20 11a8 8 0 0 0-14.5-4.4L4 8" />
+    <path d="M4 4v4h4" />
+    <path d="M4 13a8 8 0 0 0 14.5 4.4L20 16" />
+    <path d="M20 20v-4h-4" />
+  </Icon>
+);
+export const UsersIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="9" cy="8" r="3.5" />
+    <path d="M2.5 20a6.5 6.5 0 0 1 13 0" />
+    <path d="M16 4.6a3.5 3.5 0 0 1 0 6.8" />
+    <path d="M18.5 14.2A6.5 6.5 0 0 1 21.5 20" />
+  </Icon>
+);
+export const ChartIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M4 20V10" />
+    <path d="M10 20V4" />
+    <path d="M16 20v-7" />
+    <path d="M22 20H2" />
+  </Icon>
+);
+export const ChevronRightIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="m9 6 6 6-6 6" />
+  </Icon>
+);
+
 /** The app's mark: a gradient tile with a check inside a speech bubble. */
 export function LogoMark({ size = 32 }: { size?: number }) {
   const id = useId();
@@ -235,8 +289,8 @@ export function LogoMark({ size = 32 }: { size?: number }) {
     <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden="true" focusable="false">
       <defs>
         <linearGradient id={id} x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
-          <stop stopColor="#6366f1" />
-          <stop offset="1" stopColor="#8b5cf6" />
+          <stop stopColor="#f07a48" />
+          <stop offset="1" stopColor="#d0472f" />
         </linearGradient>
       </defs>
       <rect width="32" height="32" rx="9" fill={`url(#${id})`} />

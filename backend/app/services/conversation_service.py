@@ -53,49 +53,101 @@ def ratings_for(db: Session, user: User, messages: list[Message]) -> dict[uuid.U
     return {row.message_id: row.rating for row in rows}
 
 
+def readable_chunk_ids(db: Session, user: User, chunk_ids: set[str]) -> set[str]:
+    """Which of these chunks still exist in an indexed document the user may read."""
+    if not chunk_ids:
+        return set()
+    levels = [level.value for level in allowed_access_levels(user.role)]
+    return set(
+        db.scalars(
+            select(Chunk.id)
+            .join(Document, Document.id == Chunk.document_id)
+            .where(
+                Chunk.id.in_(chunk_ids),
+                Document.status == DocumentStatus.INDEXED.value,
+                Document.access_level.in_(levels),
+            )
+        )
+    )
+
+
+def hide_unreadable(citations: list[dict[str, Any]], readable: set[str]) -> list[dict[str, Any]]:
+    """The citations, with each one the reader may not see made ``unavailable``.
+
+    A citation stores a copy of the cited passage so a result can be reopened later. That copy
+    must not outlive the reader's right to read it: the document may have been deleted, or the
+    reader's role lowered since. Such a citation keeps its number and page but loses the passage,
+    the document name and the section, and the client shows "source no longer available".
+    """
+    return [
+        citation
+        if str(citation.get("chunk_id")) in readable
+        else {
+            **citation,
+            "document_name": "",
+            "section_title": "",
+            "text": "",
+            "unavailable": True,
+        }
+        for citation in citations
+    ]
+
+
 def readable_citations(
     db: Session, user: User, messages: list[Message]
 ) -> dict[uuid.UUID, list[dict[str, Any]] | None]:
     """Each message's citations, with the ones the user can no longer read made unavailable.
 
-    A citation stores a copy of the cited passage so a conversation can be reopened later. That
-    copy must not outlive the user's right to read it: the document may have been deleted, or
-    the user's role lowered since. Such a citation keeps its number and page but loses the
-    passage, the document name and the section (``unavailable`` is set), and the client shows
-    "source no longer available". The answer text itself is kept as a record of the exchange.
+    The answer text itself is kept as a record of the exchange.
     """
     wanted = {str(c["chunk_id"]) for m in messages for c in m.citations or [] if c.get("chunk_id")}
-    readable: set[str] = set()
-    if wanted:
-        levels = [level.value for level in allowed_access_levels(user.role)]
-        readable = set(
-            db.scalars(
-                select(Chunk.id)
-                .join(Document, Document.id == Chunk.document_id)
-                .where(
-                    Chunk.id.in_(wanted),
-                    Document.status == DocumentStatus.INDEXED.value,
-                    Document.access_level.in_(levels),
-                )
-            )
-        )
+    readable = readable_chunk_ids(db, user, wanted)
+    return {
+        m.id: None if m.citations is None else hide_unreadable(m.citations, readable)
+        for m in messages
+    }
+
+
+def readable_conflicts(
+    messages: list[Message], citations: dict[uuid.UUID, list[dict[str, Any]] | None]
+) -> dict[uuid.UUID, list[dict[str, Any]] | None]:
+    """Each message's conflicts without claims whose source the reader can no longer see.
+
+    A conflict that is left with claims from fewer than two documents is no longer a conflict
+    the reader can check, so it is dropped.
+    """
     result: dict[uuid.UUID, list[dict[str, Any]] | None] = {}
     for message in messages:
-        if message.citations is None:
+        if not message.conflicts:
             result[message.id] = None
             continue
-        result[message.id] = [
-            citation
-            if str(citation.get("chunk_id")) in readable
-            else {
-                **citation,
-                "document_name": "",
-                "section_title": "",
-                "text": "",
-                "unavailable": True,
-            }
-            for citation in message.citations
+        gone = {c["n"] for c in citations.get(message.id) or [] if c.get("unavailable")}
+        kept = []
+        for conflict in message.conflicts:
+            claims = [c for c in conflict.get("claims", []) if c.get("n") not in gone]
+            if len({c.get("document_id") for c in claims}) >= 2:
+                kept.append({**conflict, "claims": claims})
+        result[message.id] = kept or None
+    return result
+
+
+def readable_suggestions(
+    db: Session, user: User, messages: list[Message]
+) -> dict[uuid.UUID, list[dict[str, Any]] | None]:
+    """Each message's follow-up suggestions, without those whose passage the reader can no
+    longer read (deleted document, lowered role): its question could quote that document."""
+    wanted = {
+        str(s["chunk_id"]) for m in messages for s in m.suggestions or [] if s.get("chunk_id")
+    }
+    readable = readable_chunk_ids(db, user, wanted)
+    result: dict[uuid.UUID, list[dict[str, Any]] | None] = {}
+    for message in messages:
+        kept = [
+            {"type": s["type"], "question": s["question"], "document_id": s.get("document_id")}
+            for s in message.suggestions or []
+            if str(s.get("chunk_id")) in readable
         ]
+        result[message.id] = kept or None
     return result
 
 

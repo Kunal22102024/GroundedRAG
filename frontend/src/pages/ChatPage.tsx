@@ -3,7 +3,9 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, streamChat } from "../api/client";
 import Answer from "../components/chat/Answer";
+import ConflictPanel from "../components/chat/ConflictPanel";
 import FilterBar from "../components/chat/FilterBar";
+import SuggestionChips from "../components/chat/SuggestionChips";
 import SourceDrawer from "../components/source/SourceDrawer";
 import {
   AlertCircleIcon,
@@ -25,18 +27,23 @@ import {
   TrashIcon,
   XIcon,
 } from "../components/ui/icons";
-import { Skeleton } from "../components/ui/primitives";
+import { FileTypeBadge, Skeleton } from "../components/ui/primitives";
 import { useToast } from "../components/ui/Toast";
+import { useSuggestions } from "../hooks/useSuggestions";
 import { timeAgo } from "../lib/format";
 import {
   REFUSAL_MESSAGE,
   type ChatFilters,
   type Citation,
+  type Conflict,
   type Conversation,
   type ConversationDetail,
   type DocumentList,
   type DonePayload,
+  type FollowUp,
   type Message,
+  type QuestionSource,
+  type Suggestions,
 } from "../lib/types";
 import { btnSecondary, iconBtn } from "../lib/ui";
 
@@ -45,6 +52,8 @@ interface StreamState {
   text: string;
   status: string;
   citations: Citation[];
+  conflicts: Conflict[];
+  suggestions: FollowUp[];
   error: string | null;
   done: DonePayload | null;
 }
@@ -53,6 +62,8 @@ const STATUS_TEXT: Record<string, string> = {
   searching: "Searching your documents",
   rewriting: "Understanding your follow-up",
   generating: "Writing the answer",
+  checking_sources: "Checking the sources against each other",
+  suggesting: "Finding follow-up questions",
   rate_limited: "The AI service is busy, retrying shortly",
   retrying: "Double-checking the citations",
   saving: "Saving the conversation",
@@ -68,6 +79,49 @@ const SUGGESTIONS = [
   { title: "Find a requirement", prompt: "What is the minimum recommended length for a work password?" },
   { title: "Compare figures", prompt: "Which region reported the highest quarterly revenue?" },
 ];
+
+/** Before the first question: questions the chosen (or recent) documents answer, and questions others often asked. */
+function StartSuggestions({ suggestions, onAsk }: { suggestions: Suggestions; onAsk: (question: string) => void }) {
+  const chip =
+    "group flex max-w-full items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-left text-sm text-slate-700 shadow-xs transition-all hover:-translate-y-0.5 hover:border-indigo-200 hover:shadow-md";
+  return (
+    <div className="mt-8 w-full space-y-5 text-left">
+      {(suggestions.documents.length > 0 || suggestions.pending.length > 0) && (
+        <section aria-label="Questions from your documents" className="space-y-2">
+          <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            <BookOpenIcon size={14} /> From your documents
+          </h3>
+          <div className="flex flex-wrap gap-2">
+            {suggestions.documents.map((s, i) => (
+              <button key={`${s.document_id}-${s.question}`} onClick={() => onAsk(s.question)} className={`${chip} animate-fade-up`} style={{ animationDelay: `${Math.min(i, 8) * 40}ms` }} title={s.document_name}>
+                <FileTypeBadge name={s.document_name} size="sm" />
+                <span className="min-w-0">{s.question}</span>
+              </button>
+            ))}
+            {suggestions.pending.length > 0 &&
+              [0, 1, 2].map((i) => <Skeleton key={i} className="h-11 w-56 rounded-xl" />)}
+          </div>
+          {suggestions.pending.length > 0 && <p className="text-xs text-slate-400">Writing questions for the selected documents…</p>}
+        </section>
+      )}
+      {suggestions.popular.length > 0 && (
+        <section aria-label="Often asked" className="space-y-2">
+          <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            <SparklesIcon size={14} /> Often asked
+          </h3>
+          <div className="flex flex-wrap gap-2">
+            {suggestions.popular.map((s) => (
+              <button key={s.question} onClick={() => onAsk(s.question)} className={chip}>
+                <span className="min-w-0">{s.question}</span>
+                <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-500">asked by {s.asked_by}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
 
 function AssistantAvatar() {
   return (
@@ -158,7 +212,17 @@ function UserBubble({ text }: { text: string }) {
   );
 }
 
-function AssistantBubble({ message, onCite }: { message: Message; onCite: (c: Citation) => void }) {
+function AssistantBubble({
+  message,
+  onCite,
+  onAsk,
+  busy,
+}: {
+  message: Message;
+  onCite: (c: Citation) => void;
+  onAsk: (question: string) => void;
+  busy: boolean;
+}) {
   const refusal = message.content === REFUSAL_MESSAGE;
   return (
     <div className="flex animate-fade-up gap-3">
@@ -171,6 +235,12 @@ function AssistantBubble({ message, onCite }: { message: Message; onCite: (c: Ci
               <AlertTriangleIcon size={13} /> Some citations could not be verified, or the answer was cut short.
             </p>
           )}
+          {!refusal && message.conflicts && message.conflicts.length > 0 && (
+            <div className="mt-3">
+              <ConflictPanel conflicts={message.conflicts} citations={message.citations ?? []} onCite={onCite} />
+            </div>
+          )}
+          {!refusal && message.suggestions && <SuggestionChips suggestions={message.suggestions} onAsk={onAsk} disabled={busy} />}
         </div>
         {!refusal && (
           <div className="mt-1 pl-1">
@@ -256,7 +326,7 @@ export default function ChatPage() {
     onError: () => toast({ tone: "error", title: "Could not delete that conversation" }),
   });
 
-  const send = async (question: string) => {
+  const send = async (question: string, source: QuestionSource) => {
     controller.current?.abort();
     const abort = new AbortController();
     controller.current = abort;
@@ -267,7 +337,7 @@ export default function ChatPage() {
 
     stickToBottom.current = true;
     setInput("");
-    setStream({ question, text: "", status: "searching", citations: [], error: null, done: null });
+    setStream({ question, text: "", status: "searching", citations: [], conflicts: [], suggestions: [], error: null, done: null });
     const clean: ChatFilters = Object.fromEntries(
       Object.entries(filters).filter(([, v]) => (Array.isArray(v) ? v.length > 0 : Boolean(v))),
     );
@@ -293,11 +363,13 @@ export default function ChatPage() {
 
     try {
       await streamChat(
-        { question, conversation_id: conversationId, filters: Object.keys(clean).length ? clean : undefined },
+        { question, conversation_id: conversationId, filters: Object.keys(clean).length ? clean : undefined, source },
         {
           onStatus: (stage, data) => patch((s) => ({ status: stage, text: data.reset ? "" : s.text })),
           onToken: (t) => patch((s) => ({ text: s.text + t })),
           onCitations: (citations) => patch({ citations }),
+          onConflicts: (conflicts) => patch({ conflicts }),
+          onSuggestions: (suggestions) => patch({ suggestions }),
           onDone: (done) => {
             // Stay busy until the stored conversation is loaded: a question sent in between would
             // otherwise start a second conversation or have its bubble cleared.
@@ -316,7 +388,7 @@ export default function ChatPage() {
   };
 
   const busy = stream !== null && !stream.error && !FINISHED.has(stream.status);
-  const ask = (raw: string) => {
+  const ask = (raw: string, source: QuestionSource = "typed") => {
     const question = raw.trim();
     if (!question || busy) return;
     if (filters.date_from && filters.date_to && filters.date_from > filters.date_to) {
@@ -325,8 +397,9 @@ export default function ChatPage() {
       return;
     }
     setFormError(null);
-    void send(question);
+    void send(question, source);
   };
+  const askFollowUp = (question: string) => ask(question, "followup");
   const submit = (event: FormEvent) => {
     event.preventDefault();
     ask(input);
@@ -342,6 +415,7 @@ export default function ChatPage() {
   const title = conversationId ? (detail.data?.title ?? "Conversation") : "New chat";
   const empty = messages.length === 0 && !stream && !(conversationId && (detail.isLoading || detail.isError));
   const docCount = indexed.data?.total ?? 0;
+  const offered = useSuggestions(filters.document_ids ?? [], empty && docCount > 0);
 
   return (
     <div className="relative flex h-full">
@@ -481,11 +555,14 @@ export default function ChatPage() {
                     </span>
                   ) : null}
                 </p>
+                {offered.data && (offered.data.documents.length > 0 || offered.data.popular.length > 0 || offered.data.pending.length > 0) ? (
+                  <StartSuggestions suggestions={offered.data} onAsk={(q) => ask(q, "suggestion")} />
+                ) : (
                 <div className="mt-8 grid w-full gap-3 sm:grid-cols-2">
                   {SUGGESTIONS.map((s, i) => (
                     <button
                       key={s.title}
-                      onClick={() => ask(s.prompt)}
+                      onClick={() => ask(s.prompt, "suggestion")}
                       disabled={docCount === 0}
                       className="group animate-fade-up rounded-xl border border-slate-200 bg-white p-4 text-left shadow-xs transition-all hover:-translate-y-0.5 hover:border-indigo-200 hover:shadow-md disabled:pointer-events-none disabled:opacity-50"
                       style={{ animationDelay: `${120 + i * 60}ms` }}
@@ -497,10 +574,17 @@ export default function ChatPage() {
                     </button>
                   ))}
                 </div>
+                )}
               </div>
             )}
 
-            {messages.map((m) => (m.role === "user" ? <UserBubble key={m.id} text={m.content} /> : <AssistantBubble key={m.id} message={m} onCite={setDrawer} />))}
+            {messages.map((m) =>
+              m.role === "user" ? (
+                <UserBubble key={m.id} text={m.content} />
+              ) : (
+                <AssistantBubble key={m.id} message={m} onCite={setDrawer} onAsk={askFollowUp} busy={busy} />
+              ),
+            )}
 
             {stream && (
               <>
@@ -519,6 +603,8 @@ export default function ChatPage() {
                         <Answer text={stream.text} citations={stream.citations} onCite={setDrawer} streaming={stream.status === "generating"} />
                       )
                     ) : null}
+                    {stream.conflicts.length > 0 && <ConflictPanel conflicts={stream.conflicts} citations={stream.citations} onCite={setDrawer} />}
+                    {stream.suggestions.length > 0 && !busy && <SuggestionChips suggestions={stream.suggestions} onAsk={askFollowUp} />}
                     {stream.status === "stopped" && <p className="text-sm text-slate-500">Stopped. This answer was not saved.</p>}
                     {busy && !(stream.status === "generating" && stream.text) && <TypingIndicator label={STATUS_TEXT[stream.status] ?? "Working"} />}
                   </div>

@@ -25,7 +25,7 @@ from datetime import date
 from pathlib import Path
 from typing import BinaryIO
 
-from sqlalchemy import ColumnElement, delete, func, select, update
+from sqlalchemy import ColumnElement, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -37,7 +37,7 @@ from app.constants import (
     allowed_access_levels,
 )
 from app.core import bm25, metadata, vectorstore
-from app.db.models import Document, Message, User
+from app.db.models import Document, DocumentInsight, Message, User
 from app.services import ingestion
 
 logger = logging.getLogger(__name__)
@@ -449,6 +449,25 @@ def _scrub_citations(db: Session, document_id: uuid.UUID) -> None:
             for citation in citations or []
         ]
         db.execute(update(Message).where(Message.id == message_id).values(citations=scrubbed))
+    # Follow-up questions offered after an answer were written from this document's passages.
+    rows = db.execute(
+        select(Message.id, Message.suggestions).where(
+            Message.suggestions.contains([{"document_id": wanted}])
+        )
+    ).all()
+    for message_id, suggestions in rows:
+        kept = [s for s in suggestions or [] if s.get("document_id") != wanted]
+        db.execute(update(Message).where(Message.id == message_id).values(suggestions=kept or None))
+    # Saved analyses (summaries, extractions) copy passages too. Its own are removed with the
+    # document (ON DELETE CASCADE); this removes the others that cite it or were compared with it.
+    db.execute(
+        delete(DocumentInsight).where(
+            or_(
+                DocumentInsight.content.contains({"citations": [{"document_id": wanted}]}),
+                DocumentInsight.params_key == wanted,
+            )
+        )
+    )
 
 
 def _delete_locked(db: Session, document: Document) -> None:

@@ -71,6 +71,60 @@ class MessageRole(StrEnum):
     ASSISTANT = "assistant"
 
 
+class InsightKind(StrEnum):
+    """What a saved analysis of a document is (``document_insights.kind``)."""
+
+    EXECUTIVE = "executive"
+    CHAPTERS = "chapters"
+    FAQ = "faq"
+    GLOSSARY = "glossary"
+    KEY_CHANGES = "key_changes"
+    EXTRACTION = "extraction"
+    QUESTIONS = "questions"  # suggested questions the document answers
+
+
+class InsightStatus(StrEnum):
+    """Progress of a saved analysis: it is written ``pending`` before the model is called."""
+
+    PENDING = "pending"
+    READY = "ready"
+    FAILED = "failed"
+
+
+class EventKind(StrEnum):
+    """What a ``query_events`` row measures: a chat turn or one analysis run."""
+
+    CHAT = "chat"
+    SUMMARY = "summary"
+    EXTRACT = "extract"
+    COMPARE = "compare"
+    SUGGEST = "suggest"
+
+
+class EventOutcome(StrEnum):
+    """How a chat turn or analysis run ended."""
+
+    ANSWERED = "answered"
+    REFUSED = "refused"
+    FAILED = "failed"
+
+
+class QuestionSource(StrEnum):
+    """How a chat question was asked: typed, or picked from a suggestion."""
+
+    TYPED = "typed"
+    SUGGESTION = "suggestion"
+    FOLLOWUP = "followup"
+
+
+class SuggestionType(StrEnum):
+    """Kinds of question offered after an answer."""
+
+    FOLLOW_UP = "follow_up"
+    SUB_QUESTION = "sub_question"
+    RELATED = "related"
+
+
 class FeedbackRating(StrEnum):
     """Thumbs up/down on an assistant message."""
 

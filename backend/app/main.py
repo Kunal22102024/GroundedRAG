@@ -15,12 +15,22 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.api import auth, chat, conversations, documents, health
+from app.api import (
+    analysis,
+    auth,
+    chat,
+    conversations,
+    documents,
+    health,
+    metrics,
+    suggestions,
+    users,
+)
 from app.config import get_settings
 from app.constants import API_PREFIX
 from app.db import database
 from app.middleware import RequestContextMiddleware, configure_logging
-from app.services import index_service, ingestion
+from app.services import analysis_service, index_service, ingestion
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +48,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await asyncio.to_thread(index_service.run_startup)
     yield
     ingestion.shutdown_workers()
+    analysis_service.shutdown()
     database.dispose_engine()
     logger.info("backend stopped")
 
@@ -73,6 +84,10 @@ def create_app() -> FastAPI:
     api_router.include_router(documents.router)
     api_router.include_router(chat.router)
     api_router.include_router(conversations.router)
+    api_router.include_router(analysis.router)
+    api_router.include_router(suggestions.router)
+    api_router.include_router(metrics.router)
+    api_router.include_router(users.router)
     app.include_router(api_router)
     return app
 

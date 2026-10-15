@@ -14,7 +14,25 @@ export async function downloadOriginal(documentId: string, name: string): Promis
   setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
-export const isPdf = (name: string): boolean => name.toLowerCase().endsWith(".pdf");
+/** Save text generated in the page (an export) as a file. */
+export function saveText(filename: string, mime: string, text: string): void {
+  const url = URL.createObjectURL(new Blob([text], { type: `${mime};charset=utf-8` }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+/** "Quarterly report.pdf" -> "Quarterly report" (for naming exports). */
+export function baseName(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(0, dot) : name;
+}
+
+export const isPdf =(name: string): boolean => name.toLowerCase().endsWith(".pdf");
 
 /** "Policy.PDF" -> "pdf" ("" when there is none). */
 export function fileExtension(name: string): string {

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
-import { pageLabel } from "../../lib/files";
 import type { Citation } from "../../lib/types";
+import CitationChip from "./CitationChip";
 
 // Citation markers, bold and inline code. Bold and code can contain markers, which `inline` resolves
 // by calling itself on their text.
@@ -15,19 +15,7 @@ function inline(text: string, citations: Citation[], onCite: (c: Citation) => vo
     if (cite) {
       const citation = citations.find((c) => c.n === Number(cite[1]));
       if (!citation) return null; // never show a marker that maps to no source
-      if (citation.unavailable) {
-        return (
-          <span key={key} className="cite-chip cite-chip-unavailable" title="This source is no longer available">
-            [{citation.n}] source no longer available
-          </span>
-        );
-      }
-      const name = citation.document_name.length > 26 ? `${citation.document_name.slice(0, 24)}…` : citation.document_name;
-      return (
-        <button key={key} type="button" className="cite-chip" title={`${citation.document_name} • page ${pageLabel(citation.page_number, citation.page_end)}`} onClick={() => onCite(citation)}>
-          {name} • p{pageLabel(citation.page_number, citation.page_end)}
-        </button>
-      );
+      return <CitationChip key={key} citation={citation} onCite={onCite} />;
     }
     if (part.startsWith("**") && part.endsWith("**") && part.length > 4) return <strong key={key}>{inline(part.slice(2, -2), citations, onCite, key)}</strong>;
     if (part.startsWith("`") && part.endsWith("`") && part.length > 2) return <code key={key} className="rounded bg-slate-100 px-1 text-sm">{part.slice(1, -1)}</code>;

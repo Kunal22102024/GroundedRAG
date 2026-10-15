@@ -1,11 +1,15 @@
+import type { ReactNode } from "react";
 import { Link, Navigate, NavLink, Outlet, Route, Routes, useLocation } from "react-router-dom";
-import { AlertCircleIcon, ChatIcon, LibraryIcon, LogOutIcon, LogoMark } from "./components/ui/icons";
+import { AlertCircleIcon, ChartIcon, ChatIcon, LibraryIcon, LogOutIcon, LogoMark, SparklesIcon, UsersIcon } from "./components/ui/icons";
 import { Spinner } from "./components/ui/primitives";
 import { useAuth } from "./hooks/useAuth";
 import { btnPrimary, iconBtn } from "./lib/ui";
+import AnalyzePage from "./pages/AnalyzePage";
 import ChatPage from "./pages/ChatPage";
+import DashboardPage from "./pages/DashboardPage";
 import LibraryPage from "./pages/LibraryPage";
 import LoginPage from "./pages/LoginPage";
+import UsersPage from "./pages/UsersPage";
 
 function FullPageLoading() {
   return (
@@ -42,9 +46,20 @@ function ProtectedLayout() {
   if (!user) return <Navigate to="/login" replace />;
 
   const tab = ({ isActive }: { isActive: boolean }) =>
-    `relative flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium transition-all ${
+    `relative flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm font-medium transition-all sm:px-3 ${
       isActive ? "bg-white text-indigo-700 shadow-sm" : "text-slate-600 hover:text-slate-900"
     }`;
+  /** A header tab. Its label is hidden when space is short (`labelFrom`), except on the page you are on. */
+  const NavTab = ({ to, icon, label, labelFrom }: { to: string; icon: ReactNode; label: string; labelFrom: "sm" | "lg" }) => (
+    <NavLink to={to} className={tab} aria-label={label} title={label}>
+      {({ isActive }) => (
+        <>
+          {icon}
+          <span className={isActive ? "inline" : labelFrom === "sm" ? "hidden sm:inline" : "hidden lg:inline"}>{label}</span>
+        </>
+      )}
+    </NavLink>
+  );
   const section = location.pathname.split("/")[1] || "chat";
   return (
     <div className="flex h-full flex-col">
@@ -56,12 +71,11 @@ function ProtectedLayout() {
           </span>
         </Link>
         <nav className="flex gap-1 rounded-xl bg-slate-100 p-1" aria-label="Main">
-          <NavLink to="/chat" className={tab}>
-            <ChatIcon size={16} /> Chat
-          </NavLink>
-          <NavLink to="/library" className={tab}>
-            <LibraryIcon size={16} /> Library
-          </NavLink>
+          <NavTab to="/chat" icon={<ChatIcon size={16} />} label="Chat" labelFrom="sm" />
+          <NavTab to="/library" icon={<LibraryIcon size={16} />} label="Library" labelFrom="sm" />
+          <NavTab to="/analyze" icon={<SparklesIcon size={16} />} label="Analyze" labelFrom="sm" />
+          {user.role === "admin" && <NavTab to="/dashboard" icon={<ChartIcon size={16} />} label="Evaluation" labelFrom="lg" />}
+          {user.role === "admin" && <NavTab to="/users" icon={<UsersIcon size={16} />} label="Users" labelFrom="lg" />}
         </nav>
         <div className="ml-auto flex items-center gap-2">
           <div className="hidden items-center gap-2.5 rounded-full border border-slate-200 bg-white py-1 pl-1 pr-3 sm:flex">
@@ -112,6 +126,9 @@ export default function App() {
         <Route path="/chat" element={<ChatPage />} />
         <Route path="/chat/:conversationId" element={<ChatPage />} />
         <Route path="/library" element={<LibraryPage />} />
+        <Route path="/analyze" element={<AnalyzePage />} />
+        <Route path="/dashboard" element={<DashboardPage />} />
+        <Route path="/users" element={<UsersPage />} />
       </Route>
       <Route path="*" element={<NotFoundPage />} />
     </Routes>

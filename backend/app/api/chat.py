@@ -41,7 +41,12 @@ async def chat(body: ChatRequest, user: CurrentUser) -> StreamingResponse:
     """Answer a question from the documents the caller may read."""
     try:
         plan = await asyncio.to_thread(
-            chat_service.prepare_chat, user, body.question, body.conversation_id, body.filters
+            chat_service.prepare_chat,
+            user,
+            body.question,
+            body.conversation_id,
+            body.filters,
+            body.source,
         )
     except chat_service.ConversationNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found") from None

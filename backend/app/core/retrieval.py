@@ -68,6 +68,20 @@ class Candidate:
     rrf_score: float
 
 
+def citation_dict(number: int, candidate: Candidate) -> dict[str, Any]:
+    """A citation as stored with a message and sent to the client (the cited passage included)."""
+    return {
+        "n": number,
+        "chunk_id": candidate.chunk_id,
+        "document_id": candidate.document_id,
+        "document_name": candidate.document_name,
+        "page_number": candidate.page_number,
+        "page_end": candidate.page_end,
+        "section_title": candidate.section_title,
+        "text": candidate.text,
+    }
+
+
 @dataclass(frozen=True)
 class RetrievalResult:
     """The chunks to answer from, plus what the guard needs and the per-stage timings (ms)."""

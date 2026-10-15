@@ -1,6 +1,48 @@
 @import "tailwindcss";
 
 @theme {
+  /* Warm peach theme. The components use Tailwind's palette names; the palettes themselves are
+     redefined here, so a theme change happens in this block and nowhere else:
+       indigo = peach / burnt apricot (primary accent; 600-700 keep white and chip text readable)
+       violet = coral (second stop of the gradients, admin badge)
+       slate  = warm cream to cocoa (neutrals: backgrounds, borders, text)
+     rose (errors), amber (warnings, conflicts) and emerald (success) keep their meaning. */
+  --color-indigo-50: #fff6f0;
+  --color-indigo-100: #ffe9dc;
+  --color-indigo-200: #ffd2b8;
+  --color-indigo-300: #ffb48e;
+  --color-indigo-400: #fb9466;
+  --color-indigo-500: #f07a48;
+  --color-indigo-600: #c2541f;
+  --color-indigo-700: #a14418;
+  --color-indigo-800: #833819;
+  --color-indigo-900: #6b301a;
+  --color-indigo-950: #3a160a;
+
+  --color-violet-50: #fff4f1;
+  --color-violet-100: #ffe4dc;
+  --color-violet-200: #ffcbbd;
+  --color-violet-300: #ffa893;
+  --color-violet-400: #fb8268;
+  --color-violet-500: #f2654c;
+  --color-violet-600: #d0472f;
+  --color-violet-700: #b03a28;
+  --color-violet-800: #922f23;
+  --color-violet-900: #78291f;
+  --color-violet-950: #42120d;
+
+  --color-slate-50: #fdf8f4;
+  --color-slate-100: #f8efe8;
+  --color-slate-200: #efe1d6;
+  --color-slate-300: #e0cbbd;
+  --color-slate-400: #b8a194;
+  --color-slate-500: #8b7569;
+  --color-slate-600: #6b584e;
+  --color-slate-700: #54443c;
+  --color-slate-800: #3b2f2a;
+  --color-slate-900: #29201c;
+  --color-slate-950: #160f0c;
+
   --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 
   --animate-fade-in: fade-in 0.25s ease-out both;
@@ -90,7 +132,7 @@ body {
 /* Thin, quiet scrollbars. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgb(203 213 225) transparent;
+  scrollbar-color: var(--color-slate-300) transparent;
 }
 
 .cite-chip {
@@ -109,7 +151,12 @@ body {
 
 .skeleton {
   @apply animate-shimmer rounded-md bg-[length:200%_100%];
-  background-image: linear-gradient(90deg, rgb(241 245 249) 0%, rgb(226 232 240) 50%, rgb(241 245 249) 100%);
+  background-image: linear-gradient(
+    90deg,
+    var(--color-slate-100) 0%,
+    var(--color-slate-200) 50%,
+    var(--color-slate-100) 100%
+  );
 }
 
 /* Respect people who asked their system for less motion. */

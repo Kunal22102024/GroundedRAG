@@ -55,9 +55,13 @@ class AnswerResult:
 
 
 async def generate_answer(
-    question: str, candidates: Sequence[Candidate]
+    question: str, candidates: Sequence[Candidate], max_retries: int | None = None
 ) -> AsyncIterator[llm.Wait | Restart | Token | AnswerResult]:
-    """Stream a cited answer to ``question`` from ``candidates``; raises ``llm.LlmError``."""
+    """Stream a cited answer to ``question`` from ``candidates``; raises ``llm.LlmError``.
+
+    ``max_retries`` (default: ``INTERACTIVE_MAX_RETRIES``) is how often a busy model is retried
+    before giving up; a comparison, which is slower than a chat turn anyway, passes a larger one.
+    """
     started = time.perf_counter()
     usage: Counter[str] = Counter()
     ttft_ms: float | None = None
@@ -69,7 +73,7 @@ async def generate_answer(
         finish: str | None = None
         received = False
         messages = prompts.build_answer_messages(question, candidates, strict=attempt == 2)
-        async for item in llm.stream(messages, "answer"):
+        async for item in llm.stream(messages, "answer", max_retries):
             if isinstance(item, llm.Wait):
                 yield item
                 continue

@@ -15,7 +15,16 @@ from sqlalchemy.schema import CreateTable
 from app.db.database import Base, get_engine
 from tests.conftest import run_migrations, temporary_database, use_database
 
-EXPECTED_TABLES = {"users", "documents", "chunks", "conversations", "messages", "feedback"}
+EXPECTED_TABLES = {
+    "users",
+    "documents",
+    "chunks",
+    "conversations",
+    "messages",
+    "feedback",
+    "document_insights",
+    "query_events",
+}
 
 
 @pytest.fixture
@@ -88,6 +97,8 @@ def test_foreign_keys_cascade_as_designed(empty_database: str) -> None:
     assert ("chunks", "c") in actions
     assert ("messages", "c") in actions
     assert ("feedback", "c") in actions
+    assert ("document_insights", "c") in actions
     assert ("conversations", "c") in actions
     assert ("documents", "n") in actions
+    assert ("query_events", "n") in actions  # a measurement outlives its user
     assert all(kind in {"c", "n"} for _, kind in actions), "no unexpected RESTRICT/NO ACTION FKs"

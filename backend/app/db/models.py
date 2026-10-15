@@ -25,8 +25,13 @@ from app.constants import (
     ACCESS_LEVELS,
     AccessLevel,
     DocumentStatus,
+    EventKind,
+    EventOutcome,
     FeedbackRating,
+    InsightKind,
+    InsightStatus,
     MessageRole,
+    QuestionSource,
     Role,
 )
 from app.db.database import Base
@@ -185,6 +190,13 @@ class Message(Base):
     role: Mapped[str] = mapped_column(sa.String(16))
     content: Mapped[str] = mapped_column(sa.Text)
     citations: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    # Points on which the cited documents disagree:
+    # [{topic, claims: [{n, document_id, document_name, claim}]}], where n is a number in
+    # ``citations``. NULL when the check did not run or found nothing.
+    conflicts: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    # Questions offered after the answer: [{type, question, n}], n a number of the retrieved
+    # passage that would answer it (kept in ``suggestions`` items as ``document_id`` too).
+    suggestions: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
     # Best dense cosine / reranker score seen by the guard (exposed for debugging).
     guard_score: Mapped[float | None] = mapped_column(sa.Float)
     timings: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
@@ -217,3 +229,91 @@ class Feedback(Base):
     created_at: Mapped[datetime] = _created_at()
 
     message: Mapped[Message] = relationship(back_populates="feedback")
+
+
+class DocumentInsight(Base):
+    """A saved analysis of one document: a summary of one kind, or an extraction.
+
+    ``params_key`` tells apart analyses of the same kind: the set of fields of an extraction, or
+    the earlier version a ``key_changes`` report compares against (empty otherwise). The row is
+    written ``pending`` before the model is called, so a restart can fail what it interrupted.
+    ``content`` holds the text or items and the cited passages, so it goes with the document
+    (``ON DELETE CASCADE``) and is also removed when a document it cites is deleted.
+    """
+
+    __tablename__ = "document_insights"
+    __table_args__ = (
+        UniqueConstraint("document_id", "kind", "params_key"),
+        CheckConstraint(_in("kind", InsightKind), name="kind_valid"),
+        CheckConstraint(_in("status", InsightStatus), name="status_valid"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(sa.String(16))
+    params_key: Mapped[str] = mapped_column(sa.String(64), default="", server_default="")
+    status: Mapped[str] = mapped_column(
+        sa.String(16), default=InsightStatus.PENDING.value, server_default="pending"
+    )
+    content: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    error_message: Mapped[str | None] = mapped_column(sa.Text)
+    model: Mapped[str] = mapped_column(sa.String(100), default="", server_default="")
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()
+    )
+
+
+class QueryEvent(Base):
+    """One chat turn or analysis run, as measured: the source of the evaluation dashboard.
+
+    Written for every outcome, failures included, and never read back into an answer. It holds
+    the question (shown to admins on the dashboard, and the source of "often asked" suggestions)
+    and ids, never document text. ``conversation_id``/``message_id`` have no foreign key: the
+    measurement outlives a deleted conversation. Old rows are pruned (``METRICS_RETENTION_DAYS``).
+    """
+
+    __tablename__ = "query_events"
+    __table_args__ = (
+        CheckConstraint(_in("kind", EventKind), name="kind_valid"),
+        CheckConstraint(_in("outcome", EventOutcome), name="outcome_valid"),
+        CheckConstraint(_in("source", QuestionSource), name="source_valid"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), index=True
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    kind: Mapped[str] = mapped_column(sa.String(16))
+    outcome: Mapped[str] = mapped_column(sa.String(16))
+    source: Mapped[str] = mapped_column(
+        sa.String(16), default=QuestionSource.TYPED.value, server_default="typed"
+    )
+    error_code: Mapped[str | None] = mapped_column(sa.String(40))
+    guard_reason: Mapped[str | None] = mapped_column(sa.String(40))
+    best_similarity: Mapped[float | None] = mapped_column(sa.Float)
+    mean_similarity: Mapped[float | None] = mapped_column(sa.Float)
+    retrieved: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    cited: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    cited_documents: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    cited_document_ids: Mapped[list[str] | None] = mapped_column(JSONB)
+    citations_removed: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    uncited: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
+    retried: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
+    partial: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
+    rewritten: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
+    conflicts: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    suggestions: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    input_tokens: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    output_tokens: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    total_tokens: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    model: Mapped[str] = mapped_column(sa.String(100), default="", server_default="")
+    total_ms: Mapped[float | None] = mapped_column(sa.Float)
+    timings: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    question: Mapped[str | None] = mapped_column(sa.Text)
+    document_ids: Mapped[list[str] | None] = mapped_column(JSONB)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid)
+    message_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid)

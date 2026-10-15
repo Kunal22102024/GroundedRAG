@@ -40,6 +40,8 @@ def get_conversation(
         raise _not_found() from None
     ratings = service.ratings_for(db, user, conversation.messages)
     citations = service.readable_citations(db, user, conversation.messages)
+    conflicts = service.readable_conflicts(conversation.messages, citations)
+    suggestions = service.readable_suggestions(db, user, conversation.messages)
     return ConversationDetail(
         id=conversation.id,
         title=conversation.title,
@@ -52,6 +54,8 @@ def get_conversation(
                 role=m.role,
                 content=m.content,
                 citations=citations[m.id],
+                conflicts=conflicts[m.id],
+                suggestions=suggestions[m.id],
                 guard_score=m.guard_score,
                 flagged=m.flagged,
                 created_at=m.created_at,

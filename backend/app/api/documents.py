@@ -13,6 +13,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Response, Uploa
 from fastapi.responses import FileResponse
 
 from app.constants import AccessLevel, DocumentStatus
+from app.db.models import Document
 from app.deps import CurrentUser, DbSession
 from app.schemas import (
     DocumentListResponse,
@@ -21,7 +22,7 @@ from app.schemas import (
     RejectedFileOut,
     UploadResponse,
 )
-from app.services import document_service
+from app.services import analysis_service, document_service
 from app.services.document_service import (
     DocumentBusy,
     DocumentDeleteFailed,
@@ -38,6 +39,12 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 _PDF = "application/pdf"
 _NO_NUL = r"^[^\x00]*$"  # PostgreSQL text cannot hold a NUL character
+
+
+def _with_summary(document: Document, summaries: dict[uuid.UUID, str]) -> DocumentOut:
+    """The document with the state of its automatic executive summary."""
+    out = DocumentOut.model_validate(document)
+    return out.model_copy(update={"executive_summary": summaries.get(document.id, "none")})
 
 
 def _not_found() -> HTTPException:
@@ -132,8 +139,9 @@ def list_documents(
         limit,
         offset,
     )
+    summaries = analysis_service.executive_statuses(db, [d.id for d in page.items])
     return DocumentListResponse(
-        items=[DocumentOut.model_validate(d) for d in page.items],
+        items=[_with_summary(d, summaries) for d in page.items],
         total=page.total,
         limit=limit,
         offset=offset,

@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal
@@ -83,11 +83,16 @@ def _build(model: str, max_tokens: int) -> Any:
     )
 
 
-def get_chat_model(kind: Literal["answer", "rewrite"] = "answer") -> Any:
-    """The chat model for answering or for rewriting follow-ups (built once per setting)."""
+Kind = Literal["answer", "rewrite", "analysis"]
+
+
+def get_chat_model(kind: Kind = "answer") -> Any:
+    """The chat model for answering, rewriting follow-ups or analysing (built once per setting)."""
     settings = get_settings()
     if kind == "rewrite":
         return _build(settings.rewrite_model_id, REWRITE_MAX_TOKENS)
+    if kind == "analysis":  # summaries, tables and comparisons: same model, a larger output budget
+        return _build(settings.llm_model, settings.analysis_max_tokens)
     return _build(settings.llm_model, settings.llm_max_tokens)
 
 
@@ -153,11 +158,16 @@ def _to_error(exc: BaseException, info: Classified) -> LlmError:
 
 
 async def stream(
-    messages: Sequence[BaseMessage], kind: Literal["answer", "rewrite"] = "answer"
+    messages: Sequence[BaseMessage], kind: Kind = "answer", max_retries: int | None = None
 ) -> AsyncIterator[Wait | Piece]:
-    """Stream the model's reply, retrying a rate limit briefly before any output has been sent."""
+    """Stream the model's reply, retrying a rate limit briefly before any output has been sent.
+
+    ``max_retries`` replaces ``INTERACTIVE_MAX_RETRIES`` for work that can afford to wait longer
+    (analysis); each wait is still capped by ``INTERACTIVE_MAX_WAIT_SECONDS``.
+    """
     settings = get_settings()
     model = get_chat_model(kind)
+    limit = settings.interactive_max_retries if max_retries is None else max_retries
     attempt = 0
     while True:
         started = False
@@ -179,11 +189,7 @@ async def stream(
                 delay = _BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
             delay *= _jitter(1.0, 1.1)
             retriable = info.kind in ("rate_limit", "transient")
-            if (
-                not retriable
-                or attempt > settings.interactive_max_retries
-                or delay > settings.interactive_max_wait_seconds
-            ):
+            if not retriable or attempt > limit or delay > settings.interactive_max_wait_seconds:
                 raise _to_error(exc, info) from exc
             logger.warning(
                 "llm call will be retried",
@@ -196,3 +202,44 @@ async def stream(
             )
             yield Wait(delay)
             await _sleep(delay)
+
+
+BLOCKED_MESSAGE = "The AI service declined to process this content."
+EMPTY_MESSAGE = "The AI service returned no answer. Please try again."
+
+
+async def complete(
+    messages: Sequence[BaseMessage],
+    kind: Kind = "analysis",
+    on_wait: Callable[[float], None] | None = None,
+    max_retries: int | None = None,
+) -> tuple[str, dict[str, int]]:
+    """The whole reply of one call: ``(text, usage)``. For work whose output is read as a unit
+    (JSON, a summary) rather than streamed to a person.
+
+    A rate limit is retried briefly exactly like ``stream`` does (``on_wait`` is told how long the
+    wait is, so a screen can say so). A safety block, a reply cut off by a stop reason other than
+    the normal ones, or an empty reply raises ``LlmError``: a blank result is never returned.
+    """
+    parts: list[str] = []
+    usage: dict[str, int] = {}
+    finish: str | None = None
+    async for item in stream(messages, kind, max_retries):
+        if isinstance(item, Wait):
+            if on_wait is not None:
+                on_wait(item.seconds)
+            continue
+        if item.blocked:
+            raise LlmError("blocked", BLOCKED_MESSAGE)
+        parts.append(item.text)
+        finish = item.finish_reason or finish
+        for key, value in item.usage.items():
+            usage[key] = usage.get(key, 0) + value
+    if finish not in (None, "STOP", "MAX_TOKENS"):  # SAFETY, RECITATION, BLOCKLIST, ...
+        raise LlmError("blocked", BLOCKED_MESSAGE)
+    text = "".join(parts)
+    if not text.strip():
+        raise LlmError("empty", EMPTY_MESSAGE)
+    if finish == "MAX_TOKENS":
+        logger.warning("analysis reply hit the output limit", extra={"kind": kind})
+    return text, usage

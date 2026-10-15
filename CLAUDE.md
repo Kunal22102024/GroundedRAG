@@ -55,7 +55,8 @@ groundedrag/
 │   ├── requirements-dev.txt      # pytest, httpx2, ruff (installed in the image by default)
 │   ├── pyproject.toml            # pytest + ruff configuration
 │   ├── alembic.ini
-│   ├── alembic/                  # env.py, script.py.mako, versions/ (0001 schema, 0002 nullable creation_date)
+│   ├── alembic/                  # env.py, script.py.mako, versions/ (0001 schema, 0002 nullable creation_date,
+│   │                             # 0003 document_insights + messages.conflicts, 0004 query_events + messages.suggestions)
 │   ├── app/
 │   │   ├── main.py               # app factory, startup/shutdown, router mounting
 │   │   ├── config.py             # Settings loaded from env (single source of config)
@@ -70,9 +71,17 @@ groundedrag/
 │   │   │   ├── documents.py
 │   │   │   ├── chat.py
 │   │   │   ├── conversations.py      # conversations CRUD and POST /messages/{id}/feedback
+│   │   │   ├── analysis.py           # summaries, extraction, comparison (SSE) + a document's saved insights
+│   │   │   ├── suggestions.py        # GET /suggestions: questions from documents and often asked
+│   │   │   ├── metrics.py            # evaluation dashboard (admins only)
+│   │   │   ├── users.py              # account administration: list, promote/demote, delete (admins only)
 │   │   │   └── health.py
 │   │   │
 │   │   ├── services/             # business workflows; orchestrate core + db
+│   │   │   ├── analysis_service.py  # access, saved results, streaming drivers, background executive summary,
+│   │   │   │                        # suggested questions per document
+│   │   │   ├── metrics_service.py   # query_events: record one per request, dashboard figures, often-asked questions
+│   │   │   ├── user_service.py      # list/promote/demote/delete accounts; always one admin, under the accounts lock
 │   │   │   ├── health_service.py # readiness probes (Postgres, Chroma, embeddings) so api/ never touches them
 │   │   │   ├── index_service.py  # startup: verify collection, recover jobs, refuse inconsistent index, load BM25
 │   │   │   ├── auth_service.py
@@ -97,6 +106,7 @@ groundedrag/
 │   │   │   ├── prompts.py
 │   │   │   ├── generation.py
 │   │   │   ├── guard.py
+│   │   │   ├── analysis.py       # summaries, extraction, conflict detection: pure, cited, validated
 │   │   │   └── gemini_errors.py  # shared Gemini error classification (rate limit, key, transient)
 │   │   │
 │   │   └── db/
@@ -137,6 +147,11 @@ groundedrag/
 │       ├── test_query_rewrite.py  # follow-up rewriting, bounded and treated as untrusted
 │       ├── test_llm.py          # model client construction and error handling
 │       ├── test_chat.py         # chat end to end (the integration test: upload -> index -> ask -> cited answer)
+│       ├── test_analysis_core.py  # JSON parsing, batching, global numbering, grounding rules (summaries, extraction, conflicts)
+│       ├── test_analysis_api.py   # the endpoints, saved results, access, deletion, auto summary, conflicts in chat
+│       ├── test_users_api.py      # admin-only, role changes on live tokens, last-admin rule (+ race), delete cascades
+│       ├── test_metrics.py        # one event per turn/run incl. failures, figure definitions, admin-only, retention
+│       ├── test_suggestions.py    # document questions, often-asked privacy rules, follow-ups after an answer
 │       └── test_eval_corpus.py  # eval/questions.jsonl agrees with eval/sample_docs/ (needs eval/ mounted)
 │
 ├── frontend/
@@ -148,17 +163,26 @@ groundedrag/
 │   └── src/
 │       ├── main.tsx              # entry: error boundary, query client, router, auth provider
 │       ├── App.tsx               # routes, protected layout (header, navigation), 404 page
-│       ├── api/client.ts         # fetch wrapper (token, 401 -> logout, readable errors) and the /chat SSE reader
-│       ├── hooks/useAuth.tsx     # auth context: login, signup, logout (clears cached data)
-│       ├── pages/                # LoginPage (login and signup, by `mode`), LibraryPage, ChatPage
+│       ├── api/client.ts         # fetch wrapper (token, 401 -> logout, readable errors); `streamSse` (the one SSE reader,
+│       │                         # finishes only on done/error) and `streamChat` on top of it
+│       ├── hooks/                # useAuth.tsx (auth context, clears cached data), useAnalysisRun.ts (one streamed
+│       │                         # analysis at a time), useIndexedDocuments.ts, useSuggestions.ts
+│       ├── pages/                # LoginPage (login and signup, by `mode`), LibraryPage, ChatPage, AnalyzePage,
+│       │                         # DashboardPage and UsersPage (admins)
 │       ├── components/
 │       │   ├── ErrorBoundary.tsx
 │       │   ├── ui/               # icons.tsx (inline SVG, LogoMark), primitives.tsx (Spinner, ProgressBar,
 │       │   │                     # Skeleton, StatusPill, AccessBadge, FileTypeBadge, Modal), Toast.tsx
-│       │   ├── chat/             # Answer (text with citation chips, streaming caret), FilterBar
+│       │   ├── chat/             # Answer (text with citation chips, streaming caret), CitationChip, ConflictPanel,
+│       │   │                     # SuggestionChips (follow-ups), FilterBar
+│       │   ├── analyze/          # CompareTab, ExtractTab, SummariesTab, DocumentPicker (tabs of AnalyzePage)
+│       │   ├── dashboard/        # charts.tsx: Sparkline, BarList, Histogram, StackedBars (SVG/CSS)
 │       │   └── source/           # SourceDrawer (cited passage + original PDF at the page)
-│       ├── lib/                  # types.ts, files.ts (download, sizes, page labels), ui.ts (shared classes), format.ts (dates)
-│       └── styles/index.css      # Tailwind v4 theme: animations (keyframes) and reduced-motion handling
+│       ├── lib/                  # types.ts, files.ts (download, save, sizes, page labels), ui.ts (shared classes),
+│       │                         # format.ts (dates), analysis.ts (Markdown/JSON/CSV export of results)
+│       └── styles/index.css      # Tailwind v4 theme: the warm peach colours (indigo = peach, violet = coral,
+│                                 # slate = warm neutral are redefined here; change the theme here, not in
+│                                 # components), animations (keyframes) and reduced-motion handling
 │   public/favicon.svg
 │
 ├── eval/
@@ -195,6 +219,10 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | `documents.py` | Upload (multi-file; 413 above `MAX_FILES_PER_REQUEST`, 422 for a bad or implausible field), list, detail, delete, serve original file |
 | `chat.py` | `POST /chat` — streams Server-Sent Events |
 | `conversations.py` | List, read (citations the reader can no longer see come back `unavailable`), rename, delete conversations; thumbs up/down on an assistant message (`POST /messages/{id}/feedback`) |
+| `suggestions.py` | `GET /suggestions?document_ids=`: questions the chosen documents answer (written once in the background, `pending` meanwhile) and questions often asked by several users |
+| `metrics.py` | `GET /metrics/summary`, `GET /metrics/events`: the evaluation dashboard, **admins only** (`AdminUser`) |
+| `users.py` | `GET /users`, `PATCH /users/{id}` (`{role}`), `DELETE /users/{id}`: account administration, **admins only**; 409 for the last administrator and for deleting yourself |
+| `analysis.py` | `GET /documents/{id}/insights` (saved results) and the SSE endpoints `POST /analysis/summary`, `/analysis/extract`, `/analysis/compare`. Everything that can fail before the stream starts (unknown or unreadable document 404, not indexed 409, bad fields or document count 422) is an HTTP error; everything after is an `error` event |
 | `health.py` | `/health` (liveness, touches nothing) and `/ready` (Postgres, Chroma, and a cached embedding probe). Delegates to `health_service` |
 
 ### 3.3 `services/` — workflows
@@ -206,8 +234,10 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | `auth_service.py` | bcrypt hashing (work factor `BCRYPT_ROUNDS`), HS256 JWT issue/verify (algorithm pinned, claims `sub`/`iat`/`exp` only), `register_user`, `authenticate`. Signup takes a Postgres advisory lock so concurrent first signups cannot create two admins; unknown-email logins still run a bcrypt check so timing does not reveal which emails exist, and both release the database connection before hashing. Typed errors (`EmailAlreadyRegistered`, `SignupDisabled`, `InvalidCredentials`, `InvalidToken`) are translated to HTTP in `api/` and `deps.py` |
 | `document_service.py` | Validate uploads (extension, declared type, magic bytes, size, creation-date plausibility; per-file accept/reject), store under `<uuid><ext>`, create `queued` rows, enqueue ingestion; a failure after some files were stored removes them. Role-aware listing (a document above your level is a 404, never a 403). Delete: park as `failed` first (immediately unsearchable), then BM25 → Chroma → blank the passages copied into saved messages (`messages.citations`) → rows → file; a busy document answers 409; a failed step leaves it retryable |
 | `ingestion.py` | Background job (one worker by default): parse → size check (`MAX_DOCUMENT_CHARS`) → chunk → resolve metadata → **chunk rows to Postgres first** → embed → upsert to Chroma → BM25 (heading + content) → `indexed`. Any failure removes partial data from all three stores and sets a user-safe message. Per-document lock shared with delete. Logs ids, counts, timings and, for unexpected errors, where it failed (never the exception message: it can quote document text) |
-| `chat_service.py` | Full chat turn: rewrite → filter → retrieve → guard → generate → verify citations → persist → stream events |
-| `conversation_service.py` | Conversations scoped to their owner; `readable_citations` marks citations whose document is gone or above the reader's level `unavailable` (no passage, no name); ratings are one atomic upsert |
+| `chat_service.py` | Full chat turn: rewrite → filter → retrieve → guard → generate → verify citations → (conflict check when the answer cites 2+ documents) → persist → stream events |
+| `conversation_service.py` | Conversations scoped to their owner; `readable_citations` marks citations whose document is gone or above the reader's level `unavailable` (no passage, no name), and `readable_conflicts` drops conflict claims whose source the reader can no longer see; ratings are one atomic upsert |
+| `metrics_service.py` | `query_events`: `new_event`/`add_usage`/`add_retrieval`/`record` (one row per chat turn or analysis run, failures included; `record` never raises), `prune` (retention, at startup), `summary` and `list_events` (dashboard, SQL aggregates), `popular_questions` (a question is suggested to others only when `POPULAR_MIN_USERS`+ users asked it and every cited document is readable by the reader) |
+| `analysis_service.py` | Summaries, extraction, comparison, the background executive summary and each document's suggested questions (`document_suggestions`, written once on the insights thread). Every stream is wrapped by `_measured` (one event). Access: only documents the user may read **and** that are `indexed`. Saved results live in `document_insights` (written `pending` before the model call; `ready`/`failed` after; a recent `pending` row is waited for, not paid for twice; `recover_interrupted` fails the rest at startup). No database session is held across a model call. The automatic executive summary runs on its own single-thread executor, registered through `ingestion.on_indexed` in `index_service.run_startup` (a hook, so `ingestion` never imports this module) and never fails or delays indexing. Compare narrows the search filter to one document per column and makes no model call for a column the guard stops |
 
 ### 3.4 `core/` — RAG building blocks (no web framework imports)
 
@@ -227,6 +257,7 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | `query_rewrite.py` | Turns a follow-up into a standalone question using prior turns | Skipped on the first turn; thinking disabled, small token limit. The conversation is untrusted data (earlier answers quote documents); a rewrite far longer than the follow-up falls back to the original question |
 | `prompts.py` | System prompt and context-block formatting | Treats context as untrusted data; numbered sources `[1]`, `[2]` |
 | `generation.py` | Calls the LLM (streaming), assembles the answer, maps citations to chunks, verifies them, retries once | Handles `MAX_TOKENS`, safety blocks, empty candidates; an answer with nothing left to show (only removed markers) is an `empty` error, never a saved blank message |
+| `analysis.py` | Summaries (executive, chapters, FAQ, glossary, key changes), field extraction, conflict detection, suggested questions (`suggest_questions`, `suggest_followups`) | Pure (no FastAPI, no database). Sources are numbered `<source id="n">` and framed as untrusted data; long documents are batched with **global numbering** so citations survive map-reduce. Every item is validated (Pydantic, one retry on bad JSON) and **dropped unless its `[n]` citation maps to a real source**; an extracted quote that is not in its source is blanked; a conflict needs claims from two different documents. Prompts live in `prompts.py`, limits in `config.py` |
 | `guard.py` | Relevance gate (cosine or reranker score, plus lexical override) and citation verification helpers | Never thresholds on the RRF score. The lexical override applies only down to `RELEVANCE_THRESHOLD - LEXICAL_OVERRIDE_MARGIN` and only to a passage the model is given. `CitationFilter` treats `[n]`, `[n, m]` and a dash range between two real sources as citations; other brackets and anything inside code are left alone; a removed marker takes its preceding space and nothing else changes |
 
 ### 3.5 `db/`
@@ -234,7 +265,7 @@ Handlers validate input, call one service function, and return a schema. **No bu
 | File | Purpose |
 | --- | --- |
 | `database.py` | SQLAlchemy engine and session factory |
-| `models.py` | `users`, `documents`, `chunks`, `conversations`, `messages`, `feedback` (columns defined in `TDD.md` §4.3). Enum-like columns are `VARCHAR` + named `CHECK` (not PG enums); cascades are `ON DELETE` in the database; constraint names come from `NAMING_CONVENTION` in `database.py`. Every change needs a new migration, and `tests/test_migrations.py` fails if models and migrations disagree |
+| `models.py` | `users`, `documents`, `chunks`, `conversations`, `messages` (incl. `conflicts`), `feedback`, `document_insights` (columns defined in `TDD.md` §4.3). Enum-like columns are `VARCHAR` + named `CHECK` (not PG enums); cascades are `ON DELETE` in the database; constraint names come from `NAMING_CONVENTION` in `database.py`. Every change needs a new migration, and `tests/test_migrations.py` fails if models and migrations disagree |
 
 ---
 
@@ -258,11 +289,14 @@ Handlers validate input, call one service function, and return a schema. **No bu
 5. `fusion.rrf` merges; optional `rerank`; keep top K (default 5).
 6. `guard`: if best cosine (or reranker) score is below `RELEVANCE_THRESHOLD` and the lexical override does not apply → emit `REFUSAL_MESSAGE`, **do not call the LLM**.
 7. Otherwise `prompts` + `generation` stream tokens; citations are mapped to chunks and verified; one retry on invalid citations, then invalid markers are stripped and the message is flagged.
-8. Persist the message (answer, citations, guard score, timings); emit `citations` and `done`.
+8. If `CONFLICT_DETECTION` is on and the cited chunks come from **two or more different documents**, `analysis.detect_conflicts` checks whether they contradict each other (one extra model call; never for a single-document answer or a refusal; a failure is logged and ignored, never costs the answer).
+   In parallel with it (`asyncio.gather`), if `FOLLOWUP_SUGGESTIONS` is on and the turn was answered, `analysis.suggest_followups` proposes follow-up, sub- and related questions, each naming a retrieved passage (one extra call; a failure is ignored).
+9. Persist the message (answer, citations, conflicts, suggestions, guard score, timings); emit `citations`, `conflicts` and `suggestions` (only if any) and `done`.
+10. Record one `query_events` row (`metrics_service.record`); a failed turn is recorded by `run_chat` with its error code.
 
 ### 4.3 Delete flow
 
-`DELETE /api/documents/{id}` → permission check (admin or owner) → park the document as `failed` (immediately unsearchable) → remove it from BM25 → delete Chroma vectors by `document_id` → blank its passages in saved `messages.citations` → delete Postgres rows (chunks cascade) → delete the file. If a step fails, the document stays parked and the delete can be repeated; it must never be left half-searchable. (`documents.py`: 404 for a document above the caller's level, 403 only after it is visible, 409 while it is being indexed.)
+`DELETE /api/documents/{id}` → permission check (admin or owner) → park the document as `failed` (immediately unsearchable) → remove it from BM25 → delete Chroma vectors by `document_id` → blank its passages in saved `messages.citations` → delete the saved analyses that quote it (`document_insights` citing it or comparing against it) → delete Postgres rows (chunks and its own insights cascade) → delete the file. If a step fails, the document stays parked and the delete can be repeated; it must never be left half-searchable. (`documents.py`: 404 for a document above the caller's level, 403 only after it is visible, 409 while it is being indexed.)
 
 ---
 
@@ -280,7 +314,14 @@ All routes live under `/api`. "Auth" means a valid JWT bearer token.
 | `GET /documents/{id}` | user | `api/documents.py` | Document detail and status |
 | `GET /documents/{id}/file` | user | `api/documents.py` | Original file (access-checked) |
 | `DELETE /documents/{id}` | admin or owner | `api/documents.py` | Delete everywhere |
-| `POST /chat` | user | `api/chat.py` | SSE stream: `status`, `token`, `citations`, `done`, `error` |
+| `POST /chat` | user | `api/chat.py` | SSE stream: `status`, `token`, `citations`, `conflicts`, `suggestions`, `done`, `error` |
+| `GET /suggestions` | user | `api/suggestions.py` | Questions from the chosen documents and often asked ones |
+| `GET /metrics/summary`, `GET /metrics/events` | admin | `api/metrics.py` | Evaluation dashboard |
+| `GET /users`, `PATCH /users/{id}`, `DELETE /users/{id}` | admin | `api/users.py` | List accounts, set a role, delete an account |
+| `GET /documents/{id}/insights` | user | `api/analysis.py` | Saved summaries and extractions of a readable document |
+| `POST /analysis/summary` | user | `api/analysis.py` | SSE: executive, chapters, FAQ, glossary or key-changes summary (saved; `refresh` regenerates) |
+| `POST /analysis/extract` | user | `api/analysis.py` | SSE: fields (presets or custom) extracted into cited values |
+| `POST /analysis/compare` | user | `api/analysis.py` | SSE: one cited answer per document (2 to `COMPARE_MAX_DOCUMENTS`), then conflicts |
 | `GET /conversations` | user | `api/conversations.py` | Own conversations |
 | `GET /conversations/{id}` | user (owner) | `api/conversations.py` | Messages |
 | `PATCH /conversations/{id}` | user (owner) | `api/conversations.py` | Rename |
@@ -299,9 +340,12 @@ All routes live under `/api`. "Auth" means a valid JWT bearer token.
 | `/` | redirect to `/chat` | protected |
 | `/chat`, `/chat/:conversationId` | `ChatPage` | protected |
 | `/library` | `LibraryPage` | protected |
+| `/analyze` (`?tab=compare\|extract\|summaries&doc=<id>`) | `AnalyzePage` | protected |
+| `/dashboard` | `DashboardPage` (evaluation) | admins (others are redirected to `/chat`) |
+| `/users` | `UsersPage` | admins (others are redirected to `/chat`) |
 | `*` | `NotFoundPage` | public |
 
-nginx serves the SPA (with fallback to `index.html`, which is never cached; hashed `/assets/` are cached for a year and a missing one is a 404), proxies `/api` to `backend:8000`, disables buffering for `POST /api/chat`, limits request bodies per route and request rates for sign-in, chat and uploads, and checks the sign-in (`auth_request`) before it accepts an upload body.
+nginx serves the SPA (with fallback to `index.html`, which is never cached; hashed `/assets/` are cached for a year and a missing one is a 404), proxies `/api` to `backend:8000`, disables buffering for `POST /api/chat` and `/api/analysis/*` (5 minute timeout), limits request bodies per route and request rates for sign-in, chat, analysis and uploads, and checks the sign-in (`auth_request`) before it accepts an upload body.
 
 ---
 
@@ -311,14 +355,17 @@ What exists (the implementation is consolidated; there are no separate `sse.ts`,
 
 | Area | Files | Purpose |
 | --- | --- | --- |
-| `api/` | `client.ts` | `fetch` wrapper (base URL, JWT header, 401 → logout, errors turned into readable sentences by `describeDetail`), `streamChat`, the `/chat` event-stream reader (it resolves only after a `done` or `error` event and reports a stream that ends without one), and `uploadDocuments`, which uses `XMLHttpRequest` because `fetch` cannot report upload progress |
+| `api/` | `client.ts` | `fetch` wrapper (base URL, JWT header, 401 → logout, errors turned into readable sentences by `describeDetail`), `streamSse`, the one event-stream reader (it resolves only after a `done` or `error` event and reports a stream that ends without one), `streamChat` on top of it for `/chat`, and `uploadDocuments`, which uses `XMLHttpRequest` because `fetch` cannot report upload progress |
 | `pages/LibraryPage` upload flow | `useUploads` | Per-file progress while bytes are sent (one request; the bytes are spread over the files by size), then each accepted document is polled (`GET /documents/{id}`) through queued → indexing → ready or failed; refused files show the server's reason; the upload can be cancelled; toasts announce results |
 | `hooks/` | `useAuth.tsx` | Auth context: login, signup, logout. Logging out clears the TanStack cache; only a 401 drops the session (a network error shows "cannot reach the server" instead) |
+| | `useAnalysisRun.ts`, `useIndexedDocuments.ts` | One streamed summary or extraction at a time (progress text, result, error; a run that is no longer current never touches the state); the searchable documents, shared with chat |
 | `pages/` | `LoginPage` | Sign in and sign up (by `mode`) |
 | | `LibraryPage` | Upload dropzone (keyboard-operable), document table (polls while any document is `queued`/`processing`), status badges, delete confirmation dialog |
-| | `ChatPage` | Conversation sidebar, message list, filter bar, input, source drawer, the thumbs up/down and refusal notice. A per-question id makes a stream that is no longer current inert (switching conversations, Stop), and the input stays busy until the stored conversation is reloaded |
+| | `ChatPage` | Conversation sidebar, message list, filter bar, input, source drawer, the thumbs up/down and refusal notice, the "Sources disagree" panel (live and from saved `message.conflicts`). A per-question id makes a stream that is no longer current inert (switching conversations, Stop), and the input stays busy until the stored conversation is reloaded |
+| | `AnalyzePage` | Tabs Compare / Extract / Summaries (tab and document in the address); all three stay mounted so work in progress survives a tab change; one `SourceDrawer` for every citation |
 | `components/` | `ErrorBoundary` | A render error shows a way out instead of a blank page |
-| `components/chat/` | `Answer`, `FilterBar` | Text with clickable citation chips (also inside bold text; unavailable sources are shown as such), lists; pre-retrieval filters |
+| `components/chat/` | `Answer`, `CitationChip`, `ConflictPanel`, `FilterBar` | Text with clickable citation chips (also inside bold text; unavailable sources are shown as such), lists; one chip; each document's conflicting claim with its citation; pre-retrieval filters |
+| `components/analyze/` | `CompareTab`, `ExtractTab`, `SummariesTab`, `DocumentPicker` | Side-by-side columns that stream per document ("Not covered in this document" when the guard stops one; columns left unfinished by an error say so); field presets, custom fields, table / JSON view, JSON and CSV export (`lib/analysis.ts`: CSV cells that look like formulas are neutralised); five summary cards with saved status, Regenerate, Copy as Markdown |
 | `components/source/` | `SourceDrawer` | Opens on citation click: highlighted chunk, document name, page, section, embedded original (`#page=N` for PDFs; other types show chunk + download link); Escape closes it |
 
 ---
@@ -375,6 +422,22 @@ What exists (the implementation is consolidated; there are no separate `sse.ts`,
 29. No embedding model is baked into the image; only the optional FlashRank model may be.
 30. Containers run as non-root: backend uid 10001, chroma uid 10001 (via `chroma/Dockerfile`, which pre-creates `/data` so the named volume inherits ownership), nginx via `nginx-unprivileged` (host port 8081, container port 8080), postgres via `user: postgres`.
 
+### 7.7 Analysis (summaries, extraction, comparison, conflicts)
+
+31. **Analysis output is grounded like an answer.** Every summary item, extracted value, comparison answer and conflict claim must carry a citation that maps to a real source; the model's `[n]` markers are validated (`guard.filter_citations`, source-number checks) and an item without a valid citation is **dropped, never shown**. Do not add an analysis output that skips this, and keep the sources framed as untrusted data (rule 10).
+32. **Only readable, indexed documents are analysed.** Every analysis entry point goes through `analysis_service` (`document_service.get_document` plus `indexed`): a document above the caller's level is a 404, and Compare narrows the search filter to one document per column so a column can only cite its own text. A change that could bypass it needs a test in `test_analysis_api.py`.
+33. **Saved results are derived data that must follow deletion** (rule 24): `document_insights` rows cascade with their document, and results that quote or compare against it are deleted by `document_service`. Citations in saved results and conflicts are re-checked at read time.
+34. **Extras never cost the answer, and nothing holds a connection through a model call.** The conflict check, the follow-up suggestions and the automatic executive summary may fail without failing the answer or the upload (log the exception class only); analysis code opens a short session per step (rule 25a). A new analysis kind needs a prompt in `prompts.py`, a validated output model in `core/analysis.py`, an `InsightKind`, and tests for its grounding rules.
+
+### 7.8 Measurement and suggestions
+
+35. **Every chat turn and analysis run records exactly one `query_events` row, failures included** (`metrics_service.record`, after the answer is stored, in its own short session). Recording never fails the request, never stores document text, and the dashboard and its question text are for admins only. A new request type must be measured the same way (`analysis_service._measured` for streams).
+36. **A suggested question must name a real passage that answers it** (document questions and follow-ups alike; anything else is dropped), and a question someone asked is suggested to another user only when `POPULAR_MIN_USERS` (≥ 2) different users asked it and every document its answer cited is readable by that user. Suggestions from a deleted or unreadable document are never shown.
+
+### 7.9 Accounts
+
+37. **There is always at least one administrator, and one sign-in page serves everyone** (no separate admin portal: the role, re-read from Postgres on every request, decides). Anything that creates, promotes, demotes or removes accounts runs under `auth_service.lock_accounts` (the signup advisory lock), so concurrent requests cannot leave zero administrators; `tests/test_users_api.py` widens the race on purpose and fails without the lock. An administrator cannot delete their own account. Admin-only routes use `AdminUser`; admin-only screens must also redirect non-admins.
+
 ---
 
 ## 8. Coding Standards
@@ -429,6 +492,8 @@ What exists (the implementation is consolidated; there are no separate `sse.ts`,
 | Add a file type | `core/parsers.py`, upload validation in `document_service.py`, frontend dropzone accept list |
 | Add an API route | `api/<name>.py`, `schemas.py`, `main.py` router, frontend `api/` wrapper, routing table above |
 | Add a table or column | `db/models.py` + a new Alembic migration (never edit old migrations) |
+| Add or change a summary kind, extraction preset or conflict prompt | `core/prompts.py`, `core/analysis.py` (output model, `PRESETS`), `constants.InsightKind` (+ a migration if the `CHECK` changes), `schemas.py`, the frontend `SummariesTab` / `ExtractTab` and `lib/analysis.ts` |
+| Analysis limits (tokens, batch size, fields, documents), automatic summary, conflict check | `.env` / `config.py` (`ANALYSIS_*`, `AUTO_EXECUTIVE_SUMMARY`, `CONFLICT_DETECTION`, `COMPARE_MAX_DOCUMENTS`, `EXTRACTION_MAX_FIELDS`) |
 
 ---
 
@@ -479,6 +544,8 @@ docker compose exec backend alembic upgrade head
 * `gemini-2.5-flash` is closed to new API keys (404 "no longer available to new users"), so the default is `gemini-3.8-flash`; keep the model ID in configuration and re-run the eval before migrating.
 * Free-tier Gemini keys have per-minute and per-day limits (embeddings and chat). Chat retries a rate limit briefly, then shows a friendly error.
 * Reranking (`core/rerank.py`) is not implemented; `RERANK_ENABLED` must stay `false`.
+* Follow-up suggestions add one model call per answered question (`FOLLOWUP_SUGGESTIONS=false` turns them off), and a document's suggested questions cost one call the first time it is selected. The dashboard's groundedness figures come from citation checks, not from an LLM judge, and it shows live traffic only; `eval/run_eval.py` remains the labelled, offline measurement. `tests/conftest.py` switches follow-ups off for the existing chat tests (they script every model reply); `tests/test_suggestions.py` switches them on.
+* The analysis features cost model calls (TDD §16.6): one per upload (executive summary), one per summary or extraction (more for very long documents), one per covered document plus a conflict check for a comparison, and one extra for a chat answer that cites two or more documents. On a free-tier key, and when Gemini answers 503 for a while, an analysis can fail with the friendly "temporarily unavailable" error; it is saved as `failed` and can be retried. A comparison that fails part-way keeps the columns it already finished. Conflict detection is a model judgment over the cited passages only: it can miss a contradiction in text that was not retrieved.
 * The first account to sign up is the administrator and signup is open until `SIGNUP_ENABLED=false`; there is no TLS, no account lockout and no per-user quotas. nginx rate limits are per client address, which behind Docker Desktop can be one address for everybody.
 * The sign-in token is kept in `localStorage`; the Content-Security-Policy in `frontend/nginx-snippets/security-headers.conf` is the mitigation. It allows `blob:` for the PDF drawer and has not been exercised in every browser's PDF viewer.
 * Headings are searchable by keyword but are not part of the embedded text, so a purely semantic question about a heading's wording can miss (changing that means re-embedding and recalibrating the threshold).

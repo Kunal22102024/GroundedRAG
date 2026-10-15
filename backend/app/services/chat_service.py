@@ -24,12 +24,16 @@ from app.constants import (
     CONVERSATION_TITLE_MAX_CHARS,
     REFUSAL_MESSAGE,
     REWRITE_HISTORY_MESSAGES,
+    EventKind,
+    EventOutcome,
     MessageRole,
+    QuestionSource,
 )
-from app.core import embeddings, generation, guard, llm, query_rewrite, retrieval
+from app.core import analysis, embeddings, generation, guard, llm, query_rewrite, retrieval
 from app.core.filters import FilterRequest, SearchFilter, build_filter
 from app.db.database import get_sessionmaker
 from app.db.models import Conversation, Message
+from app.services import metrics_service
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +62,7 @@ class ChatPlan:
     new_conversation: bool
     history: list[tuple[str, str]]
     search_filter: SearchFilter
+    source: str = QuestionSource.TYPED.value  # typed, or picked from a suggestion (dashboard)
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,7 @@ def prepare_chat(
     question: str,
     conversation_id: uuid.UUID | None,
     filters: FilterRequest | None,
+    source: str = QuestionSource.TYPED.value,
 ) -> ChatPlan:
     """Resolve the conversation (owner only), its recent history and the search filter."""
     history: list[tuple[str, str]] = []
@@ -101,6 +107,7 @@ def prepare_chat(
         new_conversation=new_conversation,
         history=history,
         search_filter=build_filter(user, filters),
+        source=source,
     )
 
 
@@ -115,6 +122,8 @@ def _persist(
     guard_score: float | None,
     timings: dict[str, Any],
     flagged: bool,
+    conflicts: list[dict[str, Any]] | None = None,
+    suggestions: list[dict[str, Any]] | None = None,
 ) -> uuid.UUID:
     """Store the question and the answer together; returns the assistant message id."""
     with get_sessionmaker()() as db:
@@ -145,6 +154,8 @@ def _persist(
             role=MessageRole.ASSISTANT.value,
             content=answer,
             citations=citations,
+            conflicts=conflicts or None,
+            suggestions=suggestions or None,
             guard_score=guard_score,
             timings=timings,
             flagged=flagged,
@@ -155,27 +166,16 @@ def _persist(
         return assistant.id
 
 
-def _citation(number: int, candidate: retrieval.Candidate) -> dict[str, Any]:
-    return {
-        "n": number,
-        "chunk_id": candidate.chunk_id,
-        "document_id": candidate.document_id,
-        "document_name": candidate.document_name,
-        "page_number": candidate.page_number,
-        "page_end": candidate.page_end,
-        "section_title": candidate.section_title,
-        "text": candidate.text,
-    }
-
-
 def _ms(since: float) -> float:
     return round((time.perf_counter() - since) * 1000, 1)
 
 
-async def _turn(plan: ChatPlan) -> AsyncIterator[SseEvent]:
+async def _turn(plan: ChatPlan, event: dict[str, Any]) -> AsyncIterator[SseEvent]:
+    """The turn itself. ``event`` (the dashboard measurement) is filled in as stages complete,
+    so a turn that fails half-way still reports what it got to (``run_chat`` records it)."""
     settings = get_settings()
     started = time.perf_counter()
-    timings: dict[str, Any] = {}
+    timings: dict[str, Any] = event["timings"]
 
     yield SseEvent("status", {"stage": "searching"})
     question = plan.question
@@ -185,8 +185,10 @@ async def _turn(plan: ChatPlan) -> AsyncIterator[SseEvent]:
         question = await query_rewrite.rewrite_question(plan.question, plan.history)
         timings["rewrite_ms"] = _ms(step)
 
+    event["rewritten"] = question != plan.question
     result = await asyncio.to_thread(retrieval.retrieve, question, plan.search_filter)
     timings.update(result.timings)
+    metrics_service.add_retrieval(event, [c.similarity for c in result.candidates])
 
     decision = guard.evaluate(
         question,
@@ -195,6 +197,7 @@ async def _turn(plan: ChatPlan) -> AsyncIterator[SseEvent]:
         settings.relevance_threshold,
         settings.lexical_override_margin,
     )
+    event["guard_reason"] = decision.reason
     guard_info = {
         "passed": decision.passed,
         "reason": decision.reason,
@@ -209,7 +212,10 @@ async def _turn(plan: ChatPlan) -> AsyncIterator[SseEvent]:
         "rewritten": question != plan.question,
     }
     usage: dict[str, int] = {}
+    extra_usage: dict[str, int] = {}  # the conflict check and the follow-up suggestions
     citations: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    suggestions: list[dict[str, Any]] = []
 
     if not decision.passed:
         # Below the threshold: the LLM is never called (CLAUDE.md rule 8).
@@ -232,7 +238,7 @@ async def _turn(plan: ChatPlan) -> AsyncIterator[SseEvent]:
         if final is None:  # generate_answer always ends with a result; never fall through silently
             raise llm.LlmError("empty", generation.EMPTY_MESSAGE)
         answer, refused, usage = final.text, final.refused, final.usage
-        citations = [_citation(n, result.candidates[n - 1]) for n in final.cited]
+        citations = [retrieval.citation_dict(n, result.candidates[n - 1]) for n in final.cited]
         flags.update(
             partial=final.truncated,
             citations_removed=final.invalid_removed,
@@ -241,13 +247,85 @@ async def _turn(plan: ChatPlan) -> AsyncIterator[SseEvent]:
         )
         timings["ttft_ms"] = final.ttft_ms
         timings["generate_ms"] = final.generate_ms
+        metrics_service.add_usage(event, usage)
+        event.update(
+            cited=len(citations),
+            cited_documents=len({c["document_id"] for c in citations}),
+            cited_document_ids=sorted({c["document_id"] for c in citations}),
+            citations_removed=final.invalid_removed,
+            uncited=final.uncited,
+            retried=final.retried,
+            partial=final.truncated,
+        )
 
+        # Two extras after a complete answer, run side by side so the wait is the longer of the
+        # two: a conflict check when the answer draws on two or more documents (single-document
+        # answers never pay for it), and follow-up questions. Either may fail without effect.
+        passages = [analysis.Passage(n, result.candidates[n - 1]) for n in final.cited]
+        check_conflicts = (
+            settings.conflict_detection
+            and not refused
+            and len({p.candidate.document_id for p in passages}) >= 2
+        )
+        offer_followups = settings.followup_suggestions and not refused
+
+        async def conflict_check() -> None:
+            step = time.perf_counter()
+            try:
+                found, used = await analysis.detect_conflicts(question, passages)
+                conflicts.extend(found)
+                metrics_service.add_usage(extra_usage, used)
+            except Exception as exc:  # the answer is complete; the check is an extra
+                logger.warning("conflict check failed", extra={"error": type(exc).__name__})
+            timings["conflict_ms"] = _ms(step)
+
+        async def followups() -> None:
+            step = time.perf_counter()
+            try:
+                found, used = await analysis.suggest_followups(question, answer, result.candidates)
+                suggestions.extend(found)
+                metrics_service.add_usage(extra_usage, used)
+            except Exception as exc:  # an extra, like the conflict check
+                logger.warning("follow-up suggestions failed", extra={"error": type(exc).__name__})
+            timings["followup_ms"] = _ms(step)
+
+        extras = [
+            job()
+            for job, wanted in ((conflict_check, check_conflicts), (followups, offer_followups))
+            if wanted
+        ]
+        if extras:
+            yield SseEvent(
+                "status", {"stage": "checking_sources" if check_conflicts else "suggesting"}
+            )
+            await asyncio.gather(*extras)
+
+    if refused:
+        event["outcome"] = EventOutcome.REFUSED.value
+    metrics_service.add_usage(event, extra_usage)
     flagged = bool(flags["partial"] or flags["citations_removed"] or flags["uncited"])
     timings["total_ms"] = _ms(started)
     stored_timings = {**timings, "usage": usage}
+    if extra_usage:
+        stored_timings["extra_usage"] = extra_usage
     message_id = await asyncio.to_thread(
-        _persist, plan, answer, citations, decision.score, stored_timings, flagged
+        _persist,
+        plan,
+        answer,
+        citations,
+        decision.score,
+        stored_timings,
+        flagged,
+        conflicts,
+        suggestions,
     )
+    event.update(
+        message_id=message_id,
+        conflicts=len(conflicts),
+        suggestions=len(suggestions),
+        total_ms=timings["total_ms"],
+    )
+    await asyncio.to_thread(metrics_service.record, event)
     logger.info(
         "chat turn complete",
         extra={
@@ -259,9 +337,14 @@ async def _turn(plan: ChatPlan) -> AsyncIterator[SseEvent]:
             "total_ms": timings["total_ms"],
             "input_tokens": usage.get("input_tokens"),
             "output_tokens": usage.get("output_tokens"),
+            "conflicts": len(conflicts),
         },
     )
     yield SseEvent("citations", {"citations": citations})
+    if conflicts:
+        yield SseEvent("conflicts", {"conflicts": conflicts})
+    if suggestions:
+        yield SseEvent("suggestions", {"suggestions": public_suggestions(suggestions)})
     yield SseEvent(
         "done",
         {
@@ -282,6 +365,8 @@ def error_event(exc: BaseException) -> SseEvent:
     code, message, retry_after = "internal", INTERNAL_ERROR_MESSAGE, None
     if isinstance(exc, llm.LlmError):
         code, message, retry_after = exc.code, exc.message, exc.retry_after
+    elif isinstance(exc, analysis.AnalysisError):
+        code, message = exc.code, exc.message
     elif isinstance(exc, ConversationNotFound):
         code, message = "conversation_deleted", CONVERSATION_DELETED_MESSAGE
     elif isinstance(exc, retrieval.IndexUnavailableError):
@@ -307,10 +392,37 @@ def error_event(exc: BaseException) -> SseEvent:
     return SseEvent("error", {"code": code, "message": message, "retry_after": retry_after})
 
 
+def public_suggestions(suggestions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """What the screen gets of a follow-up suggestion: its type, the question and its document."""
+    return [
+        {"type": s["type"], "question": s["question"], "document_id": s.get("document_id")}
+        for s in suggestions
+    ]
+
+
 async def run_chat(plan: ChatPlan) -> AsyncIterator[SseEvent]:
-    """Run one turn; any failure ends the stream with an ``error`` event instead of an exception."""
+    """Run one turn; any failure ends the stream with an ``error`` event instead of an exception.
+
+    Every turn is measured once (``query_events``): answered and refused turns by ``_turn``, a
+    failed one here, with the stages it completed. A client that went away is not a failure.
+    """
+    event = metrics_service.new_event(
+        EventKind.CHAT,
+        plan.user_id,
+        question=plan.question,
+        source=plan.source,
+        conversation_id=plan.conversation_id,
+    )
+    started = time.perf_counter()
     try:
-        async for event in _turn(plan):
-            yield event
+        async for item in _turn(plan, event):
+            yield item
     except Exception as exc:  # CancelledError (client went away) is not an Exception: it propagates
-        yield error_event(exc)
+        failure = error_event(exc)
+        event.update(
+            outcome=EventOutcome.FAILED.value,
+            error_code=failure.data["code"],
+            total_ms=_ms(started),
+        )
+        await asyncio.to_thread(metrics_service.record, event)
+        yield failure

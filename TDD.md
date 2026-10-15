@@ -237,8 +237,10 @@ queued ──► processing ──► indexed
 | `documents` | id, owner_id, name, stored_path, mime_type, size_bytes, status, error_message, chunk_count, department, document_type, creation_date, access_level, created_at |
 | `chunks` | id (chunk_id), document_id (FK, cascade delete), ordinal, content, page_number, page_end, section_title, department, document_type, creation_date_int, access_level |
 | `conversations` | id, user_id, title, created_at, updated_at |
-| `messages` | id, conversation_id, role, content, citations (JSON), guard_score, timings (JSON), flagged, created_at |
+| `messages` | id, conversation_id, role, content, citations (JSON), conflicts (JSON, nullable), suggestions (JSON, nullable, §18), guard_score, timings (JSON), flagged, created_at |
 | `feedback` | id, message_id, user_id, rating (up/down), comment, created_at |
+| `query_events` | id, created_at, user_id (FK, `SET NULL`), kind (`chat`, `summary`, `extract`, `compare`, `suggest`), outcome (`answered`, `refused`, `failed`), source (`typed`, `suggestion`, `followup`), error_code, guard_reason, best/mean_similarity, retrieved, cited, cited_documents, cited_document_ids, citations_removed, uncited, retried, partial, rewritten, conflicts, suggestions, input/output/total_tokens, model, total_ms, timings (JSON), question, document_ids, conversation_id, message_id (no FK) (§17) |
+| `document_insights` | id, document_id (FK, cascade delete), kind (`executive`, `chapters`, `faq`, `glossary`, `key_changes`, `extraction`, `questions`), params_key, status (`pending`, `ready`, `failed`), content (JSON), error_message, model, created_at, updated_at; unique `(document_id, kind, params_key)` (§16) |
 
 Schema conventions (implemented in `db/models.py`, migration `0001_initial_schema`):
 
@@ -407,14 +409,23 @@ All routes are under `/api` and require a JWT bearer token except signup, login,
 | `DELETE /documents/{id}` | Delete file, DB rows, and all vectors. Admin or uploader (403 otherwise); 409 while the document is being indexed; 503 if a step failed, leaving the document parked as `failed` and unsearchable so the delete can simply be repeated |
 | `POST /chat` | Server-Sent Events stream (below) |
 | `GET /conversations`, `GET /conversations/{id}`, `PATCH /conversations/{id}`, `DELETE /conversations/{id}` | Conversation history management |
+| `GET /documents/{id}/insights` | The saved summaries and extractions of a document (status, content, error), citations resolved against what the reader may still see. 404 for a document above the caller's level (§16) |
+| `POST /analysis/summary`, `POST /analysis/extract`, `POST /analysis/compare` | Server-Sent Events: document summaries, structured extraction, multi-document comparison (§16) |
+| `GET /suggestions?document_ids=` | Questions to offer before the first question: from the chosen documents (written once, `pending` while being written) and questions often asked (§18) |
+| `GET /users`, `PATCH /users/{id}`, `DELETE /users/{id}` | Account administration, **admins only** (§8): list with document and conversation counts, set the role, remove an account. 409 for the last administrator and for deleting yourself; 404 for an unknown id |
+| `GET /metrics/summary?days=&kind=`, `GET /metrics/events?outcome=&kind=&limit=&before=` | Evaluation dashboard, **admins only** (403 otherwise): aggregated figures, and failed / refused / flagged queries with their question (§17) |
 | `POST /messages/{id}/feedback` | Thumbs up/down |
 | `GET /health`, `GET /ready` | Liveness (touches no dependency; used by the container healthcheck); readiness (Postgres, Chroma and, once `core/embeddings.py` exists, the embedding model via a cached probe so polling does not spend API quota). `/ready` returns 503 when any check fails and exposes only exception class names |
 
 **`POST /chat`** takes `{question (1..2000 chars), conversation_id?, filters?: {department?, document_type?, date_from?, date_to?, document_ids?}}` and streams Server-Sent Events (`Cache-Control: no-cache`, `X-Accel-Buffering: no`). A conversation that is not the caller's is a 404 before the stream starts; everything that goes wrong afterwards is an `error` event, never a dropped connection.
 
-* `status`: `{stage}` is `searching`, `rewriting`, `generating`, `rate_limited` (with `retry_in` seconds) or `retrying` (with `reset: true`: discard the text received so far).
+* `status`: `{stage}` is `searching`, `rewriting`, `generating`, `rate_limited` (with `retry_in` seconds), `retrying` (with `reset: true`: discard the text received so far) or `checking_sources` (the conflict check of §16, after the answer is complete).
 * `token`: `{text}`: answer text that is safe to show; invalid citation markers were already removed.
 * `citations`: `{citations: [{n, chunk_id, document_id, document_name, page_number, page_end, section_title, text}]}`: only the sources the answer cites, `n` matching the `[n]` markers; empty for a refusal.
+* `conflicts`: `{conflicts: [{topic, claims: [{n, document_id, document_name, claim}]}]}`, sent after `citations` and only when the answer cites two or more different documents that contradict each other (§16); `n` is a citation number of this answer.
+* `suggestions`: `{suggestions: [{type, question, document_id}]}` with `type` `follow_up`, `sub_question` or `related`, sent before `done` for an answered (not refused) turn when `FOLLOWUP_SUGGESTIONS` is on (§18). The `status` stage `suggesting` precedes it when no conflict check runs.
+
+The request may carry `source`: `typed` (default), `suggestion` or `followup`, recorded for the dashboard.
 * `done`: `{conversation_id, message_id, answer (authoritative final text), refused, guard: {passed, reason, score, threshold}, timings, usage, flags}`. `guard.reason` is `relevant`, `lexical_override`, `below_threshold` or `no_candidates`. `timings` (ms): `rewrite_ms` (follow-ups only), `embed_ms`, `dense_ms`, `keyword_ms`, `fusion_ms`, `hydrate_ms`, `ttft_ms`, `generate_ms`, `total_ms` (the last three absent when the LLM was not called). `usage`: `input_tokens`, `output_tokens`, `total_tokens`, `reasoning_tokens`. `flags`: `partial` (cut off by `MAX_TOKENS`), `citations_removed`, `uncited`, `retried`, `rewritten`.
 * `error`: `{code, message, retry_after?}` with `code` one of `rate_limited`, `quota_exhausted`, `auth`, `not_configured`, `blocked` (safety), `empty`, `unavailable`, `index_unavailable`, `failed`, `internal`. Nothing is stored for a failed turn.
 
@@ -429,14 +440,15 @@ All routes are under `/api` and require a JWT bearer token except signup, login,
   * **Account enumeration:** wrong password and unknown email return the same response, and an unknown email still performs a bcrypt check so response time does not reveal which addresses have accounts (measured: median difference under 1 ms against about 25 ms of jitter at cost 12). Signup necessarily reveals that an address is taken (`409`), which is acceptable for an internal tool.
   * **Signup switch:** `SIGNUP_ENABLED=false` makes signup answer `403` once any account exists (checked before the email lookup, so a closed door does not reveal which addresses have accounts). While no account exists, signup always works, so a fresh deployment cannot be locked out.
   * **Connections:** `get_current_user` and `authenticate` end their database transaction before returning or hashing. The request-scoped session would otherwise keep one pooled connection until the response finished, which for a streamed answer is the whole generation (measured as one `idle in transaction` per stream), and ~40 concurrent logins would hold the whole pool through their bcrypt checks. The pool is sized explicitly (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`).
-  * **Out of scope for now:** account lockout, password reset, email verification, and a user-management API (promoting or removing users); roles beyond the first admin must be changed in the database. **Request-rate limits** exist at nginx only (below).
-* **Request limits (nginx):** per-route body ceilings (32 KB for `/api/auth/`, 64 KB for `/api/chat`, 1 MB elsewhere, 256 MB for `POST /api/documents`), request-rate zones for sign-in (30/min, burst 20), chat (60/min, burst 30) and uploads (20/min, burst 10; only POST is counted, so the library's polling is not), and `auth_request` on the upload route so the sign-in is verified **before** nginx accepts the body (otherwise an unauthenticated request could make it buffer 256 MB). 401, 413 and 429 produced by nginx are JSON (`{"detail": ...}`). The rate zones are keyed by client address; behind Docker Desktop every client can share one, so the numbers are generous. The per-file size (`MAX_UPLOAD_MB`) and the number of files (`MAX_FILES_PER_REQUEST`) are checked by the backend.
+  * **Account administration:** one sign-in page for everyone; the role decides (admin-only routes use `deps.AdminUser`, 403 otherwise). `GET /users`, `PATCH /users/{id}` (`{role}`) and `DELETE /users/{id}` (admins only; `services/user_service.py`) list, promote, demote and remove accounts. **There is always at least one administrator:** the only administrator cannot be demoted or deleted (409), an account cannot delete itself (409), and role changes and removals run under the **same advisory lock as signup** (`auth_service.lock_accounts`), so two administrators acting at the same moment cannot both pass the "another admin exists" check (a test widens the window on purpose and fails without the lock). A change applies at once, including to tokens already issued, because the role is re-read per request. Removing an account cascades in the database: its conversations, messages and feedback go; documents it uploaded stay (`owner_id` cleared); its dashboard measurements stay (`user_id` cleared).
+  * **Out of scope for now:** account lockout, password reset, email verification, and creating accounts on someone's behalf (people sign up themselves). **Request-rate limits** exist at nginx only (below).
+* **Request limits (nginx):** per-route body ceilings (32 KB for `/api/auth/`, 64 KB for `/api/chat` and `/api/analysis/`, 1 MB elsewhere, 256 MB for `POST /api/documents`), request-rate zones for sign-in (30/min, burst 20), chat (60/min, burst 30), analysis (20/min, burst 10: each request is at least one model call) and uploads (20/min, burst 10; only POST is counted, so the library's polling is not), and `auth_request` on the upload route so the sign-in is verified **before** nginx accepts the body (otherwise an unauthenticated request could make it buffer 256 MB). 401, 413 and 429 produced by nginx are JSON (`{"detail": ...}`). The rate zones are keyed by client address; behind Docker Desktop every client can share one, so the numbers are generous. The per-file size (`MAX_UPLOAD_MB`) and the number of files (`MAX_FILES_PER_REQUEST`) are checked by the backend.
 * **Response headers (nginx):** `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options: SAMEORIGIN` and a `Content-Security-Policy` that allows scripts only from this origin (the sign-in token is in `localStorage`), with `blob:` allowed for frames and objects because the source drawer shows the cited PDF from a blob URL. `index.html` is `no-cache`; `/assets/*` are immutable and a missing one is a 404 rather than `index.html`.
 * **Roles and access levels:** `admin` may read `Public`, `Internal`, and `Restricted`; `user` may read `Public` and `Internal`. Enforced as a metadata filter on every query, in both retrieval channels.
 * **Uploads:** any authenticated user may upload; only `admin` may assign `Restricted`. Deletion by `admin` or the document owner.
   * **Validation:** extension (pdf, docx, md, markdown, html, htm, txt), declared content type (image, audio and video types refused; otherwise advisory), magic bytes (`%PDF-` near the start, a DOCX that is a zip with `word/document.xml` and a bounded unpacked size, text without NUL bytes) and size (`MAX_UPLOAD_MB`, counted while copying).
   * **Storage:** the original is stored as `<uuid4 hex><validated extension>`; the uploaded name is only ever displayed (folders stripped, control characters removed, 255 characters), never used as a path. The served media type comes from our validated extension, not the client.
-  * **Delete order:** the document is first parked as `failed` (instantly excluded from retrieval), then removed from BM25 and Chroma, the passages copied into saved messages are blanked (`messages.citations[].text`), the Postgres rows are deleted (chunks cascade), then the file. A leftover file is wasted space, not a leak, since nothing points at it.
+  * **Delete order:** the document is first parked as `failed` (instantly excluded from retrieval), then removed from BM25 and Chroma, the passages copied into saved messages are blanked (`messages.citations[].text`), the saved analyses that quote it are deleted (`document_insights` whose content cites the document or that compare against it; its own rows cascade), the Postgres rows are deleted (chunks cascade), then the file. A leftover file is wasted space, not a leak, since nothing points at it.
   * **Saved citations:** a citation stores the cited chunk's text so a conversation can be reopened. Reading a conversation resolves each citation against the live `chunks` of an `indexed` document the reader may see; one that fails (document deleted, role lowered) is returned with `unavailable: true` and without passage, document name or section. The assistant's answer text is kept as the record of the exchange.
   * **Parsing time:** every text parser is linear in the input. Unbounded regular-expression quantifiers rescanned the rest of the text from each unclosed bracket, string growth per line was quadratic, and the sentence splitter re-split an ever longer candidate: a few hundred KB of hostile or merely odd text stalled the whole process (the GIL is held) for tens of seconds. Tests assert wall-time ceilings. `MAX_DOCUMENT_CHARS` bounds the extracted text, and the backend container has a memory limit; a parser subprocess was not added.
 * **File safety:** extension and content-type validation, size limit, generated storage names, no path traversal.
@@ -471,6 +483,16 @@ Both document chunks (for embedding) and retrieved context plus questions (for g
 | `LLM_TEMPERATURE` / `LLM_MAX_TOKENS` / `LLM_THINKING_BUDGET` | `0.0` / `1024` / `0` | Generation settings |
 | `LLM_TIMEOUT_SECONDS` | `60` | A model call is abandoned after this long |
 | `INTERACTIVE_MAX_RETRIES` / `INTERACTIVE_MAX_WAIT_SECONDS` | `2` / `30` | Rate-limit retries for a user waiting on an answer (LLM and query embedding) |
+| `ANALYSIS_MAX_TOKENS` | `4096` | Output budget of one analysis call (summary, extraction, conflict check), 256 to 16384 |
+| `ANALYSIS_MAX_RETRIES` | `4` | Retries of a busy or briefly unavailable model (429, 503) before a summary, extraction or comparison answer gives up; chat and the extra conflict check use `INTERACTIVE_MAX_RETRIES` |
+| `ANALYSIS_MAX_SOURCE_CHARS` | `120000` | A document with more text is read in batches of at most this size and combined (map-reduce, §16) |
+| `AUTO_EXECUTIVE_SUMMARY` | `true` | Write an executive summary after each document is indexed (one model call per upload) |
+| `CONFLICT_DETECTION` | `true` | After an answer citing two or more documents, one extra call checks them for contradictions (Chat and Compare) |
+| `COMPARE_MAX_DOCUMENTS` / `EXTRACTION_MAX_FIELDS` | `4` / `20` | Documents in one comparison (2 to 8); fields in one extraction (1 to 50) |
+| `FOLLOWUP_SUGGESTIONS` | `true` | One extra call after every answered chat turn for follow-up, sub- and related questions (§18) |
+| `SUGGESTIONS_PER_DOCUMENT` / `POPULAR_MIN_USERS` | `6` / `2` | Questions written per document; distinct users who must have asked a question before it is suggested to others (at least 2) |
+| `METRICS_RETENTION_DAYS` | `90` | Dashboard measurements (with question text) older than this are deleted at startup (§17) |
+| `LLM_INPUT_USD_PER_MTOK` / `LLM_OUTPUT_USD_PER_MTOK` | `0` / `0` | Model price for the dashboard's cost estimate; 0 shows tokens only |
 | `RETRIEVAL_CANDIDATES` / `RETRIEVAL_TOP_K` | `30` / `5` | Per-channel candidates; chunks sent to the LLM |
 | `RRF_K` | `60` | RRF smoothing constant |
 | `RELEVANCE_THRESHOLD` | `0.60` (calibrated, §6.3) | Guard cutoff on the best dense cosine similarity |
@@ -582,8 +604,161 @@ Per-stage timings (rewrite, embed, dense, keyword, fusion, hydrate, ttft, genera
 
 ---
 
+## 16. Analysis Features (summaries, extraction, comparison, conflicts)
+
+Four features work on whole documents rather than on the best five chunks of one question. They share one rule with chat: **nothing is shown that is not tied to a retrieved passage.** Code: `core/analysis.py` (pure: no web framework, no database), `services/analysis_service.py` (access, saving, streaming, the background executive summary), `api/analysis.py` (HTTP and SSE), prompts in `core/prompts.py`.
+
+### 16.1 Sources and grounding
+
+* A document's chunks are read from PostgreSQL in order and turned into the same `Candidate` objects retrieval produces, so `prompts.format_sources` numbers and frames them as untrusted data (`<source id="n">`, the same framing as chat, rule 10). Every analysis prompt repeats that the sources are data and asks for the output shape only.
+* A document whose text exceeds `ANALYSIS_MAX_SOURCE_CHARS` is split into batches along chunk boundaries (`make_batches`) and **numbered globally**: a source keeps one number across all batches, so the map step (notes per batch, with citations) and the reduce step (one call over the notes) both cite the same `[n]`.
+* **Citations are verified, not trusted.** Text with `[n]` markers goes through `guard.filter_citations`; markers that name no source are removed. An item left without any valid citation is **dropped** (summary items, FAQ answers, glossary entries, key changes, extracted values). A summary or answer that ends up with no citation at all is retried once with a stricter reminder and then fails (`failed`), it is never shown uncited.
+* **Structured output** (chapters, FAQ, glossary, key changes, extraction, conflicts) is JSON validated with Pydantic (`extra="ignore"`, code fences stripped). An unreadable reply is retried once with `JSON_RETRY_REMINDER`, then fails. `llm.complete()` collects a whole reply from the streaming client, forwards rate-limit waits as `status` events and raises `LlmError` for a blocked or empty reply (the same finish-reason handling as chat, rule 19). Analysis calls use a separate kind in `core/llm.py` (`analysis`: `ANALYSIS_MAX_TOKENS`; temperature and thinking budget stay as for answers, rule 18).
+* **Patience.** These are long-running requests with a progress display, and the live Gemini API was seen answering `503 UNAVAILABLE` to roughly every other call for minutes at a time, so summaries, extraction and the answers of a comparison retry a busy model `ANALYSIS_MAX_RETRIES` times (`llm.stream(..., max_retries=)`; the wait before each retry still honours the server's hint and `INTERACTIVE_MAX_WAIT_SECONDS`, and the screen shows "the AI service is busy, retrying shortly"). The *extra* conflict check keeps chat's `INTERACTIVE_MAX_RETRIES`: it must not hold up an answer that is already complete.
+
+### 16.2 Summaries
+
+| Kind | Result | Notes |
+| --- | --- | --- |
+| `executive` | Markdown text with `[n]` | Written automatically after indexing (§16.6); map-reduce for long documents |
+| `chapters` | `[{title, summary}]` | One per section, in document order |
+| `faq` | `[{question, answer}]` | At most 12, repeats removed |
+| `glossary` | `[{term, definition}]` | At most 40, one entry per term |
+| `key_changes` | `[{change, impact}]` | With `compare_to` (an earlier version): the differences between the two documents, each with citations to both (numbers continue across the two documents). Without it: what the document itself announces as new or changed |
+
+`POST /analysis/summary` takes `{document_id, kind, compare_to?, refresh?}` (`compare_to` only for `key_changes`, a different document the caller may read). The saved result is returned unless `refresh` is true, so asking again costs no model call. The result is `{kind, text | items, citations}`; the citations list holds every source cited, `n` matching the markers.
+
+### 16.3 Extraction
+
+`POST /analysis/extract` takes `{document_id, fields[1..50], refresh?}`. A field is a preset key (`dates`, `parties`, `amounts`, `requirements`, `deadlines`, `contacts`, `definitions`: each has a description that tells the model what it means) or any custom name (1 to 60 characters; the limit per request is `EXTRACTION_MAX_FIELDS`). Repeats are removed case-insensitively. The result is `{fields: [{field, values: [{value, n, quote}]}], citations}`:
+
+* a value whose source number is not a real source is **dropped**; a `quote` that does not actually appear in its source is **blanked** (the value stays, with its citation);
+* a field the document does not mention has an empty `values` list and is shown as "not found", never filled in;
+* batches of a long document are extracted separately and merged without duplicates.
+
+The saved result is keyed by the sorted, lower-cased field list (`fields_key`), so the same fields in another order or case are the same extraction. The UI turns a result into a table and exports JSON (`page_start`, `page_end`, `section`, `quote` per value) and CSV, built in the browser; a CSV cell that starts with `=`, `+`, `-`, `@`, tab or carriage return gets a leading apostrophe because values come from documents and a spreadsheet would otherwise run them as formulas.
+
+### 16.4 Comparison
+
+`POST /analysis/compare` takes `{question, document_ids[2..8]}` (at most `COMPARE_MAX_DOCUMENTS`, no repeats); every document must be readable and `indexed`, otherwise the whole request is 404 or 409 **before** the stream starts. For each document, one after another (the quota is shared):
+
+1. Retrieval runs with the user's filter **narrowed to that document** (`document_ids=(id,)`, access levels still applied), so a column can only cite its own text.
+2. The relevance guard (§6.3) decides. Below the threshold the column is `covered: false` with **no model call** ("Not covered in this document").
+3. Otherwise `generation.generate_answer` streams a cited answer exactly as in chat, with the same citation verification and one retry. A model that refuses makes the column `covered: false` too.
+
+Events: `status` (`{document_id, stage}` with `searching`, `generating`, `rate_limited`, `retrying`; and `{stage: "checking_sources"}`), `token` (`{document_id, text}`), `column` (`{document_id, document_name, answer, covered, citations, flags}`), `conflicts`, `done` (`{question, documents, conflicts: count}`), `error`. Each column numbers its citations from 1; a conflict claim names its document, so the UI matches claims to citations by `(document_id, n)`.
+
+### 16.5 Conflict detection
+
+`detect_conflicts(question, passages)` asks the model, given the passages an answer cites (each tagged with its document), for points on which **different documents** contradict each other: `[{topic, claims: [{source, claim}]}]`. The result is validated: a claim must name a real passage, and a conflict is kept only if its claims come from at least two different documents (two parts of one document disagreeing is not a conflict between sources). With passages from fewer than two documents **no model call is made**.
+
+* **Chat:** after the answer is complete, if `CONFLICT_DETECTION` is on, the answer was not a refusal and the cited chunks span two or more documents, the `checking_sources` status is sent, the check runs, and a non-empty result is sent as a `conflicts` event after `citations` and stored in `messages.conflicts`. One extra model call, only for such answers.
+* **Compare:** one check across every covered column, passages numbered globally for the call and mapped back to each column's own citation numbers.
+* **A failure never costs the answer.** The check is extra: an exception is logged by class name and the answer is delivered without it.
+* **Reading back:** a conversation's conflicts are filtered with its citations. A claim whose source the reader may no longer read (deleted document, lowered role) is removed, and a conflict left with fewer than two claims is removed; the message is returned with `conflicts: null` when none remain.
+
+### 16.6 Saving, background work and deletion
+
+* `document_insights` holds one row per `(document, kind, params_key)`; `params_key` is `''`, the field hash (extraction) or the earlier version's id (`key_changes`). Deleting a document cascades to its rows. Before the model is called the row is written as `pending`; the result replaces it with `ready` or `failed` (with a user-safe message). **No database session is held across a model call** (rule 25a): each step opens its own short one.
+* **Executive summary after upload:** when ingestion marks a document `indexed` it calls the registered hook (`ingestion.on_indexed`, registered in `index_service.run_startup`), which hands the document to a **separate single-thread executor** so indexing is never slowed or failed by it. A failed automatic summary leaves the document `indexed`; the row is `failed` and can be retried from the Analyze page. `AUTO_EXECUTIVE_SUMMARY=false` turns it off.
+* **Interrupted work:** at startup `pending` rows are marked `failed` ("interrupted by a restart"). A request for something that is `pending` and recent (under 10 minutes) waits for it instead of paying twice; an older one is regenerated.
+* **Deletion (rule 24):** besides the cascade, `document_service` deletes every saved analysis whose citations or comparison target is the deleted document, before its rows go. Reading an insight resolves each citation against the live chunks the reader may see; one that fails is returned `unavailable: true` without text, document name or section (§8).
+* **Cost on a free-tier key:** an upload costs one extra call (the executive summary), a summary or extraction one call (one per batch for a very long document), a comparison one call per covered document plus one conflict check, and a chat answer that cites two or more documents one extra call. Saved results are free to reopen.
+
+### 16.7 Interface
+
+The **Analyze** page (`/analyze?tab=compare|extract|summaries&doc=<id>`) has the three tabs; the Library has a per-row button and a "Summary ready" / "Writing summary…" / "Retry summary" note; Chat shows a "Sources disagree" panel under an answer, live and when the conversation is reopened. The three tabs stay mounted, so a comparison in progress survives a look at another tab. All streams use one reader (`streamSse`) that, like the chat reader, finishes only on a `done` or `error` event.
+
+---
+
+## 17. Evaluation Dashboard (live measurements)
+
+The offline evaluation (§14, `eval/run_eval.py`) measures retrieval on a labelled question set. The dashboard measures **real use**. It is admin-only and shows only live traffic: the offline eval stays a command.
+
+### 17.1 One measurement per request
+
+- **What is recorded:** every chat turn and every analysis run (summary, extraction, comparison, the automatic executive summary, the generation of a document's suggested questions) writes exactly **one** `query_events` row, whatever its outcome.
+- **Code:** `services/metrics_service.py` (`new_event`, `add_usage`, `add_retrieval`, `record`). `chat_service._turn` fills the event as the stages complete; `run_chat` records it as `failed` with the `error_event` code when an exception ends the turn, keeping what the turn got to (guard decision, similarities, partial timings). Analysis streams are wrapped by `analysis_service._measured`; a saved result served again is recorded with 0 tokens and `timings.cached = true`.
+- **Never fails the request:** `record` opens its own short session after the answer is stored and swallows any error (logged by class name).
+- **Not recorded:** a request the client abandoned (cancellation).
+- **Tokens:** all tokens of the request are counted, including the conflict check and the follow-up suggestions of a chat turn (`timings.extra_usage` on the message).
+- **What is stored:** the question text and ids, never document text.
+- **Retention:** rows older than `METRICS_RETENTION_DAYS` are deleted at startup. Deleting a user nulls `user_id`; deleting a conversation or a document leaves the measurement (with its question) in place, because it is an operational record readable by admins only.
+
+### 17.2 Definitions
+
+| Figure | Definition |
+| --- | --- |
+| Retrieval relevance | `best_similarity`: the best dense cosine of the retrieved candidates (what the guard tests); `mean_similarity`: the mean over all retrieved candidates; a 0.05-bin histogram of `best_similarity` against `RELEVANCE_THRESHOLD`; the guard-reason distribution and the lexical-override rate |
+| Abstention rate | refused ÷ (answered + refused). Guard refusals (`below_threshold`, `no_candidates`: no model call) and model refusals (the guard passed, the model answered `REFUSAL_MESSAGE`) are counted separately |
+| Citation precision | valid citations ÷ (valid + invalid markers removed by citation verification) |
+| Groundedness | share of answers with ≥1 valid citation; uncited, retried-for-citations and truncated rates; citations and documents per answer; the share of answers whose sources disagree; thumbs up/down from `feedback`. There is no LLM judge: these are the checks the app already runs on every answer |
+| Latency | p50, p95 and max of `total_ms` over answered and refused requests (failures excluded), and per-stage p50/p95 from `timings`, shown against the §12 targets |
+| Token cost | input/output tokens per kind and per day; USD when `LLM_INPUT_USD_PER_MTOK` / `LLM_OUTPUT_USD_PER_MTOK` are set |
+| Failures | failed ÷ all, and a list of failed, refused and flagged (citations removed, uncited or truncated) queries with the question, user, reason and timing |
+| Suggestions | share of chat questions asked from a suggestion or follow-up, and follow-up click-through (follow-up questions ÷ answers that offered follow-ups) |
+
+Relevance, abstention and groundedness read chat turns. Totals, latency and cost follow the selected scope: `all`, `chat`, or `analysis`.
+
+### 17.3 API and screen
+
+- **`GET /metrics/summary`:** everything above for the last `days` days. It is computed in SQL (`count(*) FILTER`, `percentile_cont`, `date_trunc('day')`).
+- **`GET /metrics/events`:** problem queries, newest first, with keyset paging on `created_at`.
+- **The Evaluation page** (`/dashboard`, admins only; non-admins are redirected): KPI cards with daily sparklines, then sections for relevance, groundedness, latency, cost, and the problem-query table. Plain SVG/CSS charts, no chart library.
+
+## 18. Query Suggestions
+
+### 18.1 Questions a document answers
+
+- **Generation:** `analysis.suggest_questions(sources, SUGGESTIONS_PER_DOCUMENT)`. It is given evenly spaced chunks within `ANALYSIS_MAX_SOURCE_CHARS` (one call), with the same untrusted-data framing as every analysis. It must name, for each question, the source that answers it.
+- **Validation:**
+  - a question naming no real source is **dropped**;
+  - a text that is not a one-line question of 8 to 200 characters ending in "?" is dropped;
+  - repeats are dropped;
+  - citation markers are removed.
+- **Storage:** saved as `document_insights` kind `questions` (cascade on document deletion; content carries citations like every insight).
+- **When:** written on the single-thread insights executor the **first time** the document is selected in Chat. One call per document, ever.
+- **On request:**
+  - `GET /suggestions` reports a document still being written as `pending` (the client polls);
+  - a failed set is not retried for 10 minutes;
+  - without a selection, only the saved sets of up to 4 recently indexed readable documents are used, and nothing is generated.
+
+### 18.2 Questions other people asked
+
+- **Source:** `metrics_service.popular_questions` reads `query_events`.
+- **What qualifies:** a chat question that was **answered with valid citations** (no removed markers, not uncited, not truncated), within the retention window. Questions are grouped by normalized text (lower case, collapsed spaces, trailing punctuation removed).
+- **Privacy:**
+  - a question is offered only when **`POPULAR_MIN_USERS` (≥ 2) different users** asked it, so one person's question is never shown to anyone else;
+  - **every** document its answer cited must still be indexed and readable at the reader's access level;
+  - with documents selected, it must cite one of them.
+- **Ranking:** distinct users, then thumbs-up, then recency. The most common phrasing is shown.
+
+### 18.3 Follow-ups after an answer
+
+- **Generation:** `analysis.suggest_followups(question, answer, candidates)` runs after every answered (not refused) chat turn when `FOLLOWUP_SUGGESTIONS` is on.
+  - It runs **concurrently** with the conflict check (`asyncio.gather`), so the extra wait is the longer of the two.
+  - It uses chat's short patience.
+  - A failure is logged and the answer is unaffected.
+- **Output:** three types:
+  - `follow_up` (deeper into the answer);
+  - `sub_question` (one part of a broad question);
+  - `related` (a neighbouring topic the sources cover).
+- **Validation:** each suggestion must name one of the **retrieved** passages (numbered as in the answer); otherwise it is dropped, so nothing is suggested that the documents cannot answer. Unknown types, repeats and the question itself are dropped; at most 5 are kept.
+- **Storage:** `messages.suggestions`, `[{type, question, n, document_id, chunk_id}]`; the client gets type, question and document.
+- **Reading back:** suggestions whose passage the reader can no longer read are dropped. Deleting a document removes its suggestions from saved messages (rule 24).
+- **Recording:** a click asks the question in the same conversation with `source="followup"`; an empty-state chip uses `source="suggestion"`.
+
+---
+
 ## Changelog
 
+* **1.6.0:** Account administration (§8): `GET /users`, `PATCH /users/{id}`, `DELETE /users/{id}`, the Users screen, the "always one administrator" rule under the shared accounts lock (`auth_service.lock_accounts`, formerly the signup-only lock). The user-management API is no longer out of scope.
+* **1.5.0:**
+  - **Evaluation dashboard** (§17): table `query_events`, one row per chat turn or analysis run including failures; admin-only `GET /metrics/summary` and `/metrics/events`; the Evaluation page.
+  - **Query suggestions** (§18): `questions` insight kind; `messages.suggestions`; the `suggestions` chat event and `suggesting` status; `source` on chat requests; `GET /suggestions`.
+  - **Migration `0004`** and six settings (§10).
+  - **Chat turns** now count the conflict check's tokens.
+* **1.4.0:** Analysis features (§16): multi-document comparison, structured extraction, document summaries (executive after upload; chapters, FAQ, glossary and key changes on request) and source conflict detection in Chat and Compare. New: table `document_insights` and column `messages.conflicts` (migration `0003`), endpoints `GET /documents/{id}/insights` and `POST /analysis/{summary,extract,compare}`, the `conflicts` chat event and `checking_sources` status, a separate `analysis` model-call kind, seven settings (§10; `ANALYSIS_MAX_RETRIES` gives analysis runs more patience with a flaky model than chat has), an `/api/analysis/` nginx location with its own rate zone (§8), and the Analyze page. Deleting a document now also deletes the saved analyses that quote it.
 * **1.3.5:** Phases 5 and 6 (web UI, conversations and feedback API, evaluation script, README) and an audit pass over the whole system. Phases 5-6 had never been recorded here: the React UI (login/signup, library, chat with citation chips, source drawer; answers read with `fetch` because the stream needs the bearer token and a POST body), the conversation and feedback endpoints (§7), and `eval/run_eval.py`. The audit (every item reproduced or covered by a test that fails without the fix) changed: the **guard** (the lexical override has a floor, `LEXICAL_OVERRIDE_MARGIN`, §6.3), the **citation filter** (ranges, code, whitespace; blank answers are errors, §6.3), **keyword search** (headings are indexed, §4.2), **parsing and chunking** (linear time, `MAX_DOCUMENT_CHARS`, chunk ceiling includes the separator, §8), the **vector store** (write lock, timeouts, missing ids, interrupted-rebuild recovery, §4.1), **database connections** (released before slow work, explicit pool, §8), **saved citations** (blanked on delete, unavailable on read when the reader may no longer see them, §8), **embeddings** (per-minute budget, readiness probe never sleeps, §10), **nginx** (body limits, rate limits, sign-in before upload bodies, cache and security headers, CSP, §8), **deployment** (loopback bind, `SIGNUP_ENABLED`, hardening, single-worker enforcement, §8, §13), **configuration** (new settings in §10; `RERANK_ENABLED=true` rejected), the **evaluation** (committed corpus, 24 questions, production code path, re-measured calibration in §6.3), and many **UI** fixes (Stop, switching conversations mid-answer, streams that end without a final event, readable errors, cache cleared on logout, accessibility). `RELEVANCE_THRESHOLD` stays 0.60. README "Decisions" lists each choice, including what was deliberately left alone.
 * **1.3.4:** Phase 4 (filters, retrieval, guard, rewriting, generation, streaming chat, citation verification). Documented the retrieval implementation (one `SearchFilter` translated for Chroma, BM25 and SQL; hydration from PostgreSQL; an unhealthy index is an error, never an empty result; an `index` check in `/ready`), the SSE protocol with every payload, streaming citation verification with a single retry, the rate-limit policy for a waiting user, the calibrated `RELEVANCE_THRESHOLD = 0.60` with the evaluation data and the honest finding that near-miss questions overlap answerable ones, the measured latencies, and the default model change to `gemini-3.8-flash` after `gemini-2.5-flash` turned out to be closed to new API keys. Optional exact-token `where_document` search and reranking were not implemented.
 * **1.3.3:** Phase 3 (parsers, chunking, metadata, embeddings, vector store, BM25, ingestion, documents API). Documented implemented parser behavior (physical PDF pages, outline or font-based sections, column-by-column reading of two-column pages, page-chrome removal with a safety net, known overprint limitation) and chunker rules (sentence packing, same-page overlap, size ceiling validated at startup); metadata resolution during indexing with month/year refinement (migration 0002 makes `creation_date` nullable until then); the embeddings wrapper's error classification, shared rate-limit cooldown and measured free-tier limits (100 requests per minute) and latency; ingestion ordering (Postgres before Chroma), failure cleanup, per-document lock and startup consistency checks including refusal to start on an empty Chroma and the `reembed` maintenance command; `bm25s` details; the documents API contract, upload validation, safe file serving and the park-then-delete order; verification and repair of the Chroma index after a live recall failure (stored vectors that no query returned); new risks.

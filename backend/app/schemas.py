@@ -103,6 +103,21 @@ class UserOut(BaseModel):
     created_at: datetime
 
 
+class UserAdminOut(UserOut):
+    """An account on the administrators' list, with what it owns."""
+
+    documents: int = 0
+    conversations: int = 0
+
+
+class RoleUpdate(BaseModel):
+    """New role for an account."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Role
+
+
 class AuthResponse(BaseModel):
     """Result of signup or login."""
 
@@ -134,6 +149,8 @@ class DocumentOut(BaseModel):
     access_level: AccessLevel
     owner_id: uuid.UUID | None
     created_at: datetime
+    # State of the automatic executive summary: none, pending, ready or failed.
+    executive_summary: Literal["none", "pending", "ready", "failed"] = "none"
 
 
 class LibrarySummaryOut(BaseModel):
@@ -202,6 +219,8 @@ class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=QUESTION_MAX_CHARS)
     conversation_id: uuid.UUID | None = None
     filters: ChatFilters | None = None
+    # How the question was asked, for the dashboard: typed, or picked from a suggestion.
+    source: Literal["typed", "suggestion", "followup"] = "typed"
 
     @field_validator("question")
     @classmethod
@@ -234,6 +253,10 @@ class MessageOut(BaseModel):
     role: str
     content: str
     citations: list[dict[str, object]] | None = None
+    # Where the documents behind the answer disagree: [{topic, claims: [{n, document_id, claim}]}].
+    conflicts: list[dict[str, object]] | None = None
+    # Questions offered after the answer: [{type, question, document_id}].
+    suggestions: list[dict[str, object]] | None = None
     guard_score: float | None = None
     flagged: bool = False
     created_at: datetime
@@ -271,3 +294,122 @@ class FeedbackRequest(BaseModel):
     @classmethod
     def _no_nul(cls, value: str | None) -> str | None:
         return None if value is None else reject_nul(value)
+
+
+# --- Analysis: summaries, extraction, comparison ------------------------------------------------
+
+SummaryKind = Literal["executive", "chapters", "faq", "glossary", "key_changes"]
+
+
+class SummaryRequest(BaseModel):
+    """Summarize one document. ``compare_to`` (an older version) is for ``key_changes`` only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: uuid.UUID
+    kind: SummaryKind
+    compare_to: uuid.UUID | None = None
+    refresh: bool = False
+
+    @model_validator(mode="after")
+    def _compare_only_for_changes(self) -> SummaryRequest:
+        if self.compare_to is not None and self.kind != "key_changes":
+            raise ValueError("compare_to is only for the key_changes summary")
+        if self.compare_to == self.document_id:
+            raise ValueError("compare_to must be a different document")
+        return self
+
+
+class ExtractRequest(BaseModel):
+    """Extract fields from one document: preset keys (``dates``, ``parties``...) or any name."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: uuid.UUID
+    fields: list[str] = Field(min_length=1, max_length=50)
+    refresh: bool = False
+
+    @field_validator("fields")
+    @classmethod
+    def _field_names(cls, value: list[str]) -> list[str]:
+        for name in value:
+            reject_nul(name)
+            if len(name) > 200:
+                raise ValueError("a field name is too long")
+        return value
+
+
+class CompareRequest(BaseModel):
+    """One question, asked of each chosen document on its own."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=QUESTION_MAX_CHARS)
+    document_ids: list[uuid.UUID] = Field(min_length=2, max_length=8)
+
+    @field_validator("question")
+    @classmethod
+    def _clean_question(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return reject_nul(value)
+
+
+class QueryEventOut(BaseModel):
+    """A failed, refused or flagged query on the dashboard (admins only)."""
+
+    id: uuid.UUID
+    created_at: datetime
+    kind: str
+    outcome: str
+    source: str
+    user_email: str | None = None
+    question: str | None = None
+    error_code: str | None = None
+    guard_reason: str | None = None
+    best_similarity: float | None = None
+    cited: int = 0
+    citations_removed: int = 0
+    uncited: bool = False
+    retried: bool = False
+    partial: bool = False
+    total_ms: float | None = None
+    total_tokens: int = 0
+    conversation_id: uuid.UUID | None = None
+    document_ids: list[str] | None = None
+
+
+class DocumentQuestionOut(BaseModel):
+    """A question a chosen document answers."""
+
+    question: str
+    document_id: uuid.UUID
+    document_name: str
+
+
+class PopularQuestionOut(BaseModel):
+    """A question several people asked and got a cited answer to."""
+
+    question: str
+    asked_by: int
+
+
+class SuggestionsOut(BaseModel):
+    """Questions to offer before the first question of a chat."""
+
+    documents: list[DocumentQuestionOut]
+    popular: list[PopularQuestionOut]
+    # Documents whose suggested questions are being written: ask again shortly.
+    pending: list[uuid.UUID]
+
+
+class InsightOut(BaseModel):
+    """A saved analysis of a document."""
+
+    id: uuid.UUID
+    kind: str
+    params_key: str
+    status: Literal["pending", "ready", "failed"]
+    content: dict[str, object] | None = None
+    error_message: str | None = None
+    updated_at: datetime

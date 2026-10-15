@@ -72,11 +72,13 @@ def _dummy_hash() -> str:
     return hash_password("not-a-real-password")
 
 
-def _lock_signups(db: Session) -> None:
-    """Serialize signups until the transaction ends.
+def lock_accounts(db: Session) -> None:
+    """Serialize everything that creates, promotes, demotes or removes accounts, until the
+    transaction ends.
 
-    Without this, two simultaneous first signups could both see an empty
-    ``users`` table and both become admin.
+    Without this, two simultaneous first signups could both see an empty ``users`` table and both
+    become admin, and two administrators demoting each other at the same moment could both pass
+    the "is there another admin" check and leave none (``user_service``).
     """
     db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _SIGNUP_LOCK_KEY})
 
@@ -91,7 +93,7 @@ def register_user(db: Session, email: str, password: str) -> User:
     email = normalize_email(email)
     password_hash = hash_password(password)  # slow: do it before holding the lock
 
-    _lock_signups(db)
+    lock_accounts(db)
     is_first_user = db.scalar(select(func.count()).select_from(User)) == 0
     if not is_first_user and not get_settings().signup_enabled:
         db.rollback()  # checked before the email lookup: a closed door must not reveal accounts
